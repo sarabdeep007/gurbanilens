@@ -1,0 +1,48 @@
+cat > .gitignore << 'EOF'
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Audio samples (large files, gitignore by default — share separately)
+samples/*.mp3
+samples/*.wav
+samples/*.m4a
+samples/*.flac
+samples/*.ogg
+!samples/.gitkeep
+!samples/README.md
+
+# Models (Whisper weights are large)
+models/
+*.bin
+*.pt
+*.onnx
+
+# Data (corpus can be large)
+data/sggs/*.json
+data/sggs/*.db
+!data/sggs/.gitkeep
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Environment
+.env
+.env.local
+*.log
+EOF
