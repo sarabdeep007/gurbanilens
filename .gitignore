@@ -1,4 +1,3 @@
-cat > .gitignore << 'EOF'
 # Python
 __pycache__/
 *.py[cod]
@@ -33,7 +32,11 @@ models/
 # Data (corpus can be large)
 data/sggs/*.json
 data/sggs/*.db
+data/sggs/*.sqlite
 !data/sggs/.gitkeep
+
+# Eval runs
+eval_runs/
 
 # IDE
 .vscode/
@@ -45,4 +48,3 @@ data/sggs/*.db
 .env
 .env.local
 *.log
-EOF

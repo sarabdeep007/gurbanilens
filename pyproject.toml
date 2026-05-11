@@ -1,0 +1,37 @@
+[project]
+name = "gurbanilens"
+version = "0.1.0"
+description = "Real-time Kirtan-to-Pangti detection. Phase 1 CLI proof-of-concept."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Deep", email = "deep@taajstudios.com" },
+]
+dependencies = [
+    "faster-whisper>=1.0.3",
+    "rapidfuzz>=3.9.0",
+    "typer>=0.12.0",
+    "rich>=13.7.0",
+    "tqdm>=4.66.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.5.0",
+]
+
+[project.scripts]
+gurbanilens = "gurbanilens.cli:app"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
