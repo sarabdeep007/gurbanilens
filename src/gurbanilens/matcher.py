@@ -39,7 +39,7 @@ _PUNCT = re.compile(r"[.,;|:!?\-\"'(){}\[\]0-9]+")
 _WHITESPACE = re.compile(r"\s+")
 
 LONG_TOKEN_MIN = 3
-TOKEN_MATCH_THRESHOLD = 60.0
+TOKEN_MATCH_THRESHOLD = 55.0
 CANDIDATE_POOL = 50
 
 
