@@ -105,6 +105,7 @@ def match_file(
     model: str = typer.Option("medium", "--model", "-m", help="faster-whisper model size"),
     threshold: float = typer.Option(75.0, "--threshold", "-t", help="confidence cutoff for MATCH tag"),
     engine: str = typer.Option("whisper", "--engine", help="ASR engine: whisper (default)"),
+    vad: bool = typer.Option(False, "--vad/--no-vad", help="Silero VAD pre-filter; OFF by default — VAD eats sung Kirtan. Enable only for noisy ambient mics with lots of silence"),
 ) -> None:
     """Transcribe AUDIO_PATH and match each segment to SGGS Pangtis."""
     print(f"Loading corpus...", file=sys.stderr)
@@ -117,7 +118,7 @@ def match_file(
     t0 = time.time()
     asr: ASREngine
     if engine == "whisper":
-        asr = WhisperASR(model_size=model)
+        asr = WhisperASR(model_size=model, vad_filter=vad)
     else:
         raise typer.BadParameter(f"unknown engine: {engine}")
     print(f"  ready in {time.time()-t0:.1f}s", file=sys.stderr)

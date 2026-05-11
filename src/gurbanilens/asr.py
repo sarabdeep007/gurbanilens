@@ -117,8 +117,11 @@ class WhisperASR:
         device: ``auto`` picks CUDA if available, else CPU.
         compute_type: ``auto`` picks a sensible default (float16 on GPU, int8
             on CPU). Override for benchmarking.
-        vad_filter: Silero VAD pre-filter — drops silent regions before
-            decoding. Recommended for Kirtan with natural pauses.
+        vad_filter: Silero VAD pre-filter — drops "non-speech" regions
+            before decoding. **Off by default** — empirically VAD treats sung
+            Kirtan as non-speech and discards almost all of it (verified
+            2026-05-12 on harjinder-singh sample: 34s of Kirtan → 2-word
+            transcript with VAD on, 2 full Pangtis with VAD off).
     """
 
     def __init__(
@@ -126,7 +129,7 @@ class WhisperASR:
         model_size: str = "medium",
         device: str = "auto",
         compute_type: str = "auto",
-        vad_filter: bool = True,
+        vad_filter: bool = False,
     ) -> None:
         from faster_whisper import WhisperModel  # lazy: heavy import + model download
 
