@@ -33,47 +33,56 @@ Ragi performs Kirtan, app listens (ideally via line-in from mixer), and the acti
 
 ---
 
-## Phase 1: CLI Proof-of-Concept (CURRENT)
+## Phase 1: CLI Proof-of-Concept (COMPLETE 2026-05-12)
 
-**Goal:** Validate that ASR + fuzzy matching against the SGGS corpus works reliably on varied Kirtan recordings *before* investing in mobile/desktop apps.
+See [PHASE_1_CONCLUSION.md](./PHASE_1_CONCLUSION.md) for the full close-out.
 
-**Approach:**
-1. Take an audio file (MP3/WAV) as input
-2. Run streaming ASR (Whisper) with Punjabi language hint
-3. Match transcribed text against pre-indexed SGGS corpus (BaniDB)
-4. Output matched Pangtis with timestamps and confidence scores
+**Outcome:** architecture validated end-to-end. Matcher is solid; Whisper-medium ASR is the binding constraint on accuracy.
 
-**Sample CLI output target:**
-```
-$ gurbanilens match-file ./samples/bhai-harjinder-asa-ki-vaar.mp3
-[00:12] Matched: SGGS Ang 462, Pangti 3 (confidence 0.87)
-        ਆਸਾ ਮਹਲਾ ੧ ॥
-[00:18] Matched: SGGS Ang 462, Pangti 4 (confidence 0.91)
-        ਵਾਰ ਸਲੋਕਾ ਨਾਲਿ ਸਲੋਕ ਭੀ ਮਹਲੇ ਪਹਿਲੇ ਕੇ ਲਿਖੇ ...
-```
+| Model | Confident matches (≥75) | Negative test |
+|---|---|---|
+| `medium` | 4 / 13 (31%) | ✅ rejected |
+| `large-v3` | 6 / 13 (46%) | ✅ rejected |
 
-**Stack:**
-- Python 3.11+
-- `faster-whisper` (efficient Whisper implementation) or OpenAI Whisper
-- BaniDB API / SGGS corpus (downloaded locally for offline indexing)
-- Custom fuzzy matcher (n-gram + phonetic, biased toward sequential progression)
+Original success criterion (≥70% Shabad-hit on clean studio recordings) was met for the 4 clean studio recordings we have (babiha 2, harjinder 1/3/5 — all confidently matched); the headline rate is dragged down by live/melodic samples. Most importantly, the matcher correctly refuses to match on Simran audio — the non-negotiable safety property for Use Case 2.
 
-**Success criteria for Phase 1:**
-- Correctly identifies Shabad on at least 70% of clean studio recordings
-- Tracks Pangti progression with reasonable lag
-- Surface accuracy data per sample for analysis
-- Decision point: if matching works, proceed to native apps. If not, fine-tune Whisper on Kirtan data first.
+**Phase 1 stack** (preserved as reference implementation):
+- Python 3.11+, `faster-whisper`, `rapidfuzz`, `indic-transliteration`
+- SGGS corpus: `shabados/database` v4.8.7 SQLite (not Khalis BaniDB which is API-only)
+- Matcher: naive `rapidfuzz` partial_ratio × token-coverage × length factor
+- Latin matching surface (Whisper Devanagari → IAST → ASCII)
 
 ---
 
-## Future Phases (post-validation)
+## Phase 2 plan (post-Phase 1 decision)
 
-- **Phase 2:** Core engine ported to C++/Rust for cross-platform reuse
-- **Phase 3:** iOS app (Swift/SwiftUI) — Use Case 1 MVP
-- **Phase 4:** Android app (Kotlin/Compose)
-- **Phase 5:** Projector display + Sevadaar control panel — Use Case 2
-- **Phase 6:** Desktop Pro install (Mac/PC permanent Gurdwara deployment)
-- **Phase 7:** Fine-tune ASR on Kirtan-specific audio for robustness across raags, jathas, noise
+### Phase 2A — Paath / Bani recitation companion app (CURRENT)
+
+Full Paath companion: Nitnem Banis (Japji, Jaap, Tav-Prasad Savaiye, Chaupai, Anand, Rehras, Kirtan Sohila), Sukhmani Sahib, Asa Ki Vaar, **Sehaj Paath** (find reader anywhere in SGGS), **Akhand Paath** (continuous 48hr, multi-Pathi).
+
+- iOS first (Swift/SwiftUI), Android right after (Kotlin/Compose)
+- On-device ASR via whisper.cpp + CoreML where the device can handle it; server fallback for older devices (opt-in due to privacy)
+- Background-tolerant (screen off, app backgrounded → still listening)
+- Offline-capable for the SGGS corpus
+- Anvaad-js (build-time) for Anmol Lipi → Unicode Gurmukhi conversion
+
+See [docs/PHASE_2A_ARCHITECTURE.md](./docs/PHASE_2A_ARCHITECTURE.md) for stack decisions, repo structure, data flow, and implementation roadmap.
+
+### Phase 2B — Kirtan dataset + fine-tuned ASR (parallel)
+
+Build a labeled Kirtan dataset (transcript + audio alignment), then fine-tune Whisper on it. Two preparation tracks running in the background:
+- `scripts/fetch_samples.py` — Deep gathers more Kirtan recordings systematically
+- aeneas forced-alignment spike — given a known Shabad and audio, can we auto-align word-to-time?
+
+### Phase 2C — Gurdwara projector + Sevadaar control panel (gated on 2A polish + 2B fine-tuning)
+
+Use Case 2. Strict accuracy required. Includes Sevadaar override controls. Waits for fine-tuned ASR.
+
+### Later phases
+
+- Desktop Pro install (Mac/PC permanent Gurdwara deployment)
+- Multi-language UI expansion (Punjabi/Hindi/English/Spanish)
+- Additional Banis, gutkas, Bhai Gurdas Vaaran, Dasam Granth selections
 
 ---
 
@@ -139,5 +148,7 @@ gurbanilens/
 - ✅ Project scoped and designed (in claude.ai chat)
 - ✅ Name chosen: GurbaniLens
 - ✅ Domain: GurbaniLens.com (to be registered)
-- ✅ Sample Kirtan recordings gathered (~15-20 files in `./samples/`)
-- ⏳ Phase 1 CLI build — starting now
+- ✅ 13 sample Kirtan recordings gathered in `./samples/` (gitignored)
+- ✅ Phase 1 CLI built, evaluated, closed (see [PHASE_1_CONCLUSION.md](./PHASE_1_CONCLUSION.md))
+- ⏳ Phase 2A architecture review — drafted at [docs/PHASE_2A_ARCHITECTURE.md](./docs/PHASE_2A_ARCHITECTURE.md), awaiting Deep's sign-off before iOS code begins
+- ⏳ Phase 2B preparation tracks (sample gathering script, aeneas spike) — to be scheduled
