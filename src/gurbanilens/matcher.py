@@ -41,6 +41,11 @@ _WHITESPACE = re.compile(r"\s+")
 LONG_TOKEN_MIN = 3
 TOKEN_MATCH_THRESHOLD = 55.0
 CANDIDATE_POOL = 50
+# A query needs at least this many "long" tokens to reach full confidence.
+# Below this, coverage is scaled down linearly. Prevents 1-2 token queries
+# (Whisper hallucinations on silence/music: "nan", "at six", "well") from
+# trivially scoring 1.00 coverage and producing high-confidence false matches.
+MIN_LONG_TOKENS_FOR_FULL_CONFIDENCE = 4
 
 
 def normalize(text: str) -> str:
@@ -56,17 +61,23 @@ def _long_tokens(normalized: str) -> list[str]:
 
 
 def _token_coverage(query_long_tokens: list[str], candidate_tokens: list[str]) -> float:
-    """Fraction of query long-tokens that have a fuzzy-equivalent in candidate."""
-    if not query_long_tokens:
-        return 0.0
-    if not candidate_tokens:
+    """Fraction of query long-tokens fuzzy-matched in candidate, scaled by query length.
+
+    The raw fraction (matched / total) is multiplied by a length factor
+    min(1, total / MIN_LONG_TOKENS_FOR_FULL_CONFIDENCE). So a 1-token query
+    can only reach 1/3 of full coverage even if that token matches — preventing
+    Whisper-on-silence garbage like 'nan' or 'at six' from scoring 100%.
+    """
+    if not query_long_tokens or not candidate_tokens:
         return 0.0
     matched = 0
     for qt in query_long_tokens:
         best = max((fuzz.ratio(qt, ct) for ct in candidate_tokens), default=0.0)
         if best >= TOKEN_MATCH_THRESHOLD:
             matched += 1
-    return matched / len(query_long_tokens)
+    raw = matched / len(query_long_tokens)
+    length_factor = min(1.0, len(query_long_tokens) / MIN_LONG_TOKENS_FOR_FULL_CONFIDENCE)
+    return raw * length_factor
 
 
 @dataclass(frozen=True, slots=True)
