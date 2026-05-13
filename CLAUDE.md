@@ -151,5 +151,13 @@ gurbanilens/
 - ✅ 13 sample Kirtan recordings gathered in `./samples/` (gitignored)
 - ✅ Phase 1 CLI built, evaluated, closed (see [PHASE_1_CONCLUSION.md](./PHASE_1_CONCLUSION.md))
 - ✅ Phase 2A architecture **LOCKED 2026-05-12** — see [docs/PHASE_2A_ARCHITECTURE.md](./docs/PHASE_2A_ARCHITECTURE.md). Sign-off table at top of doc.
-- ⏳ Phase 2A implementation in progress — starting with repo restructure + build pipeline + port-parity vectors (step 1 of §14)
-- ⏳ Phase 2B preparation tracks running in parallel: `scripts/fetch_samples.py` (Track B) and aeneas forced-alignment spike (Track C, writeup at [docs/aeneas_spike.md](./docs/aeneas_spike.md))
+- ✅ Phase 2A foundation complete (steps 1–2 of §14): repo restructure (`src/` → `core/`), build pipeline (anvaad-js → ~77 MB app SQLite), port-parity infrastructure, **Swift matcher port — 11/11 port-parity PASS**
+- ✅ Phase 2A iOS smoke test code written (step 3 of §14): Xcode project (XcodeGen), AudioSource protocol + MicSource + FileSource + LineInSource stub, whisper.cpp + CoreML ASR wrapper, Gurmukhi/Devanagari → Latin port, SwiftUI smoke-test view
+- ⏳ **Waiting on Deep**: install Xcode + run on iPhone with free Apple ID — see [docs/PHASE_2A_IOS_SETUP.md](./docs/PHASE_2A_IOS_SETUP.md)
+- ✅ Phase 2B preparation tracks: `scripts/fetch_samples.py` (Track B); aeneas pivoted to faster-whisper word_timestamps (Track C, [docs/aeneas_spike.md](./docs/aeneas_spike.md))
+- ✅ Server skeleton (`server/`) + privacy contract committed; not deployed
+- ✅ Opt-in feedback channel spec ([docs/feedback_channel_spec.md](./docs/feedback_channel_spec.md))
+
+## Known Phase 2A gating items
+- **Sehaj Paath gated on Swift matcher perf.** The Swift `partial_ratio` is a brute-force port — correct (11/11 port-parity passes against the canonical Python on the full 60K-line SGGS corpus) but **too slow for full-corpus search at production latency**. Nitnem Banis (constrained to a few hundred lines per Bani) work fine. Sehaj Paath, which scans all 60K lines, needs either Hyyro's bitmap algorithm (what rapidfuzz uses internally) or an n-gram prefilter. Decision gated on real iOS device benchmarks during step 3 device validation.
+- **Whisper non-determinism.** Phase 1 finding (`temperature=0`, no fallback, fixed seed where supported) is wired into the iOS `WhisperASR.Config` defaults. Verify on device.
