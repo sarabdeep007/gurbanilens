@@ -1,0 +1,17 @@
+{
+  "name": "gurbanilens-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Optional GurbaniLens server — opt-in Whisper-large-v3 fallback ASR + correction feedback queue. DE jurisdiction. No audio storage. No content logging. No user ID. See README.md.",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "node --watch src/index.js",
+    "start": "node src/index.js",
+    "test": "node --test tests/"
+  },
+  "dependencies": {
+    "fastify": "^4.27.0",
+    "@fastify/websocket": "^10.0.1"
+  }
+}
