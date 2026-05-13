@@ -1,8 +1,19 @@
 # Phase 2A Architecture — Paath / Bani Recitation Companion
 
-_Drafted 2026-05-12. Status: awaiting Deep's sign-off before iOS implementation begins._
+_Drafted 2026-05-12. **Status: architecture LOCKED 2026-05-12. Sign-offs and amendments below.**_
 
-This doc covers the engineering decisions for Phase 2A. **Decisions flagged ⚠️ are the ones Deep should explicitly approve, push back on, or amend before we lock them in.**
+| Decision | Status | Amendment |
+|---|---|---|
+| §3 Core engine | ✅ approved | Python = canonical source of truth; `tests/portparity/` JSON validates all ports |
+| §5 ASR strategy | ✅ approved | Default model = `small` / `base` (~200 MB), not `medium`. Server privacy contract documented inline. |
+| §2 Repo layout | ✅ approved | Phase 1 Python moves to `core/` |
+| §4 Corpus bundle | ✅ amended | Trim to ~100 MB; curated translations only; additional translations server-downloadable |
+| §14 Implementation order | ✅ amended | Anvaad-js / Unicode rendering moves **before** first end-to-end Bani checkpoint |
+| Flag A Akhand Paath line-in | ✅ approved | `AudioSource` abstraction with `MicSource` (Phase 2A) + `LineInSource` (Phase 2C); architect for it now |
+| Flag B Tracks B + C | ✅ spun up | `scripts/fetch_samples.py` + `scripts/aeneas_spike.py`; aeneas write-up at `docs/aeneas_spike.md` |
+| Flag C Whisper non-determinism | ✅ deferred | tuning task in §15: `temperature=0, no fallback, fixed seed where supported` |
+| Addition 1 | ✅ added | Opt-in feedback channel (§17) — capture from launch |
+| Addition 2 | ✅ added | Accessibility (§18) — core feature, not bolt-on |
 
 ---
 
@@ -24,38 +35,50 @@ Out of scope for Phase 2A:
 
 ---
 
-## 2. Repository structure ⚠️
+## 2. Repository structure ✅
 
-**Recommendation: keep monorepo, add `ios/`, `android/`, `build/`, `server/` to the existing `gurbanilens/` repo.**
+Monorepo. Phase 1 Python becomes `core/` — emphasising its role as **canonical reference + evaluation harness**, not a runtime dependency.
 
 ```
 gurbanilens/
 ├── CLAUDE.md
 ├── PHASE_1_CONCLUSION.md
 ├── docs/
-│   └── PHASE_2A_ARCHITECTURE.md            (this file)
-├── src/gurbanilens/                        (Phase 1 Python — preserved as reference)
+│   ├── PHASE_2A_ARCHITECTURE.md            (this file)
+│   └── aeneas_spike.md                     (Track C writeup)
+├── core/                                   (RENAMED from src/gurbanilens/)
+│   ├── pyproject.toml
+│   ├── gurbanilens/                        (Phase 1 Python — canonical reference impl)
+│   │   ├── corpus.py
+│   │   ├── matcher.py
+│   │   ├── asr.py
+│   │   └── cli.py
+│   └── tests/
+│       ├── test_corpus.py
+│       ├── test_matcher.py
+│       └── portparity/
+│           ├── test_vectors.json           (11-case JSON; ports validate against this)
+│           └── README.md                   (port-parity contract)
 ├── samples/
 ├── data/sggs/                              (raw shabados/database v4.8.7)
-├── evaluation/                             (Phase 1 reports stay here)
+├── evaluation/                             (Phase 1 reports)
 ├── scripts/
 │   ├── fetch_corpus.py                     (Phase 1)
 │   ├── evaluate.py                         (Phase 1)
 │   ├── fetch_samples.py                    (Phase 2B — track B)
 │   └── aeneas_spike.py                     (Phase 2B — track C)
-├── build/                                  (NEW — corpus pre-processing pipeline)
+├── build/                                  (corpus pre-processing pipeline)
 │   ├── convert_anmol_to_unicode.js         (Node.js + anvaad-js)
-│   └── build_app_database.py               (produces app-ready SQLite from data/sggs)
-├── ios/                                    (NEW — Xcode project)
-│   ├── GurbaniLens.xcodeproj
-│   └── GurbaniLens/
-│       ├── App/                            (SwiftUI entrypoint)
-│       ├── Core/                           (matcher + corpus loader, Swift)
-│       ├── ASR/                            (whisper.cpp wrapper)
-│       ├── Audio/                          (AVAudioEngine pipeline)
-│       └── UI/                             (Bani selection, follow view, settings)
-├── android/                                (NEW — when iOS is buildable; later)
-└── server/                                 (NEW — only if device-capability detection needs it)
+│   ├── build_app_database.py               (trims to ~100MB, produces app SQLite)
+│   └── package.json                        (Node deps: anvaad-js, better-sqlite3)
+├── ios/                                    (Xcode project; created when we start step 3)
+│   └── GurbaniLensCore/                    (Swift Package — testable without Xcode)
+│       ├── Package.swift
+│       └── Sources/
+│           ├── GurbaniLensCore/            (Swift matcher + corpus loader)
+│           └── GurbaniLensCoreTests/       (port-parity runner)
+├── android/                                (placeholder — populated when iOS is buildable)
+└── server/                                 (placeholder — only if server-fallback ASR ships)
 ```
 
 Rationale for monorepo over separate repos:
@@ -67,7 +90,7 @@ Push back if you'd rather isolate the iOS Xcode project in its own repo. Real re
 
 ---
 
-## 3. Core engine language ⚠️ (the big one)
+## 3. Core engine language ✅
 
 Options I considered:
 
@@ -90,9 +113,32 @@ Reasoning:
 
 **Push back here especially if you want Rust early** — happy to switch direction. But my honest read is the matcher is so simple that "shared core" is a discipline issue, not a code issue: write 3 implementations against 1 spec (the test battery) and they stay in sync.
 
+### Port-parity discipline (amendment)
+
+Python (`core/`) is the canonical reference. Swift (`ios/GurbaniLensCore/`) and Kotlin ports must produce **identical** results.
+
+The contract: `core/tests/portparity/test_vectors.json` — 11 test cases (the same battery from Phase 1's `test_matcher.py`) encoded as JSON. Every port has a runner that loads this file and asserts:
+
+- Top match's `ang` and `pangti` match the expected values
+- Final score ≥ `expected_score_at_least`
+- Coverage ≥ `expected_coverage_at_least`
+
+CI runs all three port runners on every PR touching matcher code. Any drift = port bug, blocked from merging.
+
+Threshold constants (also in JSON, shared across ports):
+```json
+{
+  "TOKEN_MATCH_THRESHOLD": 55.0,
+  "LONG_TOKEN_MIN": 3,
+  "MIN_LONG_TOKENS_FOR_FULL_CONFIDENCE": 4,
+  "CANDIDATE_POOL": 50,
+  "MATCH_THRESHOLD": 75.0
+}
+```
+
 ---
 
-## 4. SGGS corpus pipeline ⚠️
+## 4. SGGS corpus pipeline ✅
 
 ### Build-time conversion (one-time per release)
 
@@ -115,17 +161,28 @@ android/app/src/main/assets/corpus.sqlite     (bundled)
 
 For Banis the table doesn't cover (e.g., specific Asa Ki Vaar pauri groupings if needed), we add them in `build/` as supplementary tables.
 
-### Corpus size on device
+### Corpus size on device — trim to ~100 MB
 
-Raw v4.8.7 SQLite is 151 MB. App database with Unicode column will be ~155-160 MB. Acceptable for iOS app bundle. If we want it smaller:
-- Drop translations we don't ship (Spanish, Urdu, multiple Punjabi teekas) → ~100 MB
-- Or download corpus on first launch → smaller .ipa, requires network on first run
+Bundle the **curated** corpus:
+- ✅ Anmol Lipi Gurmukhi (`lines.gurmukhi`)
+- ✅ Unicode Gurmukhi (`lines.gurmukhi_unicode` — built via anvaad-js)
+- ✅ English transliteration (`transliterations.transliteration` where `language=English`)
+- ✅ One English translation — **Bhai Manmohan Singh** by default (traditional voice; can be switched to Sant Singh Khalsa in settings)
+- ✅ One Punjabi Teeka — **Prof. Sahib Singh** (the canonical Sikh exegesis)
 
-**Recommendation:** ship the full corpus inline for now (offline-from-first-launch principle). Optimize if App Store size becomes an issue.
+Drop from default bundle (server-downloadable on demand via "Download additional translations" in Settings):
+- Spanish, French, German translations
+- Urdu transliteration
+- Hindi transliteration (Devanagari)
+- Additional English translations (multiple Khalsa variants, etc.)
+- Additional Punjabi teekas (Fareedkot Teeka, etc.)
+- `pronunciation_information` (the lengthy commentary column — saves several MB)
+
+Build target: ≤ 100 MB. Anything additional is fetched per-user via the server endpoint into the app's documents directory.
 
 ---
 
-## 5. ASR strategy ⚠️ (the second big one)
+## 5. ASR strategy ✅
 
 ### Recommended pipeline
 
@@ -143,24 +200,35 @@ Most users will hit on-device. Server is a safety net, not the default.
 - whisper.cpp is the de-facto C++ implementation; SwiftPM-installable
 - CoreML conversion offloads the encoder to the Apple Neural Engine — 3-5× speedup on supported devices
 - Model size choices (4-bit quantized):
-  - `ggml-base` (~150 MB) — fast, poor Punjabi quality
-  - `ggml-medium` (~500 MB quantized) — Phase 1 baseline; works
+  - `ggml-base` (~150 MB) — fast, lower quality but **sufficient for spoken Paath**
+  - `ggml-small` (~250 MB quantized) — slightly better than base
+  - `ggml-medium` (~500 MB quantized) — Phase 1 baseline; clear quality bump
   - `ggml-large-v3` (~1.5 GB quantized) — best quality; sizeable bundle hit
 
-**Recommendation:** ship `medium` baseline in the bundle, allow user to download `large-v3` as an optional in-app upgrade from settings. Mirrors how Whisper desktop apps handle this.
+**Default = `small` (~250 MB).** Settings UI offers upgrade to `medium` or `large-v3` with battery + storage warnings.
 
-### Server fallback
+Rationale: most Paath users don't need medium-tier quality. Phase 1's `japji sahib 1.mp3` scored 96.6 on `large-v3`; even `small` will likely cover spoken Paath well. Bundle-size pressure (App Store / first-download impact) wins over marginal accuracy. Power users upgrade.
 
-A single Hetzner CCX23 (~$25/mo, 4 vCPUs, 16 GB) running:
-- FastAPI HTTP endpoint
+### Server fallback — privacy contract
+
+A single Hetzner box (DE jurisdiction, ~$25/mo, 4 vCPUs, 16 GB) running:
+- FastAPI HTTP endpoint, source-available (this repo's `server/`)
 - Receives raw 16kHz mono PCM chunks over WebSocket
-- Runs `faster-whisper large-v3` (no need to bundle on device)
+- Runs `faster-whisper large-v3`
 - Streams back Latin-normalised transcript
 
-**Privacy considerations** (CLAUDE.md principle: privacy-first):
-- Server fallback is **opt-in only** — explicit consent on first launch on an unsupported device
-- Audio is not stored server-side; in-memory only, dropped after transcription
-- Privacy policy explicit about this; clear "use server" toggle in settings always available
+**Privacy contract — committed in writing, surfaced in-app, enforced in code:**
+
+1. **No audio storage.** PCM chunks held only in process memory during transcription; dropped immediately after the WebSocket closes. No disk writes, no temp files, no log records of audio content.
+2. **No content logging.** Server logs include: timestamp, request duration, error codes. They explicitly **do not include**: transcript text, audio bytes, IP addresses (stripped at the reverse proxy), user agents, device fingerprints.
+3. **No user identifier.** Authentication is a per-session ephemeral token generated by the app at the start of each listening session. The token is opaque, not tied to any user account, and expires when the session ends. No persistent user ID exists server-side.
+4. **DE jurisdiction.** Hetzner data centre in Germany. GDPR-aligned defaults. No US Cloud Act exposure.
+5. **Source-available server code.** The `server/` directory ships under the same OSS licence as the rest of the project. Anyone can audit that the policy above is what the code does.
+6. **Opt-in per session, not per install.** Each listening session that needs server fallback prompts: "Use server-based recognition for this session? Audio will be processed in Germany and immediately discarded. [Just for now] [Always allow] [Never use server]". "Just for now" is the default. The "Always allow" path requires a more explicit consent screen.
+7. **In-app consent flow** before any audio leaves the device. UI shows the policy above in plain language plus a link to the full privacy policy.
+8. **Always reversible.** "Never use server" in settings is honoured immediately and persistently.
+
+The server fallback is a **last-resort** — older devices with no Neural Engine, or low-storage devices that can't download even the `small` model. The 90%+ case is fully on-device.
 
 ### Streaming chunking strategy
 
@@ -172,6 +240,27 @@ A single Hetzner CCX23 (~$25/mo, 4 vCPUs, 16 GB) running:
 ---
 
 ## 6. iOS audio capture
+
+### AudioSource abstraction (Flag A) — architect now, ship MicSource only
+
+```swift
+protocol AudioSource {
+    /// Begin streaming 16 kHz mono Float32 buffers via the callback.
+    func start(_ onBuffer: @escaping (AVAudioPCMBuffer) -> Void) throws
+    func stop()
+    var isRunning: Bool { get }
+    var configurationDescription: String { get }   // for UI / telemetry
+}
+
+final class MicSource: AudioSource { /* Phase 2A — AVAudioEngine impl */ }
+
+// Stub — Phase 2C (Gurdwara projector / line-in from mixer console)
+final class LineInSource: AudioSource {
+    init() { fatalError("LineInSource not yet implemented — Phase 2C") }
+}
+```
+
+30-min design tax during Phase 2A; Phase 2C drops in `LineInSource` (uses `AVCaptureDevice` USB-audio routing or AudioUnit HAL) without touching anything downstream.
 
 ### AVAudioEngine config
 
@@ -392,22 +481,23 @@ Edge cases handled:
 
 ---
 
-## 14. Implementation roadmap
-
-I'll work through these in order; stops at the marked checkpoints.
+## 14. Implementation roadmap ✅ (Unicode rendering moved before first Bani checkpoint)
 
 | Step | What | Stop and check in? |
 |---|---|---|
-| 1 | Build pipeline: `build/convert_anmol_to_unicode.js` + `build_app_database.py` → bundle-ready SQLite | No (small, mechanical) |
-| 2 | Swift corpus loader + matcher port (covering test battery from Phase 1) | No, but I'll show the test results |
-| 3 | iOS Xcode project skeleton, AVAudioEngine pipeline, whisper.cpp wired in | **Yes — checkpoint 1: lock in architecture decisions before UI work** |
-| 4 | Bani Picker + Follow View for one Nitnem Bani (Japji) end-to-end | **Yes — checkpoint 2: first buildable iOS prototype, you try it on your phone** |
-| 5 | Remaining Nitnem Banis, Sukhmani, AKV | Incremental commits, no formal checkpoint |
-| 6 | Sehaj Paath mode (full SGGS + state machine) | No (architectural; show telemetry) |
-| 7 | Akhand Paath mode (long-session resilience) | No |
-| 8 | Settings, translations toggle, model upgrade flow | No |
-| 9 | Background mode polish, battery/thermal handling | No |
-| 10 | App Store submission readiness | **Yes — checkpoint 3: before TestFlight / submission** |
+| 1 | Repo restructure (`src/gurbanilens/` → `core/`), build pipeline (`build/convert_anmol_to_unicode.js` + `build_app_database.py`), port-parity test vectors JSON | No (mechanical) |
+| 2 | Swift Package (`ios/GurbaniLensCore/`) — corpus loader + matcher port. Validates against `tests/portparity/test_vectors.json`. | No, but I'll show test pass rate |
+| 3 | iOS Xcode project skeleton, `AudioSource`/`MicSource`, AVAudioEngine pipeline, whisper.cpp wired in | **Yes — checkpoint 1: try recording + transcribing, before UI work** |
+| 4 | **Anvaad-js / Unicode Gurmukhi rendering pipeline** (moved up per amendment) — bundled font, conjunct + vishraam rendering test cases, dark-mode + large-text variants | No, but I'll show side-by-side rendering samples |
+| 5 | Bani Picker + Follow View for one Nitnem Bani (Japji) end-to-end | **Yes — checkpoint 2: first buildable iOS prototype, you try it on your phone** |
+| 6 | Remaining Nitnem Banis, Sukhmani, AKV | Incremental commits, no formal checkpoint |
+| 7 | Sehaj Paath mode (full SGGS + state machine) | No (architectural; show telemetry) |
+| 8 | Akhand Paath mode (long-session resilience, phone-mic case only — line-in is Phase 2C) | No |
+| 9 | Settings, translations toggle, server-download flow for non-default translations, model upgrade flow | No |
+| 10 | Opt-in feedback channel (§17) — wire from launch even if backend is stub | No |
+| 11 | Accessibility pass (§18) — VoiceOver/TalkBack, large-text, haptics, high-contrast | No |
+| 12 | Background mode polish, battery/thermal handling | No |
+| 13 | App Store submission readiness | **Yes — checkpoint 3: before TestFlight / submission** |
 
 Parallel work tracks (lower priority, scheduled when I'm waiting on user feedback):
 - **Track B:** `scripts/fetch_samples.py` for Kirtan sample gathering (Phase 2B prep)
@@ -415,24 +505,72 @@ Parallel work tracks (lower priority, scheduled when I'm waiting on user feedbac
 
 ---
 
-## 15. Open questions / risks
+## 15. Open questions / known tuning tasks
 
-- **iPhone Neural Engine performance on whisper-medium** — needs real measurement; if too slow at real-time, we drop to whisper-base or move to server-only for some operations. Benchmark in step 3.
-- **CoreML conversion of large-v3** — community tooling exists but is fiddly. Plan to ship medium baseline and treat large-v3 as a stretch.
-- **Gurmukhi font rendering** — system fonts may render some conjuncts incorrectly. Plan: bundle a known-good font (Gurbani Akhar Slim / Gurbani Akhar) under appropriate licence.
+- **iPhone Neural Engine performance on `small`/`medium`** — needs real measurement; if too slow at real-time, we drop a tier. Benchmark in step 3.
+- **CoreML conversion of large-v3** — community tooling exists but is fiddly. Plan to ship `small` baseline and treat `medium`/`large-v3` as user-downloaded upgrades.
 - **Akhand Paath voice handoff** — DRIFTING-state recovery is a guess until we test on a real recording with multiple Pathis. Phase 2B sample gathering should include one.
-- **Server fallback privacy review** — opt-in is the answer but the framing of the consent screen needs care. Lawyer? Possibly worth a small consultation when we get to that step.
+- **Server fallback consent UX** — opt-in is the answer; the framing of the consent screen needs careful copywriting (some users will reflexively decline anything that asks for audio permissions). Possibly worth UX testing with a small Sangat group.
+- **Whisper non-determinism (Flag C, known tuning task)** — Phase 1 surfaced that the same audio produces different transcripts across runs. For projector reliability we need to set Whisper's `temperature=0`, disable temperature-fallback retries (`temperature_increment_on_fallback=null`), and use a fixed seed where the library supports it. faster-whisper exposes `temperature=[0.0]` to fix this; whisper.cpp has `params.temperature = 0.0f`. Apply during step 3 instrumentation.
 
 ---
 
-## 16. What I'd like Deep to weigh in on before I start
+## 16. Decision log
 
-In priority order:
+See the sign-off table at the top of this document. Architecture locked 2026-05-12; implementation begins step 1.
 
-1. **§3 — Core engine language:** Swift+Kotlin re-impl vs Rust core. My recommendation is the lighter Swift+Kotlin path. Decide if you want to invest in Rust earlier.
-2. **§5 — ASR strategy:** confirm medium-baseline + optional large-v3 download, and confirm server fallback is opt-in only.
-3. **§2 — Repo structure:** confirm monorepo is fine vs separating ios/ into its own repo.
-4. **§4 — Corpus pipeline:** ship full 155 MB or trim translations to save bundle size?
-5. **§14 — Implementation order:** any reordering you want?
+---
 
-Once you sign off (or amend), I lock these in and begin step 1.
+## 17. Opt-in feedback channel (Addition 1)
+
+A "This isn't right" button on every matched Pangti in the Follow View. Captures (anonymous device ID, audio segment, our match, user's suggested correction) and POSTs to the server.
+
+**Strictly opt-in.** First-launch onboarding includes a single, plain-language toggle: "Help improve GurbaniLens — share corrected matches when something looks wrong? Audio + correction goes to our research dataset under the same privacy contract as ASR fallback." Off by default; user must explicitly enable.
+
+**What gets captured per correction:**
+- Anonymous device ID (UUID generated on first launch, scoped to this app install, no link to Apple/Google ID)
+- The 5-10 second audio segment that produced the wrong match (raw PCM, same privacy treatment as server-fallback audio)
+- Our top match (Ang, Pangti, confidence, full window text)
+- The user's correction — either a tap on the correct Pangti from the list, or "I don't know what this is"
+- Mode context (Nitnem Bani name, or Sehaj/Akhand)
+- App version, model size
+
+**What does NOT get captured:**
+- User identity in any form
+- Location
+- Device characteristics beyond OS major version
+- Any session content other than the corrected window
+
+**Server endpoint:** `POST /feedback/correction`. Stores in a queue (encrypted at rest), processed asynchronously into a labeled dataset for future matcher/ASR improvement. Source-available alongside the ASR fallback server.
+
+**Visibility:** Settings → "View my submitted corrections" lists every submission this device has made. "Delete all my submissions" removes them from the server (we honour the request; per device, server-side, immediate).
+
+**Why capture from launch:** even if Phase 3 is when we act on this data, we can't retro-generate user feedback. The cost of building the capture path now is low; the value of having year-one corrections when fine-tuning begins is high.
+
+---
+
+## 18. Accessibility (Addition 2)
+
+This is a Seva app. Accessibility is a **core feature**, not a bolt-on. Phase 2A ships with all of these working, not as a follow-up release.
+
+### Visual
+
+- **Large-text mode:** Honour iOS Dynamic Type. Gurmukhi, transliteration, and translation all scale together with system text-size setting. Tested at the largest accessibility size (AccessibilityXXXLarge).
+- **Pinch-to-zoom Gurmukhi:** in the Follow View, a pinch gesture independently scales the Gurmukhi text up to 4×. Layout reflows. Setting is per-Bani persisted.
+- **High-contrast mode:** Honour "Increase Contrast" iOS setting. Custom palette with WCAG AAA contrast ratios. Dark mode default with optional light mode.
+- **Reduced-motion mode:** Honour "Reduce Motion" — auto-scroll becomes instant snap instead of animated; confidence-indicator pulse becomes static colour change.
+
+### Audio / motor / hearing
+
+- **VoiceOver / TalkBack:** every matched Pangti is announced when locked. The user can swipe to step through Pangtis manually. Transliteration or English translation can be set as the spoken form (so blind Sangat following along by ear can have the current line spoken in their preferred language). Critically: VoiceOver focus follows the matched line automatically.
+- **Haptic / vibration cues:** new-Pangti-match triggers a soft haptic. Hearing-impaired Sangat can follow without sound. Configurable intensity in settings.
+- **Switch Control compatible:** all buttons reachable via Switch Control / external keyboard. No gesture-only interactions.
+
+### Cognitive
+
+- **Plain-language onboarding** — no jargon. Explain what the app does, what it doesn't, what data leaves the device.
+- **Clear error states** — when the matcher loses the thread, the UI says so plainly: "I lost track of where you are. Tap the line you're on now." Never silent failure.
+
+### Verification
+
+Each Bani's Follow View ships with an automated accessibility test in `ios/GurbaniLensTests/AccessibilityTests.swift`: VoiceOver announcement order, contrast ratios, Dynamic Type scaling, haptic firing. Failures block release.

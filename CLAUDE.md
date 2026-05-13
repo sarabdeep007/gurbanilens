@@ -150,5 +150,6 @@ gurbanilens/
 - ✅ Domain: GurbaniLens.com (to be registered)
 - ✅ 13 sample Kirtan recordings gathered in `./samples/` (gitignored)
 - ✅ Phase 1 CLI built, evaluated, closed (see [PHASE_1_CONCLUSION.md](./PHASE_1_CONCLUSION.md))
-- ⏳ Phase 2A architecture review — drafted at [docs/PHASE_2A_ARCHITECTURE.md](./docs/PHASE_2A_ARCHITECTURE.md), awaiting Deep's sign-off before iOS code begins
-- ⏳ Phase 2B preparation tracks (sample gathering script, aeneas spike) — to be scheduled
+- ✅ Phase 2A architecture **LOCKED 2026-05-12** — see [docs/PHASE_2A_ARCHITECTURE.md](./docs/PHASE_2A_ARCHITECTURE.md). Sign-off table at top of doc.
+- ⏳ Phase 2A implementation in progress — starting with repo restructure + build pipeline + port-parity vectors (step 1 of §14)
+- ⏳ Phase 2B preparation tracks running in parallel: `scripts/fetch_samples.py` (Track B) and aeneas forced-alignment spike (Track C, writeup at [docs/aeneas_spike.md](./docs/aeneas_spike.md))
