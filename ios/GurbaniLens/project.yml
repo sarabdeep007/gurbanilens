@@ -1,0 +1,81 @@
+name: GurbaniLens
+options:
+  bundleIdPrefix: com.taajstudios
+  deploymentTarget:
+    iOS: "15.0"
+  developmentLanguage: en
+  groupSortPosition: top
+  generateEmptyDirectories: true
+  # Use the personal team for free-Apple-ID signing. Override via the
+  # DEVELOPMENT_TEAM build setting when the paid Apple Developer Program
+  # account is approved — no other changes required.
+  defaultConfig: Debug
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    IPHONEOS_DEPLOYMENT_TARGET: "15.0"
+    # Free-Apple-ID friendly. Personal team auto-selected by Xcode when
+    # DEVELOPMENT_TEAM is empty. Code signing happens at build time using
+    # Xcode's "Automatically manage signing" path.
+    CODE_SIGN_STYLE: Automatic
+    CODE_SIGN_IDENTITY: "Apple Development"
+    PRODUCT_BUNDLE_IDENTIFIER: com.taajstudios.gurbanilens
+    SWIFT_TREAT_WARNINGS_AS_ERRORS: NO
+    GCC_TREAT_WARNINGS_AS_ERRORS: NO
+
+packages:
+  GurbaniLensCore:
+    # Sibling SPM package in this repo (../GurbaniLensCore/)
+    path: ../GurbaniLensCore
+  whisper:
+    # whisper.cpp Swift Package — provides `import whisper`
+    url: https://github.com/ggerganov/whisper.cpp.git
+    from: "1.5.4"
+
+targets:
+  GurbaniLens:
+    type: application
+    platform: iOS
+    sources:
+      - path: GurbaniLens
+        excludes:
+          - "**/.DS_Store"
+    resources:
+      - path: GurbaniLens/Resources/Assets.xcassets
+        optional: true
+      - path: GurbaniLens/Resources/Models
+        optional: true
+    info:
+      path: GurbaniLens/Resources/Info.plist
+      properties:
+        CFBundleDisplayName: GurbaniLens
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        # Microphone permission. Plain language; we tell the user exactly
+        # what we do with audio.
+        NSMicrophoneUsageDescription: "GurbaniLens listens to recitation so it can follow along, highlight the current line, and auto-scroll. Audio stays on this device by default."
+        # Background mode entitlement — keep listening while screen is off
+        # or the app is backgrounded.
+        UIBackgroundModes:
+          - audio
+        # Allow the user to keep the app on while reciting.
+        UIRequiresPersistentWiFi: false
+    entitlements:
+      path: GurbaniLens/Resources/GurbaniLens.entitlements
+      properties:
+        com.apple.developer.kernel.increased-memory-limit: false
+    dependencies:
+      - package: GurbaniLensCore
+        product: GurbaniLensCore
+      - package: whisper
+        product: whisper
+    settings:
+      base:
+        TARGETED_DEVICE_FAMILY: "1,2"  # iPhone + iPad
+        ENABLE_PREVIEWS: YES

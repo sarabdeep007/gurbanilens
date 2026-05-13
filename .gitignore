@@ -65,3 +65,18 @@ docs/aeneas_spike_alignment.json
 .env
 .env.local
 *.log
+
+# Server
+server/node_modules/
+server/package-lock.json
+
+# XcodeGen-generated project files (regenerate with `xcodegen generate`)
+ios/GurbaniLens/GurbaniLens.xcodeproj/
+ios/GurbaniLens/GurbaniLens.xcworkspace/
+
+# iOS Resources fetched at build time (whisper models + app db live in bundle Resources)
+ios/GurbaniLens/GurbaniLens/Resources/Models/
+ios/GurbaniLens/GurbaniLens/Resources/Database/
+
+# Whisper conversion artifacts
+build/whisper.cpp/
