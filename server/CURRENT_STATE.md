@@ -197,3 +197,60 @@ I will stop and HOLD with curl test output before moving on.
 ---
 
 **HOLDING for next dispatch.**
+
+---
+
+# Update 2026-06-17 (Task 4 — vuln vetting)
+
+`npm audit` after the initial install flagged **10 vulnerabilities**:
+
+| Severity | Package | Reachable? | Action |
+|---|---|---|---|
+| HIGH | `fast-uri` (via `fastify` 4.x) | Yes — every request path through Fastify's URL parsing | upgrade `fastify` 4 → 5 |
+| HIGH | `@fastify/ajv-compiler`, `@fastify/fast-json-stringify-compiler`, `fast-json-stringify` | transitive from `fastify` 4.x | resolved by `fastify` 5 upgrade |
+| CRITICAL | `vitest` 2.x | only in `vitest --ui` / `vitest serve` mode — we run `vitest run` | upgrade `vitest` 2 → 4 anyway, defence in depth |
+| MOD | `vite`, `vite-node`, `@vitest/mocker`, `esbuild` | transitive from `vitest` 2.x | resolved by `vitest` 4 upgrade |
+
+**Done:**
+
+- `fastify` 4.27 → 5.8.5
+- `@fastify/multipart` 8 → 9 (v5-compatible)
+- `vitest` 2 → 4.1.9
+- Dropped unused devDeps (`undici`, `form-data`)
+
+**Result:** `npm audit` reports `found 0 vulnerabilities`. All 18 tests
+still pass under Fastify 5 + vitest 4. End-to-end smoke (POST/GET/DELETE
+on /feedback, /healthz, /readyz) verified.
+
+# Update 2026-06-17 (Task 3 — sql.js swap)
+
+`better-sqlite3` was the initial pick for SQLite. It failed to compile
+on this dev host (no prebuild binary matched, host was OOM-thrashing
+under load 23 with no swap). Rather than fight native-build issues —
+which would have *also* required `build-essential` in the Dockerfile —
+swapped to **`sql.js`** (pure-JS / WASM SQLite).
+
+Trade-off:
+- ✅ No native compile anywhere. Dockerfile lost a stage.
+- ✅ Throughput is fine for v1 scale (20 inserts/hr/session).
+- ⚠ DB is held in memory; we `writeFileSync` after each mutation. For
+  expected volume (kilobytes per row, < 1 MB DB after months) this is
+  free. If we ever cross ~10 MB / sustained writes, revisit.
+
+Server source still presents the same `FeedbackStore` interface — call
+sites in `src/routes/feedback.js` didn't change.
+
+# Update 2026-06-17 (Task 3 — privacy bug found + fixed during smoke)
+
+While smoke-testing `/feedback`, noticed the server log was printing the
+full URL including the `?session_token=...` query string for GET and
+DELETE endpoints. That violates the README's "no headers, no IPs, no
+bodies, no tokens" promise.
+
+Fixed in `src/middleware/privacy.js`: logger `req` serializer now
+projects `{ method, path: stripQuery(url) }`. Verified by re-running
+smoke: `grep -c session_token /tmp/server.log → 0`.
+
+Added an explicit Vitest assertion in `test/privacy.test.js` so this
+can never regress.
+
