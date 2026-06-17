@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "build_id": "e3b0c44298fc1c14",
+  "produced_by": "scripts/build_dataset.py",
+  "registry_path": "samples/registry.json",
+  "eligibility_predicate": {
+    "tiers": [
+      "high",
+      "medium"
+    ],
+    "kinds": [
+      "pangti"
+    ],
+    "require_text_gurmukhi": true,
+    "exclude_repeat_groups": true,
+    "recording_qualities": [
+      "clean_live",
+      "studio"
+    ],
+    "doc": "docs/alignment_accuracy.md §6"
+  },
+  "splits": {
+    "train": {
+      "file": "splits/train.json",
+      "rows": 0
+    },
+    "val": {
+      "file": "splits/val.json",
+      "rows": 0
+    },
+    "test": {
+      "file": "splits/test.json",
+      "rows": 0
+    }
+  },
+  "coverage": {
+    "rows": 0,
+    "duration_sec": 0.0,
+    "duration_hours": 0.0,
+    "rows_per_split": {
+      "train": 0,
+      "val": 0,
+      "test": 0
+    },
+    "rows_per_tier": {
+      "high": 0,
+      "medium": 0
+    },
+    "distinct_pangtis": 0,
+    "distinct_jathas": 0,
+    "distinct_raags": 0
+  },
+  "v1_targets": {
+    "high_tier_audio_hours": 5,
+    "distinct_jathas": 5,
+    "distinct_raags": 5,
+    "distinct_pangtis": 200,
+    "rationale": "See docs/DATASET_PHILOSOPHY.md §7 — quality over quantity for first fine-tune attempt."
+  },
+  "samples": [],
+  "audio_storage": "symlinked"
+}

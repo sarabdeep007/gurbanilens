@@ -87,3 +87,8 @@ ios/GurbaniLens/GurbaniLens/Resources/Database/
 
 # Whisper conversion artifacts
 build/whisper.cpp/
+
+# Dataset audio is symlinked/copied from samples/ (which is gitignored upstream).
+# Alignments, splits, manifest, and README *are* checked in — those are our
+# original CC-BY-SA-4.0 contribution.
+dataset/audio/
