@@ -17,7 +17,10 @@ import { existsSync } from "node:fs";
 
 import { requireBearer } from "./middleware/auth.js";
 import { RateLimiter, makeRateLimitHook } from "./middleware/rate_limit.js";
+import { privacyLoggerConfig, registerPrivacyHooks } from "./middleware/privacy.js";
 import { registerTranscribeRoute, TRANSCRIBE_LIMITS } from "./routes/transcribe.js";
+import { registerFeedbackRoutes } from "./routes/feedback.js";
+import { openFeedbackStore } from "./db.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_SERVER = resolve(__dirname, "..");
@@ -30,26 +33,20 @@ const WHISPER_PYTHON = process.env.WHISPER_PYTHON
   ?? join(REPO_SERVER, ".venv-asr", "bin", "python");
 const WHISPER_WORKER = process.env.WHISPER_WORKER
   ?? join(REPO_SERVER, "src", "asr", "whisper_worker.py");
+const FEEDBACK_DB_PATH = process.env.FEEDBACK_DB_PATH
+  ?? join(REPO_SERVER, "data", "feedback.db");
+const FEEDBACK_HMAC_SECRET = process.env.FEEDBACK_HMAC_SECRET
+  ?? "dev-only-change-me-32-chars-or-more-please-do-not-use-in-prod";
+const FEEDBACK_DISABLED = process.env.FEEDBACK_DISABLED === "1";
 
 const app = Fastify({
-  logger: {
-    level: process.env.LOG_LEVEL ?? "info",
-    serializers: {
-      // Privacy: no headers, no IPs, no bodies. Only method+url+status+duration.
-      req: (req) => ({ method: req.method, url: req.url }),
-      res: (res) => ({ statusCode: res.statusCode }),
-    },
-  },
+  logger: privacyLoggerConfig({ level: process.env.LOG_LEVEL ?? "info" }),
   trustProxy: false, // X-Forwarded-For is stripped at the reverse proxy
   disableRequestLogging: false,
   bodyLimit: 12 * 1024 * 1024, // 12 MB — slightly above /transcribe's 10 MB cap
 });
 
-// Global response headers — set on every response.
-app.addHook("onSend", async (req, reply) => {
-  reply.header("X-Robots-Tag", "noindex");
-  reply.header("Cache-Control", "no-store");
-});
+registerPrivacyHooks(app);
 
 await app.register(multipart, {
   limits: {
@@ -64,7 +61,18 @@ const transcribeLimiter = new RateLimiter({
   windowMs: 60 * 60 * 1000,
   maxInWindow: 60,
 });
-setInterval(() => transcribeLimiter.sweep(), 5 * 60 * 1000).unref();
+const feedbackLimiter = new RateLimiter({
+  windowMs: 60 * 60 * 1000,
+  maxInWindow: 20,
+});
+setInterval(() => {
+  transcribeLimiter.sweep();
+  feedbackLimiter.sweep();
+}, 5 * 60 * 1000).unref();
+
+const feedbackStore = FEEDBACK_DISABLED
+  ? null
+  : await openFeedbackStore({ path: FEEDBACK_DB_PATH, hmacSecret: FEEDBACK_HMAC_SECRET });
 
 // --- routes ---
 
@@ -100,10 +108,16 @@ if (!WHISPER_DISABLED) {
   });
 }
 
-// Feedback routes (implemented in Task 3) — keep stub shape for now.
-app.post("/feedback/correction", async (_req, reply) => {
-  reply.code(501).send({ error: "not_implemented", reason: "pending_task_3" });
-});
+if (feedbackStore) {
+  registerFeedbackRoutes(app, {
+    store: feedbackStore,
+    limiter: feedbackLimiter,
+  });
+} else {
+  app.post("/feedback/correction", async (_req, reply) => {
+    reply.code(503).send({ error: "not_implemented", reason: "feedback_disabled" });
+  });
+}
 
 // --- boot ---
 
@@ -124,6 +138,9 @@ try {
 for (const sig of ["SIGINT", "SIGTERM"]) {
   process.on(sig, () => {
     app.log.info({ sig }, "shutdown requested");
-    app.close().then(() => process.exit(0));
+    app.close().then(() => {
+      if (feedbackStore) feedbackStore.close();
+      process.exit(0);
+    });
   });
 }
