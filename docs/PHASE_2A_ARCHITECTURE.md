@@ -1,6 +1,69 @@
 # Phase 2A Architecture — Paath / Bani Recitation Companion
 
 _Drafted 2026-05-12. **Status: architecture LOCKED 2026-05-12. Sign-offs and amendments below.**_
+_Versioned v1 / v2 / v3 on 2026-06-17 — see "Phase 2A versioning" section directly below._
+
+---
+
+## Phase 2A versioning (added 2026-06-17)
+
+This document was originally written for a single "Phase 2A = continuous-listen Paath companion" scope. On **2026-06-17** we split Phase 2A into three sub-versions to ship usefulness earlier and decouple v1 from the unfinished Phase 2B Kirtan fine-tune.
+
+| Version | Scope | Status | Sections in this doc |
+|---|---|---|---|
+| **v1** | **Voice-search Gurbani.** Tap → speak/recite a Pangti → ASR → matcher → display Shabad. Foreground, tap-to-record only. | **CURRENT — in flight** | §2 (repo layout), §3 (matcher port), §4 (corpus), §5 (ASR, single-shot subset), §8 (matcher) |
+| **v2** | Continuous live listen / auto-follow. Nitnem, Sukhmani, Asa Ki Vaar, Sehaj Paath, Akhand Paath. Background-tolerant. | DEFERRED — behind v1 ship + Phase 2B Kirtan fine-tune | §1 (modes), §5 (streaming chunks), §6 (iOS audio capture, background), §7 (Android background), §9 (Sehaj Paath state machine), §10 (Akhand Paath), §11 (Follow View), §12 (background resilience) |
+| **v3** | Gurdwara projector + Sevadaar control panel. Use Case 2. Line-in source. Strict accuracy. | DEFERRED — behind v2 + Phase 2B | §6 (LineInSource stub), §10 (Akhand Paath at-Gurdwara) |
+
+Cross-cutting sections (§13 data flow, §14 roadmap, §15 open questions, §16 decisions, §17 feedback, §18 accessibility) apply to **all versions**. Wherever a v2- or v3-only concept appears (Follow View auto-scroll, sequential-progression bias, AVAudioSession `.playAndRecord` background mode, `mixWithOthers`, Akhand Paath state machine, etc.) treat it as out of v1 scope.
+
+### v1 voice-search shape (delta from the rest of this doc)
+
+The original §6 audio capture, §11 Follow View, and §9–§10 state machines were written assuming **continuous listening with auto-scroll**. v1 is dramatically simpler:
+
+```
+HomeScreen (CTA: "Search by voice")
+    ↓ user taps
+RecordingScreen (visual VU, 5–15 s clip)
+    ↓ user releases / app detects silence
+ASR (whisper.cpp, single-shot on the captured buffer)
+    ↓
+Matcher (top-5 over the corpus — single-shot, no sequential bias state)
+    ↓
+ResultsScreen ("did you mean…" + confidence label)
+    ↓ user picks
+ShabadScreen (full Shabad context, scripts/translation toggles)
+```
+
+No `.mixWithOthers`, no background mode, no `MPNowPlayingInfoCenter`, no `ForegroundService`, no state machine. iOS uses `AVAudioRecorder` (or a one-shot `AVAudioEngine` tap); Android uses `AudioRecord` foreground-only.
+
+The Swift / Kotlin matcher API surface is **the same as v2 needs** — `Matcher.match(query, topN: 5)` over the full SGGS-with-English-transliteration set. The v2 additions (sequential-progression bias, state machine) are decorations on top; the v1 port doesn't include them.
+
+### v1 ASR choice (delta from §5)
+
+- Same on-device whisper.cpp recommendation. CoreML acceleration on iOS, NNAPI/GPU delegate on Android where available.
+- **Recommend bundled `small` (~250 MB).** Phase 1 evidence: `japji sahib 1.mp3` scored 96.6 on `large-v3` for spoken Paath — `small` should be plenty for tap-to-speak. Power users can download `medium` / `large-v3` from Settings.
+- No streaming/chunking pipeline needed in v1 — single-shot transcription on the captured buffer. v2 brings back the §5 sliding-window logic.
+- Server fallback (§5 "privacy contract") is **explicitly out of v1 scope**. v1 is on-device only. If a device can't run `small`, we surface "this device is below the requirement" rather than spinning up server infrastructure.
+
+### Sections to skip when reading for v1
+
+If you are working on v1, skip these on a first pass:
+- §1 Modes table (rows beyond "single Pangti search") — those are v2
+- §5 "Streaming chunking strategy" — v2 only
+- §5 "Server fallback — privacy contract" — out of v1 scope
+- §6 AudioSource abstraction, AVAudioSession, background entitlement — v1 doesn't need any of it
+- §7 Android `FOREGROUND_SERVICE_MICROPHONE` — v1 doesn't need it
+- §9 Sehaj Paath state machine — v2
+- §10 Akhand Paath — v2
+- §11 Follow View — v2 (v1 has ResultsScreen + ShabadScreen instead)
+- §12 Background + screen-off resilience — v2
+- §13 data flow diagram — v1 path is the smaller one shown above; the full diagram is v2
+
+Everything else (matcher port-parity contract, corpus pipeline, Anvaad-js Unicode rendering, accessibility, feedback channel, implementation roadmap structure) still applies to v1.
+
+---
+
 
 | Decision | Status | Amendment |
 |---|---|---|

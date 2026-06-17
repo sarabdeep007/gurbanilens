@@ -56,27 +56,46 @@ Original success criterion (≥70% Shabad-hit on clean studio recordings) was me
 
 ## Phase 2 plan (post-Phase 1 decision)
 
-### Phase 2A — Paath / Bani recitation companion app (CURRENT)
+### Phase 2A — Voice-search Gurbani (CURRENT, pivoted 2026-06-17)
 
-Full Paath companion: Nitnem Banis (Japji, Jaap, Tav-Prasad Savaiye, Chaupai, Anand, Rehras, Kirtan Sohila), Sukhmani Sahib, Asa Ki Vaar, **Sehaj Paath** (find reader anywhere in SGGS), **Akhand Paath** (continuous 48hr, multi-Pathi).
+Tap a button → speak/recite a Pangti → Whisper transcribes → matcher finds Pangti → app shows the full Shabad. Foreground only, tap-to-speak, no continuous listening, no background audio.
 
-- iOS first (Swift/SwiftUI), Android right after (Kotlin/Compose)
-- On-device ASR via whisper.cpp + CoreML where the device can handle it; server fallback for older devices (opt-in due to privacy)
-- Background-tolerant (screen off, app backgrounded → still listening)
-- Offline-capable for the SGGS corpus
+Why this is the right v1:
+- **Spoken Punjabi recitation is the best possible ASR input.** Phase 1 measured Japji at 96.6 confidence on `large-v3` — clean speech vs sung Kirtan is night-and-day for Whisper.
+- Ships without Kirtan fine-tuning. Removes the only Phase 1 blocker.
+- Foreground tap-to-record removes a huge class of platform headaches (background audio entitlements, foreground services, AVAudioSession edge cases).
+- Most-requested user need: "I half-remember a Pangti, find the Shabad for me."
+
+Phase 2A v1 stack:
+- iOS first (Swift/SwiftUI), Android in parallel (Kotlin/Compose)
+- On-device whisper.cpp; bundled `small` model (~200 MB) at install; settings option to download `base`/`medium`/`large-v3`
+- Offline-capable: SGGS corpus + matcher fully on-device
 - Anvaad-js (build-time) for Anmol Lipi → Unicode Gurmukhi conversion
+- Matcher: port of Phase 1 Python to Swift (✅ shipped) + Kotlin (in flight)
 
-See [docs/PHASE_2A_ARCHITECTURE.md](./docs/PHASE_2A_ARCHITECTURE.md) for stack decisions, repo structure, data flow, and implementation roadmap.
+Out of scope for v1 — explicitly deferred to v2 / v3:
+- Continuous live listening / auto-follow (v2)
+- Background audio, screen-off resilience (v2)
+- Sehaj Paath find-the-reader, Akhand Paath long-session (v2)
+- Sevadaar override controls, Gurdwara projector deployment (v3)
 
-### Phase 2B — Kirtan dataset + fine-tuned ASR (parallel)
+### Phase 2A v2 — Continuous live Paath/Kirtan auto-follow (DEFERRED)
+
+The original Phase 2A spec: continuous mic, auto-scroll, Sehaj Paath, Akhand Paath. Deferred behind v1 ship + v2-grade Kirtan dataset from Phase 2B.
+
+See [docs/PHASE_2A_ARCHITECTURE.md](./docs/PHASE_2A_ARCHITECTURE.md) — most of that document describes v2 scope. Read with the v1/v2/v3 versioning header in mind.
+
+### Phase 2A v3 — Gurdwara projector + Sevadaar control panel (DEFERRED)
+
+Use Case 2. Strict accuracy required. Waits for v2 polish + Phase 2B fine-tuned ASR.
+
+### Phase 2B — Kirtan dataset + fine-tuned ASR (parallel, prep)
 
 Build a labeled Kirtan dataset (transcript + audio alignment), then fine-tune Whisper on it. Two preparation tracks running in the background:
 - `scripts/fetch_samples.py` — Deep gathers more Kirtan recordings systematically
 - aeneas forced-alignment spike — given a known Shabad and audio, can we auto-align word-to-time?
 
-### Phase 2C — Gurdwara projector + Sevadaar control panel (gated on 2A polish + 2B fine-tuning)
-
-Use Case 2. Strict accuracy required. Includes Sevadaar override controls. Waits for fine-tuned ASR.
+Phase 2B is what unlocks Phase 2A v2 and v3.
 
 ### Later phases
 
@@ -145,19 +164,20 @@ gurbanilens/
 
 ## Current Status
 
-- ✅ Project scoped and designed (in claude.ai chat)
-- ✅ Name chosen: GurbaniLens
-- ✅ Domain: GurbaniLens.com (to be registered)
-- ✅ 13 sample Kirtan recordings gathered in `./samples/` (gitignored)
+For the up-to-date project state, see [STATUS.md](./STATUS.md). High-level:
+
+- ✅ Project scoped and designed
 - ✅ Phase 1 CLI built, evaluated, closed (see [PHASE_1_CONCLUSION.md](./PHASE_1_CONCLUSION.md))
-- ✅ Phase 2A architecture **LOCKED 2026-05-12** — see [docs/PHASE_2A_ARCHITECTURE.md](./docs/PHASE_2A_ARCHITECTURE.md). Sign-off table at top of doc.
-- ✅ Phase 2A foundation complete (steps 1–2 of §14): repo restructure (`src/` → `core/`), build pipeline (anvaad-js → ~77 MB app SQLite), port-parity infrastructure, **Swift matcher port — 11/11 port-parity PASS**
-- ✅ Phase 2A iOS smoke test code written (step 3 of §14): Xcode project (XcodeGen), AudioSource protocol + MicSource + FileSource + LineInSource stub, whisper.cpp + CoreML ASR wrapper, Gurmukhi/Devanagari → Latin port, SwiftUI smoke-test view
-- ⏳ **Waiting on Deep**: install Xcode + run on iPhone with free Apple ID — see [docs/PHASE_2A_IOS_SETUP.md](./docs/PHASE_2A_IOS_SETUP.md)
-- ✅ Phase 2B preparation tracks: `scripts/fetch_samples.py` (Track B); aeneas pivoted to faster-whisper word_timestamps (Track C, [docs/aeneas_spike.md](./docs/aeneas_spike.md))
+- ✅ Phase 2A architecture LOCKED 2026-05-12 — see [docs/PHASE_2A_ARCHITECTURE.md](./docs/PHASE_2A_ARCHITECTURE.md). Versioned v1 / v2 / v3 since 2026-06-17.
+- ✅ Phase 2A foundation: repo `src/` → `core/`, Anvaad-js build pipeline → ~77 MB app SQLite, port-parity infrastructure, **Swift matcher 11/11 port-parity PASS**
+- ✅ Phase 2A iOS smoke test code written; awaiting Deep to install Xcode + run on device
+- 🟢 **Phase 2A v1 voice-search pivot announced 2026-06-17.** Android scaffold + Kotlin matcher port + voice-search MVP in flight (this agent).
+- ⏸️ Phase 2A v2 (continuous live listen) — deferred behind v1 ship + Phase 2B fine-tune
+- ⏸️ Phase 2A v3 (Gurdwara projector) — deferred behind v2
+- ✅ Phase 2B preparation tracks: `scripts/fetch_samples.py` (Track B); faster-whisper word_timestamps (Track C)
 - ✅ Server skeleton (`server/`) + privacy contract committed; not deployed
-- ✅ Opt-in feedback channel spec ([docs/feedback_channel_spec.md](./docs/feedback_channel_spec.md))
+- ✅ Opt-in feedback channel spec
 
 ## Known Phase 2A gating items
-- **Sehaj Paath gated on Swift matcher perf.** The Swift `partial_ratio` is a brute-force port — correct (11/11 port-parity passes against the canonical Python on the full 60K-line SGGS corpus) but **too slow for full-corpus search at production latency**. Nitnem Banis (constrained to a few hundred lines per Bani) work fine. Sehaj Paath, which scans all 60K lines, needs either Hyyro's bitmap algorithm (what rapidfuzz uses internally) or an n-gram prefilter. Decision gated on real iOS device benchmarks during step 3 device validation.
-- **Whisper non-determinism.** Phase 1 finding (`temperature=0`, no fallback, fixed seed where supported) is wired into the iOS `WhisperASR.Config` defaults. Verify on device.
+- **Continuous-listen / Sehaj Paath gated on matcher perf and Kirtan fine-tune.** v2 scope, not v1. Swift `partial_ratio` is a brute-force port — correct (11/11 port-parity) but too slow for full-60K-line search at projector latency. Tap-to-search v1 is unaffected (one-shot query, latency-tolerant). v2 will need Hyyro's bitmap algorithm or an n-gram prefilter; decision deferred.
+- **Whisper non-determinism.** Phase 1 finding (`temperature=0`, no fallback, fixed seed where supported) is wired into the iOS `WhisperASR.Config` defaults. Apply identically in the Android JNI wrapper.
