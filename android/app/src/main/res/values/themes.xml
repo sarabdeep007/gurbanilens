@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Bridge theme for the Activity — Compose handles real styling. -->
+    <style name="Theme.GurbaniLens" parent="android:Theme.Material.Light.NoActionBar" />
+</resources>
