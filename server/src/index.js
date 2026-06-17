@@ -1,92 +1,129 @@
-import Fastify from "fastify";
-import websocket from "@fastify/websocket";
+// GurbaniLens optional server — entry point.
+//
+// Privacy contract (enforced in code; see README for prose version):
+//   - Audio bytes live in process memory or a per-request temp file
+//     deleted in a finally{} block; never persisted long-term.
+//   - Transcript text is returned in the response only, never logged.
+//   - Request logs contain method/url/duration/status only — no headers,
+//     no IPs, no bodies, no Authorization tokens.
+//   - Session tokens are opaque, ephemeral, never persisted beyond the
+//     in-memory rate-limit bucket.
 
-const PORT = Number(process.env.PORT ?? 8443);
+import Fastify from "fastify";
+import multipart from "@fastify/multipart";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { existsSync } from "node:fs";
+
+import { requireBearer } from "./middleware/auth.js";
+import { RateLimiter, makeRateLimitHook } from "./middleware/rate_limit.js";
+import { registerTranscribeRoute, TRANSCRIBE_LIMITS } from "./routes/transcribe.js";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const REPO_SERVER = resolve(__dirname, "..");
+
+const PORT = Number(process.env.PORT ?? 4040);
 const HOST = process.env.HOST ?? "0.0.0.0";
 const WHISPER_DISABLED = process.env.WHISPER_DISABLED === "1";
+const WHISPER_MODEL = process.env.WHISPER_MODEL ?? "large-v3";
+const WHISPER_PYTHON = process.env.WHISPER_PYTHON
+  ?? join(REPO_SERVER, ".venv-asr", "bin", "python");
+const WHISPER_WORKER = process.env.WHISPER_WORKER
+  ?? join(REPO_SERVER, "src", "asr", "whisper_worker.py");
 
 const app = Fastify({
   logger: {
-    level: "info",
-    // No content logging. We deliberately reduce log surface to:
-    // timestamp + duration + status. Request/response bodies, headers,
-    // and IP addresses are stripped here.
+    level: process.env.LOG_LEVEL ?? "info",
     serializers: {
-      req: (req) => ({
-        method: req.method,
-        url: req.url,
-        // Don't log headers, IPs, or bodies.
-      }),
+      // Privacy: no headers, no IPs, no bodies. Only method+url+status+duration.
+      req: (req) => ({ method: req.method, url: req.url }),
       res: (res) => ({ statusCode: res.statusCode }),
     },
   },
-  // Strip IP addresses at the framework level. Reverse proxy (Caddy) is
-  // responsible for stripping X-Forwarded-For before we ever see it.
-  trustProxy: false,
+  trustProxy: false, // X-Forwarded-For is stripped at the reverse proxy
+  disableRequestLogging: false,
+  bodyLimit: 12 * 1024 * 1024, // 12 MB — slightly above /transcribe's 10 MB cap
 });
 
-await app.register(websocket);
-
-// Health check
-app.get("/healthz", async () => ({ status: "ok", whisper: !WHISPER_DISABLED }));
-
-// /transcribe — WebSocket; receives 16 kHz mono Int16 PCM, returns JSON segments.
-app.get("/transcribe", { websocket: true }, (socket /* SocketStream */, req) => {
-  if (WHISPER_DISABLED) {
-    socket.send(JSON.stringify({ error: "not_implemented", reason: "whisper_disabled" }));
-    socket.close();
-    return;
-  }
-  // TODO Phase 2C: spawn faster-whisper subprocess, pipe PCM in, parse JSON out.
-  // Until then, reply with the stub error.
-  socket.send(JSON.stringify({ error: "not_implemented", reason: "stub" }));
-  socket.close();
+// Global response headers — set on every response.
+app.addHook("onSend", async (req, reply) => {
+  reply.header("X-Robots-Tag", "noindex");
+  reply.header("Cache-Control", "no-store");
 });
 
-// /feedback/correction — receive a single opt-in correction.
-app.post("/feedback/correction", async (req, reply) => {
-  // Validate shape (light validation; full schema is in docs/feedback_channel_spec.md)
-  const body = req.body;
-  if (!body || typeof body !== "object" ||
-      typeof body.session_token !== "string" ||
-      typeof body.app_version !== "string" ||
-      typeof body.audio_base64 !== "string" ||
-      typeof body.match !== "object" ||
-      typeof body.correction !== "object") {
-    reply.code(400);
-    return { error: "invalid_body" };
-  }
-
-  // TODO Phase 2A polish: write to FEEDBACK_QUEUE_DIR with a UUID filename,
-  // encrypted at the filesystem layer. For now, accept the shape and
-  // discard the body. We accept the request so the client UX is correct
-  // even before deployment; nothing is persisted.
-  reply.code(202);
-  return { id: cryptoRandomId(), status: "accepted_but_not_persisted_yet" };
+await app.register(multipart, {
+  limits: {
+    fileSize: TRANSCRIBE_LIMITS.MAX_BYTES,
+    files: 1,
+    fields: 4,
+  },
 });
 
-// /feedback/submissions — list / delete for a given session token.
-app.get("/feedback/submissions", async (req, reply) => {
-  // No persistence yet → empty list.
-  return { submissions: [] };
+// Rate limiters — keyed by session token.
+const transcribeLimiter = new RateLimiter({
+  windowMs: 60 * 60 * 1000,
+  maxInWindow: 60,
+});
+setInterval(() => transcribeLimiter.sweep(), 5 * 60 * 1000).unref();
+
+// --- routes ---
+
+app.get("/healthz", async () => ({
+  status: "ok",
+  whisper_disabled: WHISPER_DISABLED,
+}));
+
+app.get("/readyz", async (_req, reply) => {
+  const checks = {
+    python_exists: existsSync(WHISPER_PYTHON),
+    worker_exists: existsSync(WHISPER_WORKER),
+    whisper_disabled: WHISPER_DISABLED,
+  };
+  const ready = checks.python_exists && checks.worker_exists && !checks.whisper_disabled;
+  if (!ready) reply.code(503);
+  return { ready, checks };
 });
 
-app.delete("/feedback/submissions", async (req, reply) => {
-  // No persistence yet → success no-op.
-  return { deleted: 0 };
-});
-
-function cryptoRandomId() {
-  return [...crypto.getRandomValues(new Uint8Array(12))]
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
+if (!WHISPER_DISABLED) {
+  registerTranscribeRoute(app, {
+    pythonPath: WHISPER_PYTHON,
+    workerPath: WHISPER_WORKER,
+    model: WHISPER_MODEL,
+    preHandlers: [
+      requireBearer,
+      makeRateLimitHook(transcribeLimiter, { label: "transcribe" }),
+    ],
+  });
+} else {
+  app.post("/transcribe", async (_req, reply) => {
+    reply.code(503).send({ error: "not_implemented", reason: "whisper_disabled" });
+  });
 }
+
+// Feedback routes (implemented in Task 3) — keep stub shape for now.
+app.post("/feedback/correction", async (_req, reply) => {
+  reply.code(501).send({ error: "not_implemented", reason: "pending_task_3" });
+});
+
+// --- boot ---
 
 try {
   await app.listen({ port: PORT, host: HOST });
-  app.log.info({ port: PORT, host: HOST, whisperDisabled: WHISPER_DISABLED },
-                "gurbanilens server listening");
+  app.log.info({
+    port: PORT,
+    host: HOST,
+    whisperDisabled: WHISPER_DISABLED,
+    whisperModel: WHISPER_DISABLED ? null : WHISPER_MODEL,
+  }, "gurbanilens server listening");
 } catch (err) {
   app.log.error(err);
   process.exit(1);
+}
+
+// Graceful shutdown so PM2 restarts don't leak temp files in flight.
+for (const sig of ["SIGINT", "SIGTERM"]) {
+  process.on(sig, () => {
+    app.log.info({ sig }, "shutdown requested");
+    app.close().then(() => process.exit(0));
+  });
 }

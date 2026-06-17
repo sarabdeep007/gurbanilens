@@ -69,6 +69,13 @@ docs/aeneas_spike_alignment.json
 # Server
 server/node_modules/
 server/package-lock.json
+server/.venv-asr/
+server/test-fixtures/
+server/data/*.db
+server/data/*.db-journal
+server/data/*.db-wal
+server/data/*.db-shm
+!server/data/.gitkeep
 
 # XcodeGen-generated project files (regenerate with `xcodegen generate`)
 ios/GurbaniLens/GurbaniLens.xcodeproj/
