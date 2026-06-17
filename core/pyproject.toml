@@ -1,0 +1,40 @@
+[project]
+name = "gurbanilens"
+version = "0.1.0"
+description = "GurbaniLens canonical reference matcher + evaluation harness (Phase 1). See ../README.md and ../LICENSE for project-level docs."
+requires-python = ">=3.11"
+authors = [
+    { name = "Deep", email = "deep@taajstudios.com" },
+]
+dependencies = [
+    "faster-whisper>=1.0.3",
+    "indic-transliteration>=2.3.0",
+    "rapidfuzz>=3.9.0",
+    "typer>=0.12.0",
+    "rich>=13.7.0",
+    "tqdm>=4.66.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.5.0",
+]
+
+[project.scripts]
+gurbanilens = "gurbanilens.cli:app"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["gurbanilens*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

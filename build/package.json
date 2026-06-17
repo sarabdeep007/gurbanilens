@@ -1,0 +1,14 @@
+{
+  "name": "gurbanilens-build",
+  "version": "0.1.0",
+  "description": "Build-time corpus preprocessing for GurbaniLens Phase 2A apps.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "convert": "node convert_anmol_to_unicode.js"
+  },
+  "dependencies": {
+    "anvaad-js": "^1.0.0",
+    "better-sqlite3": "^11.0.0"
+  }
+}
