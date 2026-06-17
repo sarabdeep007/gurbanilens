@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-06-17",
+  "notes": "Sample registry for Phase 2B Kirtan dataset. See samples/MANIFEST.md for field definitions and workflow. Audio files are gitignored; this registry references them by filename + source_url.",
+
+  "raags": {
+    "sri_raag":      {"display": "Sri Raag",      "sggs_position": 1},
+    "maajh":         {"display": "Maajh",         "sggs_position": 2},
+    "gauri":         {"display": "Gauri",         "sggs_position": 3},
+    "aasaa":         {"display": "Aasaa",         "sggs_position": 4},
+    "gujri":         {"display": "Gujri",         "sggs_position": 5},
+    "devgandhari":   {"display": "Devgandhari",   "sggs_position": 6},
+    "bihagra":       {"display": "Bihagra",       "sggs_position": 7},
+    "vadhans":       {"display": "Vadhans",       "sggs_position": 8},
+    "sorath":        {"display": "Sorath",        "sggs_position": 9},
+    "dhanasari":     {"display": "Dhanasari",     "sggs_position": 10},
+    "jaitsri":       {"display": "Jaitsri",       "sggs_position": 11},
+    "todi":          {"display": "Todi",          "sggs_position": 12},
+    "bairari":       {"display": "Bairari",       "sggs_position": 13},
+    "tilang":        {"display": "Tilang",        "sggs_position": 14},
+    "soohee":        {"display": "Soohee",        "sggs_position": 15},
+    "bilaaval":      {"display": "Bilaaval",      "sggs_position": 16},
+    "gond":          {"display": "Gond",          "sggs_position": 17},
+    "ramkali":       {"display": "Ramkali",       "sggs_position": 18},
+    "nat_narayan":   {"display": "Nat Narayan",   "sggs_position": 19},
+    "maali_gaura":   {"display": "Maali Gaura",   "sggs_position": 20},
+    "maaru":         {"display": "Maaru",         "sggs_position": 21},
+    "tukhari":       {"display": "Tukhari",       "sggs_position": 22},
+    "kedara":        {"display": "Kedara",        "sggs_position": 23},
+    "bhairao":       {"display": "Bhairao",       "sggs_position": 24},
+    "basant":        {"display": "Basant",        "sggs_position": 25},
+    "saarang":       {"display": "Saarang",       "sggs_position": 26},
+    "malaar":        {"display": "Malaar",        "sggs_position": 27},
+    "kaanra":        {"display": "Kaanra",        "sggs_position": 28},
+    "kalyaan":       {"display": "Kalyaan",       "sggs_position": 29},
+    "prabhati":      {"display": "Prabhati",      "sggs_position": 30},
+    "jaijaivanti":   {"display": "Jaijaivanti",   "sggs_position": 31},
+    "mixed_raag":    {"display": "Mixed / multiple raags", "sggs_position": null},
+    "unknown_raag":  {"display": "Unknown raag",  "sggs_position": null},
+    "non_raag":      {"display": "Non-raag content (Simran, Aarti, Paath recitation)", "sggs_position": null}
+  },
+
+  "enums": {
+    "jatha_tradition": ["akj", "taksali", "damdami", "modern", "traditional", "mixed", "unknown"],
+    "recording_quality": ["studio", "clean_live", "live_mic", "noisy_live", "archival", "broadcast"],
+    "difficulty": ["studio", "live", "noisy", "nagar_kirtan", "kid", "instrumental", "archival", "broadcast", "paath_recitation", "simran"],
+    "categories": ["studio_clean", "live_gurdwara", "varied_raags", "varied_jathas", "challenging"],
+    "source_type": ["youtube", "gurdwara_direct", "broadcaster", "personal_recording", "archived_dataset"],
+    "alignment_status": ["pending", "in_progress", "machine_aligned", "human_reviewed", "excluded"]
+  },
+
+  "coverage_targets_v1": {
+    "high_tier_audio_hours": 5,
+    "distinct_jathas": 5,
+    "distinct_raags": 5,
+    "distinct_pangtis": 200,
+    "rationale": "See docs/DATASET_PHILOSOPHY.md §7 — quality over quantity for first fine-tune attempt."
+  },
+
+  "samples": []
+}
