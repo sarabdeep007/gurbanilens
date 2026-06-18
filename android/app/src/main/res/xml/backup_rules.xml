@@ -1,0 +1,3 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- v1 voice search does not store any user-identifiable data; allow default backup. -->
+<full-backup-content />

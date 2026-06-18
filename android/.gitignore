@@ -10,3 +10,8 @@ captures/
 *.apk
 *.aab
 *.keystore
+
+# Bundled SGGS SQLite — over GitHub 100 MB per-file limit until the Anvaad-trimmed
+# build pipeline produces a ~77 MB artifact. Do NOT commit this asset directly.
+app/src/main/assets/sggs.sqlite
+

@@ -1,6 +1,6 @@
 # GurbaniLens — STATUS
 
-_Last updated: 2026-06-17 by Claude (Android agent), reflecting tonight's v1 voice-search pivot._
+_Last updated: 2026-06-17 by Claude (Android agent) — Phase 2A v1 voice-search MVP scaffold._
 
 This is the up-to-the-minute state file. CLAUDE.md is the durable project doc; STATUS.md is for "what's happening right now."
 
@@ -17,7 +17,7 @@ Pivoted from "continuous-listen Paath companion" on **2026-06-17**. Original Pha
 ## What's Done
 
 - ✅ **Phase 1 CLI** — Python `core/gurbanilens/{corpus,matcher,asr,cli}.py`. Matcher solid; ASR is the bottleneck for sung Kirtan. See [PHASE_1_CONCLUSION.md](./PHASE_1_CONCLUSION.md).
-- ✅ **Phase 2A architecture LOCKED 2026-05-12** — [docs/PHASE_2A_ARCHITECTURE.md](./docs/PHASE_2A_ARCHITECTURE.md).
+- ✅ **Phase 2A architecture LOCKED 2026-05-12** — [docs/PHASE_2A_ARCHITECTURE.md](./docs/PHASE_2A_ARCHITECTURE.md). Versioned v1 / v2 / v3 since 2026-06-17.
 - ✅ **Repo restructure** — `src/gurbanilens/` → `core/gurbanilens/`. Python is canonical reference; Swift and Kotlin ports validate against `core/tests/portparity/test_vectors.json`.
 - ✅ **Anvaad-js build pipeline** — `build/convert_anmol_to_unicode.js` + `build/build_app_database.py` → ~77 MB `app_database.sqlite` (bundled into iOS / Android).
 - ✅ **Swift matcher port** — `ios/GurbaniLensCore/`. 11/11 port-parity PASS against canonical Python on the full 60K-line SGGS corpus.
@@ -25,20 +25,24 @@ Pivoted from "continuous-listen Paath companion" on **2026-06-17**. Original Pha
 - ✅ **Phase 2B prep tracks** — `scripts/fetch_samples.py` (Track B sample gathering), `docs/aeneas_spike.md` (Track C alignment, pivoted to `faster-whisper` word_timestamps).
 - ✅ **Server skeleton + privacy contract** — `server/` directory, FastAPI scaffold. Not deployed; documents the v2 fallback policy.
 - ✅ **Opt-in feedback channel spec** — `docs/feedback_channel_spec.md`.
+- ✅ **Android scaffold** — Kotlin/Compose Gradle multi-module (`:app` + `:core`). AGP 8.6.1, Kotlin 2.0.21, Compose BOM 2024.10.01.
+- ✅ **Kotlin matcher port** — `android/core/src/main/kotlin/.../core/`. **11 / 11 port-parity PASS** against canonical Python on the full 60K-line SGGS corpus.
+- ✅ **v1 voice-search MVP UI** — 5 Compose screens (Home / Recording / Results / Shabad / Settings) wired through a NavHost with shared `VoiceSearchSession` state holder.
+- ✅ **AudioRecord capture** — 16 kHz mono Float32 PCM, tap-to-record, peak-amplitude live VU bar.
+- ✅ **whisper.cpp prebuilt integration** — vendored arm64-v8a / armeabi-v7a / x86 / x86_64 `libwhisper*.so` (54 MB) from `litongjava/whisper.cpp.android.java.demo` v1.0.0; Kotlin JNI binding at `com.whispercppdemo.whisper.WhisperLib`; idiomatic wrapper at `com.taajsingh.gurbanilens.domain.WhisperAsr`.
+- ✅ **Whisper model bundled** — `ggml-tiny.en.bin` (75 MB) downloaded from HuggingFace into `app/src/main/assets/`.
+- ✅ **End-to-end voice-search unit test** — synthetic PCM → MockAsr → Matcher → SearchResult; verified strong-confidence match on exact transcript, low-confidence reject on unrelated query, empty matches on empty transcript.
 
 ---
 
 ## What's In Flight
 
-- 🟢 **Android v1 voice-search app** (this agent, Brief 1):
-    - Doc reset (this commit)
-    - `android/` Kotlin/Compose scaffold, `:app` + `:core` modules
-    - Kotlin matcher port at `android/core/src/main/kotlin/.../core/`
-    - 11/11 port-parity test using `core/tests/portparity/test_vectors.json`
-    - Voice search MVP UI: Home, Recording, Results, Shabad, Settings
-    - `AudioRecord` + whisper.cpp JNI integration
 - 🟢 **Deep — iOS smoke test on device.** Xcode install + run on iPhone with free Apple ID. See `docs/PHASE_2A_IOS_SETUP.md`. Independent of Android track.
 - 🟢 **Phase 2B Kirtan dataset gathering** (separate agent track) — continues feeding v2.
+- 🟡 **Android v1 deferred polish** (next dispatch):
+  - Replace `MockAsr` in `MainActivity` with `WhisperAsr.fromAssetOrNull(...)` once Robolectric + UI smoke runs land. JNI wiring + model are in place; just the activity wire-up.
+  - Bundle the Anvaad-trimmed `app_database.sqlite` (~77 MB) into `app/src/main/assets/sggs.sqlite` once the build pipeline produces it. Right now `AndroidAssetCorpus` falls back to an empty matcher when the asset is absent; users see "no results" until then.
+  - Move JNI prebuilt source off the 2023 litongjava demo to either (a) self-built NDK CMake against whisper.cpp upstream (gets us `language="pa"` + fixed seed) or (b) a more recent community AAR. Current deviation documented in `WhisperLib.kt` class kdoc.
 
 ---
 
@@ -48,15 +52,17 @@ Pivoted from "continuous-listen Paath companion" on **2026-06-17**. Original Pha
 |---|---|---|
 | Phase 2A **v2** — continuous live listen, auto-follow, Nitnem, Sukhmani, AKV, Sehaj Paath, Akhand Paath | Sung-Kirtan ASR accuracy too low for projector-grade reliability per Phase 1 finding | v1 ship + Phase 2B Kirtan fine-tune |
 | Phase 2A **v3** — Gurdwara projector + Sevadaar control panel + line-in source | Strict-accuracy UX is Use Case 2; needs v2 polish first | v2 stable + Phase 2B |
-| Server-side ASR fallback | v1 is on-device only; older devices that can't run `small` get told so | v2 |
+| Server-side ASR fallback | v1 is on-device only; older devices that can't run `tiny.en` get told so | v2 |
 | Background audio / foreground service for listening | Not needed for tap-to-search v1 | v2 |
 | Hyyro / n-gram prefilter for Swift+Kotlin partial_ratio | v1 single-shot query is latency-tolerant; brute-force port is fine | v2 (full-corpus continuous search needs it) |
+| `language="pa"` + fixed Whisper seed | Prebuilt .so JNI hardcodes `language="en"` + no seed knob | Replace prebuilt with NDK-compiled-from-source (next chunk) |
+| Real-device validation of `WhisperAsr` | Headless taaj-portal can't run an APK against the mic | Deep runs `./gradlew :app:installDebug` on a connected device |
 
 ---
 
 ## Blockers
 
-None right now. Android track is fully unblocked; iOS device validation is on Deep's plate independently.
+None right now. v1 Android scaffold compiles + tests pass + APK builds clean on the headless build host. Real-device run is on Deep's plate.
 
 ---
 
@@ -68,6 +74,7 @@ None right now. Android track is fully unblocked; iOS device validation is on De
 - **Commit style:** Conventional commits (e.g. `feat(android):`, `chore(docs):`, `test(core):`).
 - **Push to origin/main** after each logical unit; this is a 1-person project + Claude, no PR gating.
 - **HOLD convention:** agents stop at scoped checkpoints and end the message with literal text "HOLDING for next dispatch." — that triggers Deep's observer email notification.
+- **Headless build toolchain (Linux taaj-portal):** Temurin JDK 21 + Kotlin 2.1.0 + Android SDK cmdline-tools + platform-34 + build-tools 34.0.0 + Gradle 8.10.2 (via wrapper). Set `ANDROID_HOME=/home/deep/.local/opt/android-sdk` and `JAVA_HOME=/home/deep/.local/opt/jdk` before `./gradlew :app:assembleDebug`.
 
 ---
 
@@ -82,7 +89,10 @@ None right now. Android track is fully unblocked; iOS device validation is on De
 | `core/gurbanilens/matcher.py` | Canonical matcher (read-only for all port agents) |
 | `core/tests/portparity/test_vectors.json` | Port-parity battery (read-only) |
 | `ios/GurbaniLensCore/` | Swift matcher port (different agent's territory) |
-| `android/` | Kotlin/Compose v1 app + matcher port (this agent's territory) |
+| `android/app/` | Voice-search MVP — Compose UI + AudioRecord + WhisperAsr |
+| `android/app/src/main/jniLibs/` | Prebuilt libwhisper.so (arm64-v8a / armeabi-v7a / x86 / x86_64) |
+| `android/app/src/main/assets/ggml-tiny.en.bin` | Bundled Whisper model (75 MB, from HuggingFace) |
+| `android/core/` | Kotlin matcher port (11/11 port-parity PASS) |
 | `server/` | FastAPI v2-fallback skeleton (different agent's territory) |
 | `build/` | Anvaad-js + app DB build pipeline |
 | `evaluation/` | Phase 1 historical artifacts (frozen) |
@@ -91,13 +101,20 @@ None right now. Android track is fully unblocked; iOS device validation is on De
 
 ## Next Concrete Actions
 
-1. ✅ Doc reset commit (this) — CLAUDE.md + ARCHITECTURE + STATUS.
-2. 🟢 Android Kotlin/Compose scaffold, `:app` + `:core` Gradle modules.
-3. 🟢 Kotlin matcher port + 11/11 port-parity passing.
-4. 🟢 Voice-search MVP screens (Compose).
-5. 🟢 `AudioRecord` capture + whisper.cpp JNI binding.
-6. 🟢 End-to-end smoke test on emulator → HOLD for Deep on-device validation.
-7. ⏸ Deep — install Xcode, run iOS smoke test on iPhone.
+1. ✅ Doc reset commit — CLAUDE.md + ARCHITECTURE + STATUS.
+2. ✅ Android Kotlin/Compose scaffold, `:app` + `:core` Gradle modules.
+3. ✅ Kotlin matcher port + 11/11 port-parity passing.
+4. ✅ Voice-search MVP screens (Compose).
+5. ✅ `AudioRecord` capture + JVM Robolectric unit tests.
+6. ✅ whisper.cpp prebuilt .so + JNI Kotlin binding + `WhisperAsr` wrapper.
+7. ✅ `ggml-tiny.en.bin` bundled in assets.
+8. ✅ End-to-end voice → transcript → matcher → result JVM test.
+9. ✅ `./gradlew :app:assembleDebug` produces a clean debug APK on the headless build host.
+10. ⏳ Deep — install Xcode, run iOS smoke test on iPhone.
+11. ⏳ Deep — sideload the Android debug APK onto a phone and confirm real-mic + on-device Whisper produces a sane transcript.
+12. ⏸ NDK-compile whisper.cpp from source to regain `language="pa"` + fixed seed.
+13. ⏸ Wire `WhisperAsr` into `MainActivity` (currently uses `MockAsr` until real-device validation lands).
+14. ⏸ Bundle the Anvaad-trimmed `app_database.sqlite` into Android assets.
 
 ---
 
