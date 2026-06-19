@@ -111,6 +111,35 @@ public final class Corpus {
         }
     }
 
+    /// All lines in a single Shabad, ordered. Used by the v1 ShabadScreen
+    /// after a voice-search match.
+    public func shabadLines(shabadId: String) throws -> [Line] {
+        let sql = """
+        SELECT l.id, l.shabad_id, l.source_page, l.source_line, l.gurmukhi,
+               l.first_letters, l.order_id,
+               lt.name_english AS line_type,
+               t.transliteration AS transliteration_en
+        FROM lines l
+        LEFT JOIN line_types lt ON l.type_id = lt.id
+        LEFT JOIN transliterations t
+            ON t.line_id = l.id AND t.language_id = ?
+        WHERE l.shabad_id = ?
+        ORDER BY l.order_id
+        """
+        guard let db = db else { return [] }
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(stmt) }
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        sqlite3_bind_int64(stmt, 1, Int64(englishLanguageId))
+        sqlite3_bind_text(stmt, 2, shabadId, -1, SQLITE_TRANSIENT)
+        var lines: [Line] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            lines.append(rowToLine(stmt))
+        }
+        return lines
+    }
+
     // ---------------------------------------------------------------------
     // Internal helpers
     // ---------------------------------------------------------------------
