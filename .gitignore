@@ -81,9 +81,12 @@ server/data/*.db-shm
 ios/GurbaniLens/GurbaniLens.xcodeproj/
 ios/GurbaniLens/GurbaniLens.xcworkspace/
 
-# iOS Resources fetched at build time (whisper models + app db live in bundle Resources)
+# iOS Resources fetched at build time (whisper models + app db live in bundle Resources).
+# Populated by scripts/fetch_ios_deps.sh — keep large binaries out of the repo.
 ios/GurbaniLens/GurbaniLens/Resources/Models/
 ios/GurbaniLens/GurbaniLens/Resources/Database/
+ios/GurbaniLens/GurbaniLens/Resources/Data/
+build/ios-deps-cache/
 
 # Whisper conversion artifacts
 build/whisper.cpp/
@@ -92,3 +95,13 @@ build/whisper.cpp/
 # Alignments, splits, manifest, and README *are* checked in — those are our
 # original CC-BY-SA-4.0 contribution.
 dataset/audio/
+
+# Android binary deps populated by scripts/fetch_android_deps.sh.
+# Whisper prebuilt .so + bundled GGML model + bundled SGGS DB are large and
+# re-downloadable, so we keep them out of the repo and let the fetch script
+# reconstruct them. (.bin and .so are already covered by the broad patterns
+# above; these explicit entries document the contract.)
+android/app/src/main/jniLibs/
+android/app/src/main/assets/ggml-*.bin
+android/app/src/main/assets/sggs.sqlite
+build/android-deps-cache/

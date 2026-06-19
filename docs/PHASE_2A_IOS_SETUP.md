@@ -1,12 +1,14 @@
 # Phase 2A — iOS Setup (Deep)
 
-This is the one-time setup to get the GurbaniLens iOS smoke test running on your iPhone with a free Apple ID. Total time: about 30–45 minutes the first run, including Xcode install.
+This is the one-time setup to get the GurbaniLens iOS app (v1 voice-search) running on your iPhone with a free Apple ID. Total time: about 30–45 minutes the first run, including Xcode install.
+
+> **v1 voice-search delta (2026-06-17).** The app now launches into the v1 voice-search UI (Home → Recording → Results → Shabad → Settings) instead of the original Smoke Test. The Smoke Test view (continuous listen + scrolling transcript) is still in the source tree as the v2 reference but is no longer the entry point. See §9 for the new expected behaviour.
 
 ## 0. Prerequisites
 
 - **macOS 14 or later** (Sonoma / Sequoia / etc.)
 - **Apple ID** — your existing personal Apple ID is fine. No paid Developer Program needed.
-- An iPhone running iOS 15 or later (the deployment target)
+- An iPhone running iOS 16 or later (v1 deployment target — needed for `NavigationStack` and `ShareLink`)
 - USB-C / Lightning cable to plug the phone into the Mac
 
 ## 1. Install Xcode (full, not just Command Line Tools)
@@ -42,42 +44,25 @@ XcodeGen lets us generate the `.xcodeproj` from `ios/GurbaniLens/project.yml`. T
 brew install xcodegen
 ```
 
-## 3. Build the corpus database (once per release)
+## 3. Fetch the bundled binary deps
 
-If you haven't already (it's in `.gitignore`):
-
-```bash
-cd build/
-npm install
-node convert_anmol_to_unicode.js
-cd ..
-python build/build_app_database.py
-# Output: build/app_database.sqlite (~77 MB)
-```
-
-Copy it into the iOS app bundle's Resources folder:
-```bash
-mkdir -p ios/GurbaniLens/GurbaniLens/Resources/Database
-cp build/app_database.sqlite ios/GurbaniLens/GurbaniLens/Resources/Database/
-```
-
-## 4. Bundle a Whisper model
-
-Run the helper to fetch + CoreML-convert (~30 minutes the first time; large download + Apple Silicon ANE conversion):
+Single re-runnable script that downloads the Whisper model and copies the SGGS corpus into the app's Resources folder (both gitignored):
 
 ```bash
-bash build/fetch_whisper_models.sh small
+bash scripts/fetch_ios_deps.sh
+# Default: --model small (~250 MB). Override with --model base, --model medium, etc.
 ```
 
-This downloads `ggml-small.bin` (~250 MB) and produces `ggml-small-encoder.mlmodelc`. Copy both into the app bundle:
+What it does:
+- Downloads `ggml-small.bin` from `huggingface.co/ggerganov/whisper.cpp` → `ios/GurbaniLens/GurbaniLens/Resources/Models/`
+- Copies `data/sggs/database.sqlite` → `ios/GurbaniLens/GurbaniLens/Resources/Data/app_database.sqlite`
 
+If `data/sggs/database.sqlite` is missing first, populate it with the existing Python helper (one-time, ~30 s download):
 ```bash
-mkdir -p ios/GurbaniLens/GurbaniLens/Resources/Models
-cp build/whisper-models/ggml-small.bin              ios/GurbaniLens/GurbaniLens/Resources/Models/
-cp -R build/whisper-models/ggml-small-encoder.mlmodelc ios/GurbaniLens/GurbaniLens/Resources/Models/
+python scripts/fetch_corpus.py
 ```
 
-Full Whisper + CoreML setup details (and how to switch to `base` or `medium`) are in [`docs/whisper_coreml_setup.md`](./whisper_coreml_setup.md).
+> **CoreML acceleration (optional, slower setup).** For the Apple Neural Engine encoder bump, `build/fetch_whisper_models.sh small` does the full CoreML conversion (~30 min on Apple Silicon). Drop the resulting `ggml-small-encoder.mlmodelc` into the same Models folder. v1 runs fine without it; the CPU path is plenty for tap-to-speak. Full details in [`docs/whisper_coreml_setup.md`](./whisper_coreml_setup.md).
 
 ## 5. Generate the Xcode project
 
@@ -115,33 +100,33 @@ Back in Xcode:
 4. The first install on the phone will ask you to trust the developer in **Settings → General → VPN & Device Management → Apple Development: (Your Apple ID) → Trust.**
 5. The app launches.
 
-## 9. The smoke test
+## 9. The v1 voice-search flow
 
-You should see a screen titled "GurbaniLens Smoke Test" with:
-- a **Status** line
-- a **Best match** placeholder
-- an empty **Transcript log**
-- a big blue **Listen** button at the bottom
+You should see a saffron-on-indigo Home screen with:
+- Title: **GurbaniLens** (gear icon to Settings in the top-right)
+- Tagline: *Bring the Bani into focus.*
+- A big circular saffron **mic button**
 
-Tap **Listen**. iOS will prompt for microphone permission — tap "Allow".
+Tap the mic. iOS will prompt for microphone permission the first time — tap "Allow". Then:
 
-Then start reciting any Bani slowly. Expected behaviour:
-- Status changes to "Listening — Mic — ..."
-- Within ~3 seconds, transcripts start appearing in the log (Devanagari text + Latin form)
-- Within ~10 seconds, the "Best match" section shows an Ang:Pangti with green confidence
-- The matched Pangti's Unicode Gurmukhi text appears
+- The Recording screen pushes in — pulsing saffron mic, "Listening…" label
+- Recite any Pangti aloud (5–15 s is the v1 sweet spot)
+- Tap **Done** → "Transcribing…" briefly → auto-advances to Results
+- Results shows the Pangti you said (monospaced), a confidence pill, the top match card (Ang:Pangti + transliteration), and up to 4 "Did you mean…" alternates
+- Tap the top match → Shabad screen shows the full Shabad scrolled to the matched line; toggles for script (Gurmukhi / Transliteration / Both) + English
 
 ## 10. What to report back
 
 Tell me:
 1. Did the app build and install at all? If not, what's the Xcode error?
-2. Does it load past "Loading corpus + matcher…"? If not, did you copy the SQLite into Resources/Database?
-3. Does it load past "Loading Whisper model…"? If not, did you bundle the model into Resources/Models?
-4. After tapping Listen, do transcripts show up in the log?
-5. Do any transcripts produce a confident match (green confidence, ≥ 75)?
-6. Any crashes, freezes, or weird logs from the Xcode console?
+2. Does the Home → Recording transition happen on tap?
+3. Does the mic VU bar (the pulsing saffron circle) actually respond to your voice volume?
+4. After "Done", does Results show a confidence pill and at least one match card?
+5. Do confident recitations produce a "Strong match" (green pill)?
+6. Tap a match — does the Shabad screen scroll to the matched line and show the full Shabad?
+7. Any crashes, freezes, or weird logs from the Xcode console?
 
-A screenshot of the running app + the Xcode console output is the perfect handoff back to me. Then we iterate.
+A screenshot of the running app + the Xcode console output is the perfect handoff back. Then we iterate.
 
 ## Free Apple ID limitations to know
 

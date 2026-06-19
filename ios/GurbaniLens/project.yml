@@ -2,7 +2,7 @@ name: GurbaniLens
 options:
   bundleIdPrefix: com.taajstudios
   deploymentTarget:
-    iOS: "15.0"
+    iOS: "16.0"
   developmentLanguage: en
   groupSortPosition: top
   generateEmptyDirectories: true
@@ -11,13 +11,14 @@ options:
   # account is approved — no other changes required.
   defaultConfig: Debug
 
+# iOS 16 is the deployment target because v1 uses SwiftUI NavigationStack
+# (iOS 16+). At time of writing iOS 16 is on ~95%+ of iPhones; bumping below
+# would require a state-driven NavigationView rewrite — not worth it for v1.
+
 settings:
   base:
     SWIFT_VERSION: "5.9"
-    IPHONEOS_DEPLOYMENT_TARGET: "15.0"
-    # Free-Apple-ID friendly. Personal team auto-selected by Xcode when
-    # DEVELOPMENT_TEAM is empty. Code signing happens at build time using
-    # Xcode's "Automatically manage signing" path.
+    IPHONEOS_DEPLOYMENT_TARGET: "16.0"
     CODE_SIGN_STYLE: Automatic
     CODE_SIGN_IDENTITY: "Apple Development"
     PRODUCT_BUNDLE_IDENTIFIER: com.taajstudios.gurbanilens
@@ -44,7 +45,14 @@ targets:
     resources:
       - path: GurbaniLens/Resources/Assets.xcassets
         optional: true
+      # Bundled Whisper ggml-*.bin (and matching CoreML .mlmodelc when present).
+      # Populated by scripts/fetch_ios_deps.sh — directory is gitignored.
       - path: GurbaniLens/Resources/Models
+        optional: true
+      # Bundled SGGS corpus (app_database.sqlite or sggs.sqlite). Populated
+      # by scripts/fetch_ios_deps.sh from data/sggs/database.sqlite —
+      # directory is gitignored.
+      - path: GurbaniLens/Resources/Data
         optional: true
     info:
       path: GurbaniLens/Resources/Info.plist
@@ -58,14 +66,9 @@ targets:
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
         # Microphone permission. Plain language; we tell the user exactly
-        # what we do with audio.
-        NSMicrophoneUsageDescription: "GurbaniLens listens to recitation so it can follow along, highlight the current line, and auto-scroll. Audio stays on this device by default."
-        # Background mode entitlement — keep listening while screen is off
-        # or the app is backgrounded.
-        UIBackgroundModes:
-          - audio
-        # Allow the user to keep the app on while reciting.
-        UIRequiresPersistentWiFi: false
+        # what we do with audio. v1 is tap-to-record only — no background
+        # listening, no recording without an explicit tap.
+        NSMicrophoneUsageDescription: "GurbaniLens listens when you tap the microphone, transcribes what you recite, and looks up the matching Shabad. Audio stays on this device — nothing is uploaded."
     entitlements:
       path: GurbaniLens/Resources/GurbaniLens.entitlements
       properties:
