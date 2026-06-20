@@ -160,6 +160,16 @@ final class AppContainer: ObservableObject {
             session.setError("No audio captured. Try again.")
             return
         }
+        // Persist the captured clip to Documents/ before we hand it to
+        // WhisperKit. Lets us extract it via Xcode → Devices → Download
+        // Container and listen to exactly what the ASR received. Failure to
+        // write is non-fatal — we still try to transcribe.
+        do {
+            let url = try WaveWriter.saveCaptureToDocuments(samples: samples)
+            NSLog("[DIAG] AppContainer.runSearchAndDone wrote capture WAV to \(url.path)")
+        } catch {
+            NSLog("[DIAG] AppContainer.runSearchAndDone WAV write FAILED: \(error.localizedDescription)")
+        }
         do {
             let asr = ensureAsr()
             let matcher = try ensureMatcher()
