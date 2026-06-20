@@ -13,7 +13,17 @@ public final class FileSource: AudioSource {
     private let url: URL
     private let outputFormat: AVAudioFormat
     private var task: Task<Void, Never>?
-    public private(set) var isRunning: Bool = false
+    private let runningLock = NSLock()
+    private var _isRunning: Bool = false
+
+    public var isRunning: Bool {
+        runningLock.lock(); defer { runningLock.unlock() }
+        return _isRunning
+    }
+
+    private func setRunning(_ v: Bool) {
+        runningLock.lock(); _isRunning = v; runningLock.unlock()
+    }
 
     public var configurationDescription: String {
         "File: \(url.lastPathComponent) → 16 kHz mono Float32"
@@ -46,7 +56,7 @@ public final class FileSource: AudioSource {
             )
         }
 
-        isRunning = true
+        setRunning(true)
         task = Task.detached(priority: .userInitiated) { [weak self, outputFormat] in
             await self?.streamFile(
                 file: file,
@@ -54,14 +64,14 @@ public final class FileSource: AudioSource {
                 outputFormat: outputFormat,
                 deliver: onBuffer
             )
-            await MainActor.run { self?.isRunning = false }
+            self?.setRunning(false)
         }
     }
 
     public func stop() {
         task?.cancel()
         task = nil
-        isRunning = false
+        setRunning(false)
     }
 
     private func streamFile(
@@ -90,23 +100,11 @@ public final class FileSource: AudioSource {
             }
             if inputBuf.frameLength == 0 { break }
 
-            let ratio = outputFormat.sampleRate / sourceFormat.sampleRate
-            let outCapacity = AVAudioFrameCount(Double(inputBuf.frameLength) * ratio + 32)
-            guard let outputBuf = AVAudioPCMBuffer(
-                pcmFormat: outputFormat,
-                frameCapacity: outCapacity
-            ) else { break }
-
-            var consumed = false
-            var error: NSError?
-            let inputBlock: AVAudioConverterInputBlock = { _, status in
-                if consumed { status.pointee = .noDataNow; return nil }
-                consumed = true
-                status.pointee = .haveData
-                return inputBuf
-            }
-            converter.convert(to: outputBuf, error: &error, withInputFrom: inputBlock)
-            if outputBuf.frameLength == 0 { continue }
+            guard let outputBuf = Self.convertChunk(
+                input: inputBuf,
+                converter: converter,
+                outputFormat: outputFormat
+            ) else { continue }
 
             let time = AVAudioTime(sampleTime: startSampleTime, atRate: outputFormat.sampleRate)
             startSampleTime += AVAudioFramePosition(outputBuf.frameLength)
@@ -116,5 +114,39 @@ public final class FileSource: AudioSource {
             // realistic stream. Use Task.sleep so cancellation works.
             try? await Task.sleep(nanoseconds: UInt64(chunkDuration * 1_000_000_000))
         }
+    }
+
+    /// Sync helper. `consumed` and `error` are local-only — they never
+    /// escape across an `await`, so the closure can capture them safely
+    /// even under Swift 6 strict concurrency checking. The previous inline
+    /// version lived inside the `async` streamFile and tripped a
+    /// `unsafeForcedSync` warning because the compiler couldn't prove the
+    /// closure didn't suspend.
+    private static func convertChunk(
+        input: AVAudioPCMBuffer,
+        converter: AVAudioConverter,
+        outputFormat: AVAudioFormat
+    ) -> AVAudioPCMBuffer? {
+        let ratio = outputFormat.sampleRate / input.format.sampleRate
+        let outCapacity = AVAudioFrameCount(Double(input.frameLength) * ratio + 32)
+        guard let outputBuf = AVAudioPCMBuffer(
+            pcmFormat: outputFormat,
+            frameCapacity: outCapacity
+        ) else { return nil }
+
+        var consumed = false
+        var error: NSError?
+        let inputBlock: AVAudioConverterInputBlock = { _, status in
+            if consumed {
+                status.pointee = .endOfStream
+                return nil
+            }
+            consumed = true
+            status.pointee = .haveData
+            return input
+        }
+        converter.convert(to: outputBuf, error: &error, withInputFrom: inputBlock)
+        if outputBuf.frameLength == 0 { return nil }
+        return outputBuf
     }
 }
