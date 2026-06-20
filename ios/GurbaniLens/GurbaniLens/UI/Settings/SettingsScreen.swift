@@ -1,5 +1,27 @@
 import SwiftUI
 
+/// v2 search-mode toggle. `.live` is the v2 "search as you speak" flow
+/// (mic streams, results update live as Whisper transcribes incrementally);
+/// `.oneShot` is the v1 "tap, recite, tap Done, wait, see result" flow.
+/// Both go through the same Results / Shabad screens on commit.
+///
+/// Default for new installs is `.live` per the v2 spec
+/// (docs/PHASE_2A_V2_INCREMENTAL_SEARCH.md decision §10). `.oneShot`
+/// stays for noisy environments, slow connections, and as a fallback if
+/// the v2 streaming pipeline misbehaves on a given device.
+enum SearchModeChoice: String, CaseIterable, Identifiable {
+    case live
+    case oneShot
+
+    var id: String { rawValue }
+    var display: String {
+        switch self {
+        case .live:    return "Live (recommended)"
+        case .oneShot: return "One-shot — tap, recite, tap Done"
+        }
+    }
+}
+
 enum WhisperModelChoice: String, CaseIterable, Identifiable {
     case tiny, base, small, medium
     var id: String { rawValue }
@@ -43,6 +65,7 @@ enum TranslationChoice: String, CaseIterable, Identifiable {
 struct SettingsScreen: View {
     let onBack: () -> Void
 
+    @AppStorage("settings.searchMode") private var searchModeRaw: String = SearchModeChoice.live.rawValue
     @AppStorage("settings.model") private var modelRaw: String = WhisperModelChoice.small.rawValue
     @AppStorage("settings.script") private var scriptRaw: String = ScriptChoice.both.rawValue
     @AppStorage("settings.translation") private var translationRaw: String = TranslationChoice.manmohanSingh.rawValue
@@ -50,6 +73,13 @@ struct SettingsScreen: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
+                section("Search mode") {
+                    ForEach(SearchModeChoice.allCases) { opt in
+                        RadioRow(label: opt.display, selected: opt.rawValue == searchModeRaw) {
+                            searchModeRaw = opt.rawValue
+                        }
+                    }
+                }
                 section("Whisper model") {
                     ForEach(WhisperModelChoice.allCases) { opt in
                         RadioRow(label: opt.display, selected: opt.rawValue == modelRaw) {
