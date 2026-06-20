@@ -6,29 +6,41 @@ import GurbaniLensCore
 /// (app-scoped) and observed by the nav graph. Mirrors
 /// `android/.../domain/VoiceSearchSession.kt`.
 ///
-/// Phases:
+/// ### v1 (one-shot) phases
 ///   - ``idle``         — Home screen, awaiting tap
 ///   - ``recording``    — mic capture in progress; live peak amplitude
-///   - ``transcribing`` — Whisper running
-///   - ``matching``     — matcher running (matcher.match in a detached Task;
-///                        Stage 0 first-letters pre-filter + Stage 1 full
-///                        partial_ratio + Stage 2 token coverage). UI shows
-///                        "Searching…" so the user sees forward progress
-///                        instead of a stale "Transcribing…" label during
-///                        the 2-5 s matcher window.
-///   - ``done``         — ``SearchResult`` ready (possibly empty)
+///   - ``transcribing`` — Whisper running (one-shot)
+///   - ``matching``     — matcher running (full Stage 0+1+2)
+///   - ``done``         — ``SearchResult`` ready
 ///   - ``error``        — message surfaced to UI
 ///
-/// Every setter logs `[DIAG]` so we can correlate UI symptoms (e.g. "stuck
-/// on Transcribing") with the actual state machine via the Xcode console.
+/// ### v2 (live search-as-you-speak) phases
+///   - ``listening``    — mic streaming; partial transcripts arriving;
+///                        liveMatches updating after each 300 ms debounce
+///   - ``committing``   — full ``Matcher.match`` running on the final
+///                        accumulated transcript
+///   - ``done``         — final ``SearchResult`` ready (shared with v1)
+///
+/// Every setter logs `[DIAG]` so we can correlate UI symptoms with the
+/// actual state machine via the Xcode console.
 @MainActor
 public final class VoiceSearchSession: ObservableObject {
 
     public enum State: Equatable {
         case idle
+        // v1 cases
         case recording(peak: Float)
         case transcribing
         case matching
+        // v2 cases
+        case listening(
+            confirmedText: String,
+            unconfirmedText: String,
+            liveMatches: [Match],
+            bufferEnergy: Float
+        )
+        case committing(query: String)
+        // shared terminal cases
         case done(SearchResult)
         case error(String)
 
@@ -36,11 +48,22 @@ public final class VoiceSearchSession: ObservableObject {
             switch (lhs, rhs) {
             case (.idle, .idle), (.transcribing, .transcribing), (.matching, .matching):
                 return true
-            case (.recording(let a), .recording(let b)): return a == b
+            case (.recording(let a), .recording(let b)):
+                return a == b
+            case (.listening(let ac, let au, let am, let ae),
+                  .listening(let bc, let bu, let bm, let be_)):
+                return ac == bc && au == bu
+                    && am.map(\.line.id) == bm.map(\.line.id)
+                    && ae == be_
+            case (.committing(let a), .committing(let b)):
+                return a == b
             case (.done(let a), .done(let b)):
-                return a.transcript == b.transcript && a.matches.map(\.line.id) == b.matches.map(\.line.id)
-            case (.error(let a), .error(let b)): return a == b
-            default: return false
+                return a.transcript == b.transcript
+                    && a.matches.map(\.line.id) == b.matches.map(\.line.id)
+            case (.error(let a), .error(let b)):
+                return a == b
+            default:
+                return false
             }
         }
     }
@@ -49,9 +72,9 @@ public final class VoiceSearchSession: ObservableObject {
 
     public init() {}
 
+    // MARK: - v1 setters (untouched)
+
     public func setRecording(peak: Float = 0) {
-        // Don't NSLog every peak — too noisy. Only the transition into
-        // recording is interesting. (peak=0 means startRecording fired.)
         if case .recording = state {} else {
             NSLog("[DIAG] VoiceSearchSession state → recording (initial peak=\(peak))")
         }
@@ -67,6 +90,34 @@ public final class VoiceSearchSession: ObservableObject {
         NSLog("[DIAG] VoiceSearchSession state → matching")
         state = .matching
     }
+
+    // MARK: - v2 setters
+
+    /// Set/update the `.listening` state. Logs `[DIAG] state → listening`
+    /// only on the initial transition to keep per-tick log volume down.
+    public func setListening(
+        confirmedText: String,
+        unconfirmedText: String,
+        liveMatches: [Match],
+        bufferEnergy: Float
+    ) {
+        if case .listening = state {} else {
+            NSLog("[DIAG] VoiceSearchSession state → listening")
+        }
+        state = .listening(
+            confirmedText: confirmedText,
+            unconfirmedText: unconfirmedText,
+            liveMatches: liveMatches,
+            bufferEnergy: bufferEnergy
+        )
+    }
+
+    public func setCommitting(query: String) {
+        NSLog("[DIAG] VoiceSearchSession state → committing (query.len=\(query.count))")
+        state = .committing(query: query)
+    }
+
+    // MARK: - Terminal setters (shared)
 
     public func setDone(_ result: SearchResult) {
         NSLog("[DIAG] VoiceSearchSession state → done (transcript.len=\(result.transcript.count) matches=\(result.matches.count) topScore=\(result.matches.first.map { String(format: "%.1f", $0.score) } ?? "n/a") confidence=\(result.topConfidence.rawValue))")
@@ -85,6 +136,8 @@ public final class VoiceSearchSession: ObservableObject {
         state = .idle
     }
 
+    // MARK: - Convenience accessors
+
     public var doneResult: SearchResult? {
         if case .done(let r) = state { return r } else { return nil }
     }
@@ -97,12 +150,21 @@ public final class VoiceSearchSession: ObservableObject {
         if case .recording(let p) = state { return p } else { return 0 }
     }
 
-    /// End-to-end search. Caller has captured `samples`; we hand them to
-    /// `asr`, then run the matcher off the @MainActor so a long query
-    /// (hallucinated garbage with thousands of chars) can't freeze the UI.
-    /// Every code path ends in a terminal state (`done` or `error`) — the
-    /// previous version could leave the session stuck in `transcribing` if
-    /// `matcher.match` blocked the @MainActor for minutes.
+    /// Snapshot of the current `.listening` payload (or nil otherwise).
+    /// Phase B UI uses this from the View body to render sticky header +
+    /// candidate list without pattern-matching the enum at the call site.
+    public var listeningSnapshot: (confirmed: String, unconfirmed: String, matches: [Match], energy: Float)? {
+        if case .listening(let c, let u, let m, let e) = state {
+            return (confirmed: c, unconfirmed: u, matches: m, energy: e)
+        }
+        return nil
+    }
+
+    // MARK: - v1 one-shot end-to-end
+
+    /// End-to-end one-shot search (v1 mode). Untouched in v2 — the
+    /// streaming path goes through ``startStreaming(asr:matcher:)`` /
+    /// ``commit(asr:matcher:)`` below instead.
     public func runSearch(
         samples: [Float],
         asr: Asr,
@@ -115,9 +177,6 @@ public final class VoiceSearchSession: ObservableObject {
         do {
             transcript = try await asr.transcribe(samples, config: config)
         } catch {
-            // Bubble up so the caller (AppContainer) can choose error vs
-            // friendly empty-result handling. We don't setError here so the
-            // caller can decide the user-facing wording.
             NSLog("[DIAG] VoiceSearchSession.runSearch ASR threw \(error.localizedDescription) afterMs=\(Int(Date().timeIntervalSince(transcribeStart) * 1000))")
             throw error
         }
@@ -127,18 +186,10 @@ public final class VoiceSearchSession: ObservableObject {
 
         let matches: [Match]
         if raw.isEmpty {
-            // Whisper said nothing (or hallucination guard suppressed it).
-            // Skip the matcher entirely AND skip the .matching state — the
-            // user gets the empty Results screen immediately instead of a
-            // misleading "Searching…" flash before "no matches found".
             matches = []
             NSLog("[DIAG] VoiceSearchSession.runSearch raw empty — skipping matcher + matching state")
         } else {
             setMatching()
-            // Move matcher.match off @MainActor. partial_ratio is O(n·m) over
-            // 60K corpus lines — on a long query it can freeze the UI for
-            // seconds (the original 2 min hang on the Telugu hallucination).
-            // Task.detached at userInitiated priority keeps UI responsive.
             let matcherRef = matcher
             let query = raw
             let matchStart = Date()
@@ -150,6 +201,130 @@ public final class VoiceSearchSession: ObservableObject {
         }
 
         let result = SearchResult.from(transcript: raw, matches: matches)
+        setDone(result)
+        return result
+    }
+
+    // MARK: - v2 streaming end-to-end
+
+    /// **v2 mode entry.** Subscribes to the `StreamingASR` partials stream,
+    /// updates `.listening(…)` on every partial, and runs
+    /// ``Matcher.matchByFirstLetters`` with a 300 ms debounce so the
+    /// live result list refreshes once per natural pause rather than per
+    /// Whisper callback.
+    ///
+    /// Returns when the stream finishes — either because WhisperKit's
+    /// silence-VAD tripped or the caller invoked ``commit(asr:matcher:)``
+    /// / `asr.stop()`. The state at return time is `.listening(…)` with
+    /// the final partial; the caller (typically `AppContainer`) then
+    /// calls `commit()` to run the full fuzzy match and transition to
+    /// `.done`.
+    public func startStreaming(
+        asr: StreamingASR,
+        matcher: Matcher
+    ) async throws {
+        setListening(confirmedText: "", unconfirmedText: "", liveMatches: [], bufferEnergy: 0)
+        let stream = try await asr.partials()
+
+        var pendingMatchTask: Task<Void, Never>? = nil
+        var lastMatchedQuery = ""
+
+        for await partial in stream {
+            // Step 1: snappy text + energy update. Preserve whatever
+            // liveMatches are currently in state — the debounce task below
+            // will refresh them when the debounce window elapses.
+            let currentLiveMatches: [Match] = listeningSnapshot?.matches ?? []
+            setListening(
+                confirmedText: partial.confirmedText,
+                unconfirmedText: partial.unconfirmedText,
+                liveMatches: currentLiveMatches,
+                bufferEnergy: partial.bufferEnergy
+            )
+
+            // Step 2: schedule a debounced matchByFirstLetters call.
+            // Cancel the pending one (if any) so only the latest query
+            // ever runs the matcher.
+            pendingMatchTask?.cancel()
+
+            let query = partial.latin.trimmingCharacters(in: .whitespacesAndNewlines)
+            if query.isEmpty || query == lastMatchedQuery { continue }
+
+            let matcherRef = matcher
+            let scheduledQuery = query
+            pendingMatchTask = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 300_000_000) // 300 ms
+                if Task.isCancelled { return }
+
+                let matchStart = Date()
+                let liveMatches = await Task.detached(priority: .userInitiated) {
+                    matcherRef.matchByFirstLetters(scheduledQuery, topN: 5)
+                }.value
+                let matchMs = Int(Date().timeIntervalSince(matchStart) * 1000)
+                NSLog("[DIAG] VoiceSearchSession.startStreaming matchByFirstLetters done matchMs=\(matchMs) matches=\(liveMatches.count) topScore=\(liveMatches.first.map { String(format: "%.1f", $0.score) } ?? "n/a")")
+
+                if Task.isCancelled { return }
+                await MainActor.run {
+                    guard let self = self else { return }
+                    // Update only the liveMatches slot — text + energy stay
+                    // in sync with whatever the LATEST partial put there.
+                    if case .listening(let c, let u, _, let e) = self.state {
+                        self.setListening(
+                            confirmedText: c,
+                            unconfirmedText: u,
+                            liveMatches: liveMatches,
+                            bufferEnergy: e
+                        )
+                    }
+                }
+            }
+            lastMatchedQuery = query
+        }
+
+        pendingMatchTask?.cancel()
+        NSLog("[DIAG] VoiceSearchSession.startStreaming partials stream finished")
+    }
+
+    /// Stop the stream and run the full ``Matcher/match(_:topN:)`` on the
+    /// accumulated transcript. Transitions through `.committing` →
+    /// `.done(result)`.
+    ///
+    /// Returns the final `SearchResult`. If the caller wants to open a
+    /// specific match (tap-row path), pass it as `selectedMatch` — we'll
+    /// still run the full fuzzy match but the caller can navigate to that
+    /// match's Shabad immediately.
+    @discardableResult
+    public func commit(
+        asr: StreamingASR,
+        matcher: Matcher
+    ) async -> SearchResult {
+        // Snapshot the listening payload BEFORE stopping the asr —
+        // otherwise the snapshot may race against a final VAD-stop
+        // setListening from the for-await loop.
+        let query: String = {
+            if case .listening(let c, let u, _, _) = state {
+                return (c + " " + u).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            return ""
+        }()
+        await asr.stop()
+        setCommitting(query: query)
+
+        let matches: [Match]
+        if query.isEmpty {
+            matches = []
+            NSLog("[DIAG] VoiceSearchSession.commit query empty — skipping full matcher")
+        } else {
+            let matcherRef = matcher
+            let q = query
+            let matchStart = Date()
+            matches = await Task.detached(priority: .userInitiated) {
+                matcherRef.match(q, topN: 5)
+            }.value
+            let matchMs = Int(Date().timeIntervalSince(matchStart) * 1000)
+            NSLog("[DIAG] VoiceSearchSession.commit full matcher done matchMs=\(matchMs) matches=\(matches.count) topScore=\(matches.first.map { String(format: "%.1f", $0.score) } ?? "n/a")")
+        }
+
+        let result = SearchResult.from(transcript: query, matches: matches)
         setDone(result)
         return result
     }
