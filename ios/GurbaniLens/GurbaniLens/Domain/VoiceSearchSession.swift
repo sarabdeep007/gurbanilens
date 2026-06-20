@@ -10,6 +10,12 @@ import GurbaniLensCore
 ///   - ``idle``         — Home screen, awaiting tap
 ///   - ``recording``    — mic capture in progress; live peak amplitude
 ///   - ``transcribing`` — Whisper running
+///   - ``matching``     — matcher running (matcher.match in a detached Task;
+///                        Stage 0 first-letters pre-filter + Stage 1 full
+///                        partial_ratio + Stage 2 token coverage). UI shows
+///                        "Searching…" so the user sees forward progress
+///                        instead of a stale "Transcribing…" label during
+///                        the 2-5 s matcher window.
 ///   - ``done``         — ``SearchResult`` ready (possibly empty)
 ///   - ``error``        — message surfaced to UI
 ///
@@ -22,12 +28,14 @@ public final class VoiceSearchSession: ObservableObject {
         case idle
         case recording(peak: Float)
         case transcribing
+        case matching
         case done(SearchResult)
         case error(String)
 
         public static func == (lhs: State, rhs: State) -> Bool {
             switch (lhs, rhs) {
-            case (.idle, .idle), (.transcribing, .transcribing): return true
+            case (.idle, .idle), (.transcribing, .transcribing), (.matching, .matching):
+                return true
             case (.recording(let a), .recording(let b)): return a == b
             case (.done(let a), .done(let b)):
                 return a.transcript == b.transcript && a.matches.map(\.line.id) == b.matches.map(\.line.id)
@@ -53,6 +61,11 @@ public final class VoiceSearchSession: ObservableObject {
     public func setTranscribing() {
         NSLog("[DIAG] VoiceSearchSession state → transcribing")
         state = .transcribing
+    }
+
+    public func setMatching() {
+        NSLog("[DIAG] VoiceSearchSession state → matching")
+        state = .matching
     }
 
     public func setDone(_ result: SearchResult) {
@@ -115,11 +128,13 @@ public final class VoiceSearchSession: ObservableObject {
         let matches: [Match]
         if raw.isEmpty {
             // Whisper said nothing (or hallucination guard suppressed it).
-            // Skip the matcher entirely — empty query yields no matches and
-            // would only waste cycles.
+            // Skip the matcher entirely AND skip the .matching state — the
+            // user gets the empty Results screen immediately instead of a
+            // misleading "Searching…" flash before "no matches found".
             matches = []
-            NSLog("[DIAG] VoiceSearchSession.runSearch raw empty — skipping matcher")
+            NSLog("[DIAG] VoiceSearchSession.runSearch raw empty — skipping matcher + matching state")
         } else {
+            setMatching()
             // Move matcher.match off @MainActor. partial_ratio is O(n·m) over
             // 60K corpus lines — on a long query it can freeze the UI for
             // seconds (the original 2 min hang on the Telugu hallucination).

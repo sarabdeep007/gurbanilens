@@ -17,6 +17,7 @@ struct RecordingScreen: View {
         switch session.state {
         case .recording:    return "Listening…"
         case .transcribing: return "Transcribing…"
+        case .matching:     return "Searching…"
         case .error:        return "Error"
         default:            return ""
         }
@@ -26,6 +27,7 @@ struct RecordingScreen: View {
         switch session.state {
         case .recording(let p): return CGFloat(p)
         case .transcribing:     return 1
+        case .matching:         return 1
         default:                return 0
         }
     }
