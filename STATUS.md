@@ -1,6 +1,6 @@
 # GurbaniLens — STATUS
 
-_Last updated: 2026-06-20 by Claude (iOS agent) — three bugs from DIAG-logged on-device test fixed (language remap pa→hi, repetition guard + temperature fallback, off-MainActor matcher + state DIAG)._
+_Last updated: 2026-06-20 by Claude (iOS agent) — matcher first-letters pre-filter; expect on-device match time to drop from 213 s to 2–5 s._
 
 This is the up-to-the-minute state file. CLAUDE.md is the durable project doc; STATUS.md is for "what's happening right now."
 
@@ -27,6 +27,7 @@ Pivoted from "continuous-listen Paath companion" on **2026-06-17**. Original Pha
 - ✅ **iOS capture WAV persistence** (2026-06-20) — every successful stopRecording writes the 16 kHz mono Float32 buffer to `Documents/capture-<unix-ms>.wav` (raw IEEE-float-32 RIFF WAV via `WaveWriter`) BEFORE the ASR runs. Extract via Xcode → Window → Devices and Simulators → iPhone → Installed Apps → GurbaniLens → Download Container. Lets us hear exactly what WhisperKit received when transcription is wrong.
 - ✅ **iOS audio + state pipeline `[DIAG]` logging** (2026-06-20) — `NSLog("[DIAG] ...")` breadcrumbs across `MicSource.installTap/stop/bulkConvert`, `RecordingCapture.start/stop`, `WhisperOneShot.transcribe` (input stats + decode options + raw text + Latin text + repetition-guard trips), `Latin.from`, `VoiceSearchSession` state setters (idle / recording / transcribing / done / error transitions) and `AppContainer.runSearchAndDone` branches (entry, WAV write success/fail, runSearch returned/threw). `grep "\[DIAG\]"` against the Xcode console gives a complete pipeline trace from tap to UI.
 - ✅ **Matcher off MainActor + `@unchecked Sendable`** (2026-06-20) — `Matcher` is immutable after init; declared `@unchecked Sendable` in `GurbaniLensCore` and called via `Task.detached(priority: .userInitiated)` from `VoiceSearchSession.runSearch`. Fixes a 2-min UI freeze when `matcher.match` was called on MainActor with a multi-thousand-char hallucinated query (partial_ratio is O(n·m) × 60K candidates ≈ 9B ops). Empty-raw-text fast-path skips the matcher entirely.
+- ✅ **Matcher first-letters pre-filter (Stage 0)** (2026-06-20) — pure-Swift partial_ratio is 100-300× slower on iPhone ARM than rapidfuzz C++ on Mac; Deep's real-device test took 213 s for a single 35-char query over the 60K corpus. Added a cheap Stage 0 that ranks lines by `partial_ratio(qFL, lineFL)` over the per-line abbreviation (first letter of each transliteration token, computed at index time), keeps top `prefilterPoolCap=1500`, and only then runs the existing Stage 1 full partial_ratio over those 1500. Expected match time: 2–5 s on iPhone, down from 213 s. Port-parity preserved by design: pre-filter is a recall stage, final ranking comes from the unchanged Stage 1+2 maths. `swift test` of `GurbaniLensCore` must remain 11/11 — run on Mac before next dispatch.
 - ✅ **`scripts/fetch_ios_deps.sh`** — re-runnable bootstrap. Default just copies `data/sggs/database.sqlite` → `Resources/Data/app_database.sqlite`. `--bundle-model` additionally fetches the WhisperKit CoreML model tree (AudioEncoder.mlmodelc + TextDecoder.mlmodelc + MelSpectrogram.mlmodelc + tokenizer) into `Resources/Models/openai_whisper-small/`. Uses `huggingface-cli` when available, falls back to git+git-lfs. Both `Models/` and `Data/` are gitignored.
 - ✅ **Phase 2B prep tracks** — `scripts/fetch_samples.py` (Track B sample gathering), `docs/aeneas_spike.md` (Track C alignment, pivoted to `faster-whisper` word_timestamps).
 - ✅ **Server skeleton + privacy contract** — `server/` directory, FastAPI scaffold. Not deployed; documents the v2 fallback policy.
@@ -85,6 +86,13 @@ xcodebuild -project GurbaniLens.xcodeproj -scheme GurbaniLens \
 ```
 
 If the build succeeds, run on device via Xcode (Cmd-R). WhisperKit will auto-download `openai_whisper-small` (~250 MB) on first launch.
+
+**Perf-test recipe (2026-06-20 post-prefilter):** record yourself reciting **"hum rulte firte koi baat na poochta"** (or anything else from SGGS) for ~5 s, tap Done. Watch the Xcode console for:
+```
+[DIAG] Matcher.match totalLines=60555 qFL="…" usedPrefilter=true stage1Candidates=1500 prefilterMs=<1000 stage1Ms=<4000 stage2Ms=<100 totalMs=<5000
+[DIAG] VoiceSearchSession.runSearch matcher done matchMs=<5000 matches=5 topScore=…
+```
+If `matchMs < 5000` and `usedPrefilter=true`, the perf fix landed cleanly. Run `cd ios/GurbaniLensCore && GURBANILENS_CORPUS_PATH=$(pwd)/../../data/sggs/database.sqlite swift test` on Mac to confirm 11/11 port-parity still passes before next dispatch.
 
 **Bug-test recipe (2026-06-20 post-fix):** record yourself reciting **"ek oankaar sat naam karataa purakh"** slowly and clearly for 5 s, tap Done. Expected on the next run:
 - `[DIAG] WhisperOneShot.transcribe language remap pa → hi (small-model Punjabi workaround)` (BUG 1 fix confirmation)
