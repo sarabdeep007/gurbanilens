@@ -70,9 +70,11 @@ targets:
         # listening, no recording without an explicit tap.
         NSMicrophoneUsageDescription: "GurbaniLens listens when you tap the microphone, transcribes what you recite, and looks up the matching Shabad. Audio stays on this device — nothing is uploaded."
     entitlements:
+      # Intentionally empty entitlements. Free-Apple-ID personal-team
+      # signing rejects `com.apple.developer.kernel.increased-memory-limit`
+      # (provisioning fails), and the v1 ASR model fits comfortably under
+      # the default iOS memory cap — no entitlement needed.
       path: GurbaniLens/Resources/GurbaniLens.entitlements
-      properties:
-        com.apple.developer.kernel.increased-memory-limit: false
     dependencies:
       - package: GurbaniLensCore
         product: GurbaniLensCore
