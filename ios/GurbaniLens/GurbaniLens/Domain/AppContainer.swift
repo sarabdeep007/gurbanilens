@@ -37,6 +37,22 @@ final class AppContainer: ObservableObject {
     // ── User intents ─────────────────────────────────────────────────────
 
     func startRecording() {
+        // Bug F guard. v1 one-shot mode must never start MicSource while a
+        // v2 streaming session is active — they fight over the AVAudioSession
+        // and the WhisperKit AudioProcessor mic, producing two parallel
+        // captures (Deep's 2026-06-20 device test, Bug F). If we got here
+        // while streaming or in any live state, refuse and log.
+        if streamingAsr != nil {
+            NSLog("[DIAG] AppContainer.startRecording REFUSED — streamingAsr active (Bug F guard)")
+            return
+        }
+        switch session.state {
+        case .listening, .committing:
+            NSLog("[DIAG] AppContainer.startRecording REFUSED — session in live state \(String(describing: session.state)) (Bug F guard)")
+            return
+        default:
+            break
+        }
         // Push the Recording screen immediately so the UI feels responsive
         // even if mic permission needs to be requested.
         path.append(.recording)
@@ -48,6 +64,14 @@ final class AppContainer: ObservableObject {
     }
 
     func stopRecording() {
+        // Bug F guard — same reason as startRecording: never run the v1
+        // bulk-MicSource → WhisperOneShot batch path while a v2 stream is
+        // active. The live commit path uses the streamed transcript, not
+        // a fresh MicSource buffer.
+        if streamingAsr != nil {
+            NSLog("[DIAG] AppContainer.stopRecording REFUSED — streamingAsr active (Bug F guard)")
+            return
+        }
         // Idempotency guard. After the user taps Done we transition
         // session state out of .recording and immediately disable the
         // Done button — but SwiftUI can still deliver a queued tap before
@@ -95,6 +119,13 @@ final class AppContainer: ObservableObject {
     /// Stop (commitLive), taps a row (commitLive(match:)), or
     /// WhisperKit's silence-VAD finishes the stream.
     func startLiveRecording() {
+        // Bug F defence — ensure no stale v1 MicSource / RecordingCapture
+        // task is still alive. If a user toggled Settings.searchMode
+        // mid-session, capture might still be running from a v1 attempt.
+        // Force-clean before WhisperKit grabs the mic.
+        recordingTask?.cancel()
+        capture.cancel()
+
         path.append(.liveRecording)
         streamingTask?.cancel()
         streamingTask = Task { [weak self] in
