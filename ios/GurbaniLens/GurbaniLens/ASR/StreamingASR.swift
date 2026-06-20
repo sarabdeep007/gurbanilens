@@ -132,6 +132,18 @@ public actor StreamingASR {
     private let energyHistorySize: Int = 8
     private let lowEnergyThreshold: Float = 0.1
 
+    // Bug M warmup grace window. WhisperKit can fire isRecording=false
+    // within tens of milliseconds of stream start, before any real audio
+    // has arrived (bufferEnergy still 0). Without this window, the v2
+    // .live mode terminated 44ms into Deep's 2026-06-21 test. We honour
+    // VAD-stop only after EITHER `warmupGracePeriod` has elapsed since
+    // stream start OR we've seen at least one partial with energy above
+    // `realAudioEnergyThreshold` — whichever comes first.
+    private var streamStartTime: Date?
+    private var maxEnergySeen: Float = 0
+    private let warmupGracePeriod: TimeInterval = 1.5
+    private let realAudioEnergyThreshold: Float = 0.1
+
     /// - Parameters:
     ///   - pipe: a constructed `WhisperKit` (typically obtained via
     ///     `WhisperOneShot.sharedPipe()` so v1 and v2 share one load).
@@ -185,6 +197,11 @@ public actor StreamingASR {
         }
 
         NSLog("[DIAG] StreamingASR.partials() starting language=\(effectiveLanguage) silenceThreshold=\(silenceThreshold) useVAD=true")
+
+        // Bug M: anchor the warmup grace window at stream start. Reset
+        // maxEnergySeen so a previous session's reading can't leak in.
+        self.streamStartTime = Date()
+        self.maxEnergySeen = 0
 
         let (stream, cont) = AsyncStream.makeStream(of: Partial.self)
         self.continuation = cont
@@ -300,6 +317,9 @@ public actor StreamingASR {
         if energyHistory.count > energyHistorySize {
             energyHistory.removeFirst()
         }
+        // Bug M: also track all-time max energy for the warmup-grace
+        // VAD-stop gate below.
+        if energy > maxEnergySeen { maxEnergySeen = energy }
         let sustainedLowEnergy = energyHistory.count >= energyHistorySize
             && energyHistory.allSatisfy { $0 < lowEnergyThreshold }
         let textGrew = currentText.count > lastEmittedTextLength
@@ -336,10 +356,20 @@ public actor StreamingASR {
 
         // If WhisperKit's VAD just flipped isRecording false → finish the
         // stream so the consumer's for-await loop exits and can transition
-        // to .committing.
+        // to .committing. Bug M: but suppress the VAD-stop if we're still
+        // in the warmup grace window AND no real audio has arrived yet.
+        // WhisperKit can fire isRecording=false within ~40 ms of stream
+        // start (Deep's 2026-06-21 test) before the mic buffer has even
+        // populated; that's a startup artifact, not real silence.
         if !new.isRecording && old.isRecording {
-            NSLog("[DIAG] StreamingASR VAD-stop detected, finishing stream")
-            finishStream()
+            let elapsed = streamStartTime.map { Date().timeIntervalSince($0) } ?? 0
+            let realAudio = maxEnergySeen > realAudioEnergyThreshold
+            if elapsed < warmupGracePeriod && !realAudio {
+                NSLog("[DIAG] StreamingASR VAD-stop SUPPRESSED (warmup or no-real-audio: elapsedMs=\(Int(elapsed * 1000)) maxEnergy=\(String(format: "%.3f", maxEnergySeen)))")
+            } else {
+                NSLog("[DIAG] StreamingASR VAD-stop detected, finishing stream (elapsedMs=\(Int(elapsed * 1000)) maxEnergy=\(String(format: "%.3f", maxEnergySeen)))")
+                finishStream()
+            }
         }
     }
 
