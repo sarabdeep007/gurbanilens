@@ -25,6 +25,15 @@ final class AppContainer: ObservableObject {
     private var streamingAsr: StreamingASR?
     private var streamingTask: Task<Void, Never>?
 
+    // Bug I single-fire flag. `commitLiveStream` is async, so the
+    // `guard case .listening = session.state` at its top doesn't gate
+    // concurrent calls — multiple Stop taps (or a Stop tap + a
+    // silence-VAD auto-commit firing at the same time, etc.) can pass
+    // the guard before any of them awaits `ensureStreamingAsr` /
+    // `session.commit`. Set this flag SYNCHRONOUSLY at entry; reset in
+    // defer so the next legitimate commit cycle can run.
+    private var commitInFlight: Bool = false
+
     private var recordingTask: Task<Void, Never>?
 
     init() {
@@ -316,6 +325,20 @@ final class AppContainer: ObservableObject {
     }
 
     private func commitLiveStream(preselected: Match?) async {
+        // Bug I: single-fire flag set SYNCHRONOUSLY before any await so
+        // concurrent commit calls (rapid Stop taps, Stop + silence-VAD
+        // firing simultaneously, etc.) are guaranteed to no-op except
+        // for the first one. The state guard below is necessary but not
+        // sufficient — by the time we await ensureStreamingAsr the second
+        // caller might still see state == .listening because setCommitting
+        // hasn't run yet on the first caller.
+        if commitInFlight {
+            NSLog("[DIAG] AppContainer.commitLiveStream re-entry blocked (commitInFlight=true)")
+            return
+        }
+        commitInFlight = true
+        defer { commitInFlight = false }
+
         // Guard: only commit while we're actually listening / committing.
         // If the session is already .done (e.g. duplicate Stop tap), no-op.
         guard case .listening = session.state else {
