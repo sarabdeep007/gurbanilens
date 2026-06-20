@@ -42,13 +42,36 @@ final class AppContainer: ObservableObject {
     }
 
     func stopRecording() {
+        // Idempotency guard. After the user taps Done we transition
+        // session state out of .recording and immediately disable the
+        // Done button — but SwiftUI can still deliver a queued tap before
+        // the disabled re-render lands. Without this guard those late
+        // taps call capture.stop() on an already-stopped mic (returns []),
+        // then runSearchAndDone(samples: 0) fires
+        // "No audio captured. Try again." while the original transcribe
+        // is mid-flight. Net: a confusing error alert behind a valid
+        // Results screen.
+        guard case .recording = session.state else {
+            NSLog("[DIAG] AppContainer.stopRecording ignored (state != .recording)")
+            return
+        }
         let samples = capture.stop()
         Task { [weak self] in await self?.runSearchAndDone(samples: samples) }
     }
 
     func cancelRecording() {
-        recordingTask?.cancel()
-        capture.cancel()
+        // Mic + capture-task teardown is only meaningful while we're
+        // actually recording. If the user backs out from the Recording
+        // screen during transcribing / matching / done / error states,
+        // those resources are already stopped — calling capture.cancel()
+        // again is a no-op but capture.stop() inside it returns [] and
+        // there's nothing useful to do. Skip cleanly.
+        if case .recording = session.state {
+            recordingTask?.cancel()
+            capture.cancel()
+        } else {
+            NSLog("[DIAG] AppContainer.cancelRecording skipping mic/task teardown (state=\(String(describing: session.state)))")
+        }
         session.reset()
         returnHome()
     }

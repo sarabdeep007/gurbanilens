@@ -30,6 +30,16 @@ struct RecordingScreen: View {
         }
     }
 
+    /// Done is only meaningful while we're actively recording. Once the user
+    /// taps it (session state → .transcribing), keep the button disabled so
+    /// stray repeat-taps can't enqueue an empty-buffer run through
+    /// runSearchAndDone — that path fires "No audio captured. Try again."
+    /// even though the real capture is mid-transcribe.
+    private var canTapDone: Bool {
+        if case .recording = session.state { return true }
+        return false
+    }
+
     var body: some View {
         VStack {
             VStack(spacing: 32) {
@@ -79,9 +89,12 @@ struct RecordingScreen: View {
                         Text("Done").fontWeight(.semibold)
                     }
                     .padding(.horizontal, 20).padding(.vertical, 12)
-                    .background(Theme.primary, in: Capsule())
-                    .foregroundColor(Theme.onPrimary)
+                    .background(canTapDone ? Theme.primary : Theme.surfaceVariant, in: Capsule())
+                    .foregroundColor(canTapDone ? Theme.onPrimary : Theme.onSurfaceVariant)
                 }
+                .disabled(!canTapDone)
+                .opacity(canTapDone ? 1 : 0.55)
+                .animation(.easeOut(duration: 0.15), value: canTapDone)
             }
             .padding(.bottom, 32)
         }
