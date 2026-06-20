@@ -100,6 +100,7 @@ public final class Matcher: @unchecked Sendable {
     }
 
     public func match(_ query: String, topN: Int = 5) -> [Match] {
+        let totalStart = Date()
         let normalised = normalize(query)
         if normalised.isEmpty { return [] }
         let qLong = longTokens(normalised)
@@ -111,7 +112,9 @@ public final class Matcher: @unchecked Sendable {
         // partial_ratio(qFL, lineFL). For queries with too few first-letters
         // to discriminate (<3 chars), fall back to the full corpus — the
         // original Stage 1 behaviour.
+        let prefilterStart = Date()
         let candidateIndices: [Int]
+        let usedPrefilter: Bool
         if qFL.count >= Self.prefilterMinQueryFL {
             var scored: [(score: Double, index: Int)] = []
             scored.reserveCapacity(firstLetters.count)
@@ -125,15 +128,20 @@ public final class Matcher: @unchecked Sendable {
             if scored.isEmpty {
                 // Defensive: every corpus line had an empty FL → full scan.
                 candidateIndices = Array(0..<normalizedTexts.count)
+                usedPrefilter = false
             } else {
                 candidateIndices = scored.prefix(Self.prefilterPoolCap).map(\.index)
+                usedPrefilter = true
             }
         } else {
             candidateIndices = Array(0..<normalizedTexts.count)
+            usedPrefilter = false
         }
+        let prefilterMs = Int(Date().timeIntervalSince(prefilterStart) * 1000)
 
         // Stage 1: top-K candidates by full partial_ratio (over the
         // pre-filtered set, not the full 60K corpus).
+        let stage1Start = Date()
         var stage1: [(score: Double, index: Int)] = []
         stage1.reserveCapacity(candidateIndices.count)
         for i in candidateIndices {
@@ -142,8 +150,10 @@ public final class Matcher: @unchecked Sendable {
         }
         stage1.sort { $0.score > $1.score }
         let candidates = stage1.prefix(Self.candidatePool)
+        let stage1Ms = Int(Date().timeIntervalSince(stage1Start) * 1000)
 
         // Stage 2: rescore by partial_ratio × token_coverage
+        let stage2Start = Date()
         var rescored: [(score: Double, partial: Double, coverage: Double, index: Int)] = []
         rescored.reserveCapacity(candidates.count)
         for (partial, index) in candidates {
@@ -152,6 +162,10 @@ public final class Matcher: @unchecked Sendable {
             rescored.append((final, partial, cov, index))
         }
         rescored.sort { $0.score > $1.score }
+        let stage2Ms = Int(Date().timeIntervalSince(stage2Start) * 1000)
+        let totalMs = Int(Date().timeIntervalSince(totalStart) * 1000)
+
+        NSLog("[DIAG] Matcher.match totalLines=\(normalizedTexts.count) qFL=\"\(qFL)\" usedPrefilter=\(usedPrefilter) stage1Candidates=\(candidateIndices.count) prefilterMs=\(prefilterMs) stage1Ms=\(stage1Ms) stage2Ms=\(stage2Ms) totalMs=\(totalMs)")
 
         return rescored.prefix(topN).map { entry in
             Match(
