@@ -267,6 +267,21 @@ final class AppContainer: ObservableObject {
 
     private func startLiveStreamAndAwait() async {
         NSLog("[DIAG] AppContainer.startLiveStreamAndAwait entry")
+        // Bug A: establish .listening state on @MainActor BEFORE we await
+        // anything heavy (matcher build, WhisperKit pipe construction,
+        // stream startup). Otherwise the first ~30 s of cold-start
+        // happens with session.state == .idle, and a user who taps Stop
+        // during that window hits `case .listening = state` guards that
+        // refuse the commit (Deep's 2026-06-20 log: three consecutive
+        // "[DIAG] AppContainer.commitLiveStream skipping (state=idle)"
+        // lines before the user gave up).
+        session.setListening(
+            confirmedText: "",
+            unconfirmedText: "",
+            liveMatches: [],
+            bufferEnergy: 0
+        )
+
         do {
             let asr = try await ensureStreamingAsr()
             let matcher = try ensureMatcher()
