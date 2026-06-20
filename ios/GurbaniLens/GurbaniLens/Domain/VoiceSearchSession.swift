@@ -129,9 +129,15 @@ public final class VoiceSearchSession: ObservableObject {
         state = .error(msg)
     }
 
-    public func reset() {
+    /// Force-transition the session to `.idle`. The `reason` is purely
+    /// diagnostic — it lets the next on-device run reveal which code path
+    /// is actually firing the reset (Bug K from the 2026-06-21 device
+    /// log showed a ~13 s auto-reset with no apparent cause; the audit
+    /// found no timer / asyncAfter in our code, so the reason tag is the
+    /// way to identify the real source on the next test).
+    public func reset(reason: String = "unspecified") {
         if state != .idle {
-            NSLog("[DIAG] VoiceSearchSession state → idle (reset)")
+            NSLog("[DIAG] VoiceSearchSession state → idle (reason=\(reason) previousState=\(String(describing: state)))")
         }
         state = .idle
     }

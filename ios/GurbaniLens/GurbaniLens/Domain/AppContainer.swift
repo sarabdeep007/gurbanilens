@@ -111,7 +111,7 @@ final class AppContainer: ObservableObject {
         } else {
             NSLog("[DIAG] AppContainer.cancelRecording skipping mic/task teardown (state=\(String(describing: session.state)))")
         }
-        session.reset()
+        session.reset(reason: "cancelRecording")
         returnHome()
     }
 
@@ -122,7 +122,7 @@ final class AppContainer: ObservableObject {
         // blocked by the Bug F guard. Idempotent: nil-ing nil is fine.
         streamingAsr = nil
         path.removeAll()
-        session.reset()
+        session.reset(reason: "returnHome")
     }
 
     // ── v2 (.live) user intents ──────────────────────────────────────────
@@ -167,7 +167,7 @@ final class AppContainer: ObservableObject {
         // runs cleanly against the original actor.
         streamingAsr = nil
         Task { await asrToStop?.stop() }
-        session.reset()
+        session.reset(reason: "cancelLive")
         returnHome()
     }
 
@@ -223,7 +223,7 @@ final class AppContainer: ObservableObject {
         // Bug J: error acknowledgement is a terminal cleanup point —
         // release the streaming ASR so a subsequent attempt is unblocked.
         streamingAsr = nil
-        session.reset()
+        session.reset(reason: "acknowledgeError")
         path.removeAll()
     }
 
