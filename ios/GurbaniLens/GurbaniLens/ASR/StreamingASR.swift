@@ -231,6 +231,17 @@ public actor StreamingASR {
     ) {
         let currentText = new.currentText.trimmingCharacters(in: .whitespacesAndNewlines)
 
+        // Bug C: WhisperKit's streaming tokenizer occasionally emits a
+        // U+FFFD (Unicode replacement char) mid-grapheme when a multi-byte
+        // Devanagari sequence is still being decoded. Latin.from on such a
+        // string corrupts the transliteration ("तत्�" → "tat�").
+        // Drop the partial; the next callback will have the complete
+        // grapheme and we recover cleanly.
+        if currentText.contains("\u{FFFD}") {
+            NSLog("[DIAG] StreamingASR skipping partial — U+FFFD in currentText (len=\(currentText.count))")
+            return
+        }
+
         // Hallucination guard. If the running currentText looks like a
         // repetition loop, swallow the update entirely — UI keeps the
         // last good partial.
