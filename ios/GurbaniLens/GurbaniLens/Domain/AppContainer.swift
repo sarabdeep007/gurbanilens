@@ -241,12 +241,17 @@ final class AppContainer: ObservableObject {
 
     /// Get / build the v2 streaming ASR. Shares the WhisperKit pipe with
     /// `ensureAsr()` so model load + CoreML cold-start are paid once
-    /// across both v1 and v2 modes.
+    /// across both v1 and v2 modes. Silence-VAD threshold comes from
+    /// Settings (`settings.silenceThreshold`); see ``SilenceThresholdChoice``.
     private func ensureStreamingAsr() async throws -> StreamingASR {
         if let s = streamingAsr { return s }
         let oneShot = ensureAsr()
         let pipe = try await oneShot.sharedPipe()
-        let s = StreamingASR(pipe: pipe, language: "pa")
+        let thresholdRaw = UserDefaults.standard.string(forKey: "settings.silenceThreshold")
+            ?? SilenceThresholdChoice.balanced.rawValue
+        let threshold = SilenceThresholdChoice(rawValue: thresholdRaw)?.value
+            ?? SilenceThresholdChoice.balanced.value
+        let s = StreamingASR(pipe: pipe, language: "pa", silenceThreshold: threshold)
         streamingAsr = s
         return s
     }

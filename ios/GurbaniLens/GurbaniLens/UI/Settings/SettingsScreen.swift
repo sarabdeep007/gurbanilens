@@ -22,6 +22,33 @@ enum SearchModeChoice: String, CaseIterable, Identifiable {
     }
 }
 
+/// v2 live-mode silence-VAD sensitivity. WhisperKit's
+/// `AudioStreamTranscriber.silenceThreshold` controls how aggressively the
+/// stream auto-finishes on a quiet moment. Phase A defaulted to 0.3 which
+/// Deep's 2026-06-20 device test showed wipes mid-sentence on a brief
+/// breath pause. v2 default is 0.6; power users can tune.
+enum SilenceThresholdChoice: String, CaseIterable, Identifiable {
+    case loose      // 0.4 — most permissive, tolerates short pauses
+    case balanced   // 0.6 — Phase A.1 default
+    case tight      // 0.8 — stop quickly on silence
+
+    var id: String { rawValue }
+    var value: Float {
+        switch self {
+        case .loose:    return 0.4
+        case .balanced: return 0.6
+        case .tight:    return 0.8
+        }
+    }
+    var display: String {
+        switch self {
+        case .loose:    return "Loose — tolerate breaths and short pauses"
+        case .balanced: return "Balanced (recommended)"
+        case .tight:    return "Tight — stop quickly after silence"
+        }
+    }
+}
+
 enum WhisperModelChoice: String, CaseIterable, Identifiable {
     case tiny, base, small, medium
     var id: String { rawValue }
@@ -66,6 +93,7 @@ struct SettingsScreen: View {
     let onBack: () -> Void
 
     @AppStorage("settings.searchMode") private var searchModeRaw: String = SearchModeChoice.live.rawValue
+    @AppStorage("settings.silenceThreshold") private var silenceThresholdRaw: String = SilenceThresholdChoice.balanced.rawValue
     @AppStorage("settings.model") private var modelRaw: String = WhisperModelChoice.small.rawValue
     @AppStorage("settings.script") private var scriptRaw: String = ScriptChoice.both.rawValue
     @AppStorage("settings.translation") private var translationRaw: String = TranslationChoice.manmohanSingh.rawValue
@@ -77,6 +105,13 @@ struct SettingsScreen: View {
                     ForEach(SearchModeChoice.allCases) { opt in
                         RadioRow(label: opt.display, selected: opt.rawValue == searchModeRaw) {
                             searchModeRaw = opt.rawValue
+                        }
+                    }
+                }
+                section("Live silence sensitivity") {
+                    ForEach(SilenceThresholdChoice.allCases) { opt in
+                        RadioRow(label: opt.display, selected: opt.rawValue == silenceThresholdRaw) {
+                            silenceThresholdRaw = opt.rawValue
                         }
                     }
                 }

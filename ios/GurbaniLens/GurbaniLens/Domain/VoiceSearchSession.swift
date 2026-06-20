@@ -223,17 +223,44 @@ public final class VoiceSearchSession: ObservableObject {
         asr: StreamingASR,
         matcher: Matcher
     ) async throws {
-        setListening(confirmedText: "", unconfirmedText: "", liveMatches: [], bufferEnergy: 0)
+        // AppContainer.startLiveStreamAndAwait already established
+        // .listening on @MainActor before this await — see Bug A. Don't
+        // overwrite it here.
         let stream = try await asr.partials()
 
         var pendingMatchTask: Task<Void, Never>? = nil
         var lastMatchedQuery = ""
 
         for await partial in stream {
+            // Bug B: freeze-last-good guard. WhisperKit's VAD can wipe
+            // currentText to empty mid-sentence on a brief silence; the
+            // user reported their full Pangti vanishing mid-recitation.
+            // If a new partial drops total content drastically vs the
+            // previous (> 50% shrink AND the previous was substantive),
+            // suppress the partial entirely — UI keeps the last good text
+            // and the matcher debounce keeps the last good matches.
+            let prevSnapshot = listeningSnapshot
+            let prevTotalLen = (prevSnapshot?.confirmed.count ?? 0) + (prevSnapshot?.unconfirmed.count ?? 0)
+            let newTotalLen = partial.confirmedText.count + partial.unconfirmedText.count
+            let dramaticShrink = prevTotalLen > 12 && newTotalLen < (prevTotalLen / 2)
+            if dramaticShrink {
+                NSLog("[DIAG] VoiceSearchSession.startStreaming Bug-B freeze-last-good (prev=\(prevTotalLen) new=\(newTotalLen)) — preserving previous transcript")
+                // Still update the energy so VU bar can pulse, but keep
+                // text + matches frozen. setListening below uses the
+                // previous text fields.
+                setListening(
+                    confirmedText: prevSnapshot?.confirmed ?? "",
+                    unconfirmedText: prevSnapshot?.unconfirmed ?? "",
+                    liveMatches: prevSnapshot?.matches ?? [],
+                    bufferEnergy: partial.bufferEnergy
+                )
+                continue
+            }
+
             // Step 1: snappy text + energy update. Preserve whatever
             // liveMatches are currently in state — the debounce task below
             // will refresh them when the debounce window elapses.
-            let currentLiveMatches: [Match] = listeningSnapshot?.matches ?? []
+            let currentLiveMatches: [Match] = prevSnapshot?.matches ?? []
             setListening(
                 confirmedText: partial.confirmedText,
                 unconfirmedText: partial.unconfirmedText,

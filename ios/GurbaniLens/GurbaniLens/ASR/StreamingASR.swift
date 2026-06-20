@@ -108,6 +108,7 @@ public actor StreamingASR {
     private let pipe: WhisperKit
     private let decodeOptions: DecodingOptions
     private let effectiveLanguage: String
+    private let silenceThreshold: Float
     private var transcriber: AudioStreamTranscriber?
     private var continuation: AsyncStream<Partial>.Continuation?
 
@@ -117,12 +118,19 @@ public actor StreamingASR {
     ///   - language: ISO language code. `"pa"` is silently remapped to
     ///     `"hi"` to dodge Whisper-small's Punjabi training gap (same
     ///     workaround as `WhisperOneShot`).
-    public init(pipe: WhisperKit, language: String = "pa") {
+    ///   - silenceThreshold: WhisperKit's VAD silence threshold. Phase A
+    ///     used the WhisperKit default 0.3; Deep's 2026-06-20 device test
+    ///     showed that wipes the transcript mid-sentence on a brief
+    ///     breath pause. Phase A.1 default is 0.6 (Settings exposes
+    ///     loose=0.4 / balanced=0.6 / tight=0.8 for power-user tuning).
+    public init(pipe: WhisperKit, language: String = "pa", silenceThreshold: Float = 0.6) {
         self.pipe = pipe
         self.effectiveLanguage = (language == "pa") ? "hi" : language
+        self.silenceThreshold = silenceThreshold
         if self.effectiveLanguage != language {
             NSLog("[DIAG] StreamingASR.init language remap \(language) → \(self.effectiveLanguage) (small-model Punjabi workaround)")
         }
+        NSLog("[DIAG] StreamingASR.init silenceThreshold=\(silenceThreshold)")
         self.decodeOptions = DecodingOptions(
             verbose: false,
             task: .transcribe,
@@ -156,7 +164,7 @@ public actor StreamingASR {
             throw StreamingError.missingTokenizer
         }
 
-        NSLog("[DIAG] StreamingASR.partials() starting language=\(effectiveLanguage) silenceThreshold=0.3 useVAD=true")
+        NSLog("[DIAG] StreamingASR.partials() starting language=\(effectiveLanguage) silenceThreshold=\(silenceThreshold) useVAD=true")
 
         let (stream, cont) = AsyncStream.makeStream(of: Partial.self)
         self.continuation = cont
@@ -174,7 +182,7 @@ public actor StreamingASR {
             audioProcessor: pipe.audioProcessor,
             decodingOptions: decodeOptions,
             requiredSegmentsForConfirmation: 2,
-            silenceThreshold: 0.3,
+            silenceThreshold: silenceThreshold,
             compressionCheckWindow: 60,
             useVAD: true,
             stateChangeCallback: cb
