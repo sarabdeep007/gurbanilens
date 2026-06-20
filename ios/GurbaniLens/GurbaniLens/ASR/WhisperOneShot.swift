@@ -115,13 +115,25 @@ public actor WhisperOneShot: Asr {
             temperatureIncrementOnFallback: 0.0,
             temperatureFallbackCount: config.noTemperatureFallback ? 0 : 5,
             usePrefillPrompt: true,
+            // Force the explicit language above. WhisperKit's DecodingOptions
+            // treats `detectLanguage: nil` as "auto" on some paths, which
+            // can override our `language: "pa"` for short or noisy clips
+            // and is one of the hypothesised causes of the nukta-spam.
+            detectLanguage: false,
             skipSpecialTokens: true,
             withoutTimestamps: true,
             wordTimestamps: false,
             suppressBlank: true,
-            compressionRatioThreshold: 2.4,
+            // Tighten loop-detection: when Whisper repeats the same token
+            // (hallucination), compression ratio of the output spikes.
+            // Default 2.4 lets a lot through; 2.0 catches loops earlier.
+            compressionRatioThreshold: 2.0,
             logProbThreshold: -1.0,
-            noSpeechThreshold: 0.6
+            // Default 0.6 is aggressive — Whisper flags borderline-speech
+            // clips as silence and the prefill prompt then dominates the
+            // decode (= hallucination). 0.45 lets quieter recitations
+            // through without disabling the silence filter entirely.
+            noSpeechThreshold: 0.45
         )
         NSLog("[DIAG] WhisperOneShot.transcribe decode task=transcribe language=\(decode.language ?? "nil") temperature=\(decode.temperature) tempFallback=\(decode.temperatureFallbackCount) compressionRatioThold=\(String(describing: decode.compressionRatioThreshold)) noSpeechThold=\(String(describing: decode.noSpeechThreshold)) withoutTimestamps=\(decode.withoutTimestamps) suppressBlank=\(decode.suppressBlank)")
 
