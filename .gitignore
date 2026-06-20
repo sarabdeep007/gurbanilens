@@ -105,3 +105,4 @@ android/app/src/main/jniLibs/
 android/app/src/main/assets/ggml-*.bin
 android/app/src/main/assets/sggs.sqlite
 build/android-deps-cache/
+samples/alignments/
