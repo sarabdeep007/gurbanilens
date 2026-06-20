@@ -1,6 +1,6 @@
 # GurbaniLens — STATUS
 
-_Last updated: 2026-06-20 by Claude (iOS agent) — Phase 2A v2 **Phase A.1** integration bug-fix sweep shipped (8 bugs from Deep's first device test); Phase A foundation now Sangat-ready pending on-device confirmation. Phase B polish (animated header, VU bar, list transitions) is next._
+_Last updated: 2026-06-20 by Claude (iOS agent) — Phase A.1 hotfix: removed duplicate `let energy` + redundant `await self.finishStream()` from `StreamingASR.handleStateChange`; modernised deprecated `.allowBluetooth` → `.allowBluetoothHFP` in `MicSource`. xcodebuild iOS Simulator should now compile clean._
 
 This is the up-to-the-minute state file. CLAUDE.md is the durable project doc; STATUS.md is for "what's happening right now."
 
