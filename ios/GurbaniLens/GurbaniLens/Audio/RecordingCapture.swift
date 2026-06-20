@@ -1,20 +1,21 @@
 import Foundation
 import AVFoundation
 
-/// One-shot mic capture for the v1 voice-search flow. Owns a ``MicSource``,
-/// accumulates the resampled 16 kHz mono Float32 samples into a single
-/// buffer, and emits peak-amplitude updates so the recording UI's VU bar
-/// can animate.
+/// One-shot mic capture for the v1 voice-search flow. Wraps ``MicSource``'s
+/// bulk-convert-at-stop model: live per-tap peak amplitudes drive the VU
+/// meter while recording, then on `stop()` the entire native-rate buffer is
+/// resampled to 16 kHz mono Float32 in one AVAudioConverter pass and
+/// returned as a `[Float]`.
 ///
-/// Lifecycle: ``start`` → caller awaits user → ``stop()`` returns the
-/// captured PCM. ``cancel()`` drops the buffer. Idempotent.
+/// Lifecycle: ``start`` → caller awaits user → ``stop()`` returns the PCM.
+/// ``cancel()`` drops the buffer. Idempotent.
 public final class RecordingCapture {
     private let mic = MicSource()
-    private var samples: [Float] = []
+    private var finalSamples: [Float] = []
     private let lock = NSLock()
     private var startedAt: Date?
 
-    /// Called on the audio thread for each delivered buffer.
+    /// Called on the audio thread for each delivered tap buffer (live VU).
     public var onPeak: ((Float) -> Void)?
 
     public var isRunning: Bool { mic.isRunning }
@@ -22,31 +23,31 @@ public final class RecordingCapture {
     public init() {}
 
     public func start() throws {
-        lock.lock(); samples.removeAll(keepingCapacity: true); lock.unlock()
+        lock.lock(); finalSamples.removeAll(keepingCapacity: false); lock.unlock()
         startedAt = Date()
         NSLog("[DIAG] RecordingCapture.start")
-        try mic.start { [weak self] buffer, _ in
-            guard let self, let chan = buffer.floatChannelData?[0] else { return }
-            let frames = Int(buffer.frameLength)
-            var peak: Float = 0
-            for i in 0..<frames {
-                let v = abs(chan[i])
-                if v > peak { peak = v }
+        try mic.startWithPeakMeter(
+            onPeak: { [weak self] peak in
+                self?.onPeak?(peak)
+            },
+            onFinal: { [weak self] buffer, _ in
+                guard let self, let chan = buffer.floatChannelData?[0] else { return }
+                let frames = Int(buffer.frameLength)
+                self.lock.lock()
+                self.finalSamples = Array(UnsafeBufferPointer(start: chan, count: frames))
+                self.lock.unlock()
             }
-            self.lock.lock()
-            self.samples.append(contentsOf: UnsafeBufferPointer(start: chan, count: frames))
-            self.lock.unlock()
-            self.onPeak?(peak)
-        }
+        )
     }
 
-    /// Stops the mic and returns the captured PCM samples (16 kHz mono Float32).
+    /// Stops the mic, runs MicSource's bulk-convert pass, and returns the
+    /// captured PCM samples (16 kHz mono Float32).
     @discardableResult
     public func stop() -> [Float] {
-        mic.stop()
+        mic.stop()  // MicSource fires onFinal synchronously inside stop()
         lock.lock(); defer { lock.unlock() }
-        let out = samples
-        samples.removeAll(keepingCapacity: false)
+        let out = finalSamples
+        finalSamples.removeAll(keepingCapacity: false)
         let wallDur = startedAt.map { Date().timeIntervalSince($0) } ?? 0
         let audioDur = Double(out.count) / 16_000.0
         let stats = quickStats(out)
@@ -57,7 +58,7 @@ public final class RecordingCapture {
     public func cancel() {
         mic.stop()
         lock.lock()
-        samples.removeAll(keepingCapacity: false)
+        finalSamples.removeAll(keepingCapacity: false)
         lock.unlock()
         NSLog("[DIAG] RecordingCapture.cancel")
     }
