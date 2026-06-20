@@ -1,91 +1,143 @@
 import Foundation
-@preconcurrency import whisper
+import WhisperKit
 
-/// One-shot whisper.cpp wrapper for v1 voice-search. Loads a `ggml-*.bin`
-/// model once and exposes a single `transcribe(samples:)` entry point.
-/// Mirrors `android/.../domain/WhisperAsr.kt`.
+/// One-shot WhisperKit wrapper for v1 voice-search. Loads a WhisperKit pipe
+/// once (CoreML-backed, optimised for Apple Neural Engine / GPU) and exposes
+/// a single `transcribe(_:config:)` entry point that satisfies the ``Asr``
+/// protocol. Mirrors `android/.../domain/WhisperAsr.kt`.
 ///
-/// Phase 1 deterministic-ASR config (locked in ``AsrConfig.default``):
-///   - sampling = greedy (no temperature ladder)
+/// Model loading
+/// -------------
+/// Two paths, in priority order:
+///   1. **Bundled** — if a `Resources/Models/openai_whisper-small` directory
+///      (or whichever variant) is in the app bundle, point WhisperKit at it
+///      via `modelFolder:`. No network needed at first launch.
+///   2. **Auto-download** — otherwise WhisperKit pulls the recommended
+///      CoreML model from huggingface.co/argmaxinc/whisperkit-coreml on
+///      first launch and caches it. Requires network on first run.
+///
+/// The bundled path is gated on `scripts/fetch_ios_deps.sh --bundle-model`;
+/// the auto-download path is the default behaviour and works out of the box.
+///
+/// Phase 1 deterministic-ASR config (locked in `DecodingOptions`):
+///   - task = .transcribe
+///   - language = config.language ("pa" by default)
 ///   - temperature = 0.0
-///   - temperature_inc = 0.0          (no fallback)
-///   - language = "pa"
-///   - translate = false
-///   - suppress_blank = true
-///   - n_threads = config.maxThreads
-///   - greedy.best_of = 1             (deterministic; mirrors fixed-seed
-///                                     intent — whisper.cpp's public API
-///                                     does not expose a numeric `seed`)
+///   - temperatureFallbackCount = 0          (no fallback ladder)
+///   - withoutTimestamps = true              (one-shot — we don't need timing)
+///   - suppressBlank = true
+///   - usePrefillPrompt = true
+///   - skipSpecialTokens = true              (clean text out)
 ///
-/// Phase 1 finding: Whisper transcribes Punjabi audio to Devanagari even
-/// with `language="pa"`. That's fine — the ``Latin`` normaliser handles both.
+/// Limitation: WhisperKit's public DecodingOptions does not expose a numeric
+/// `seed`. Greedy decoding with `temperature=0` and a disabled fallback ladder
+/// is deterministic in practice; this is the closest equivalent to Phase 1's
+/// "fixed seed where supported" finding.
+///
+/// Output text from WhisperKit is the decoded transcript. For Punjabi audio,
+/// Whisper-family models often emit Devanagari (Phase 1 finding). The
+/// returned string is Latin-normalised via ``Latin`` so the matcher sees the
+/// same surface regardless of the original script.
 public actor WhisperOneShot: Asr {
 
     public enum WhisperError: LocalizedError {
-        case modelLoadFailed(URL)
-        case transcribeFailed(Int32)
+        case pipeInitFailed(underlying: Error)
+        case transcribeFailed(underlying: Error)
+        case emptyResult
 
         public var errorDescription: String? {
             switch self {
-            case .modelLoadFailed(let url):
-                return "Couldn't load the Whisper model at \(url.lastPathComponent). " +
-                       "Run `bash scripts/fetch_ios_deps.sh` and rebuild."
-            case .transcribeFailed(let code):
-                return "whisper.cpp transcribe failed (code \(code))."
+            case .pipeInitFailed(let e):
+                return "Couldn't load WhisperKit (\(e.localizedDescription)). " +
+                       "Check network on first launch — the model auto-downloads from " +
+                       "huggingface.co/argmaxinc/whisperkit-coreml. Or run " +
+                       "`bash scripts/fetch_ios_deps.sh --bundle-model` to pre-bundle it."
+            case .transcribeFailed(let e):
+                return "WhisperKit transcribe failed: \(e.localizedDescription)"
+            case .emptyResult:
+                return "WhisperKit returned no transcription segments."
             }
         }
     }
 
-    private let modelURL: URL
-    private var ctx: OpaquePointer?  // whisper_context*
+    private let modelName: String
+    private let modelFolder: String?
+    private var pipe: WhisperKit?
     public nonisolated var isReady: Bool { true }
 
-    public init(modelURL: URL) throws {
-        self.modelURL = modelURL
-        var params = whisper_context_default_params()
-        params.use_gpu = true   // CoreML / Metal if available
-        guard let c = whisper_init_from_file_with_params(modelURL.path, params) else {
-            throw WhisperError.modelLoadFailed(modelURL)
-        }
-        self.ctx = c
+    /// - Parameters:
+    ///   - modelName: WhisperKit model id, e.g. "openai_whisper-small". When
+    ///     `modelFolder` is nil this is used to resolve the auto-downloaded
+    ///     model on huggingface.co/argmaxinc/whisperkit-coreml.
+    ///   - modelFolder: Absolute path to a pre-bundled WhisperKit CoreML
+    ///     model directory (containing AudioEncoder.mlmodelc,
+    ///     TextDecoder.mlmodelc, MelSpectrogram.mlmodelc, tokenizer files).
+    ///     Pass nil to let WhisperKit auto-download.
+    public init(modelName: String = "openai_whisper-small", modelFolder: String? = nil) {
+        self.modelName = modelName
+        self.modelFolder = modelFolder
     }
 
-    deinit {
-        if let c = ctx { whisper_free(c) }
+    private func ensurePipe() async throws -> WhisperKit {
+        if let p = pipe { return p }
+        do {
+            let config = WhisperKitConfig(
+                model: modelName,
+                modelFolder: modelFolder,
+                verbose: false,
+                logLevel: .info,
+                prewarm: true,
+                load: true,
+                download: modelFolder == nil   // only download if we're not bundled
+            )
+            let p = try await WhisperKit(config)
+            pipe = p
+            return p
+        } catch {
+            throw WhisperError.pipeInitFailed(underlying: error)
+        }
     }
 
     public func transcribe(_ samples: [Float], config: AsrConfig) async throws -> AsrTranscript {
-        guard let c = ctx else { throw WhisperError.modelLoadFailed(modelURL) }
         let start = Date()
+        let pipe = try await ensurePipe()
 
-        var params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY)
-        params.language = (config.language as NSString).utf8String
-        params.translate = config.translate
-        params.print_realtime = false
-        params.print_progress = false
-        params.print_timestamps = false
-        params.print_special = false
-        params.single_segment = false
-        params.suppress_blank = true
-        params.no_speech_thold = 0.6
-        params.temperature = config.temperature
-        params.temperature_inc = config.noTemperatureFallback ? 0.0 : 0.2
-        params.n_threads = config.maxThreads
-        params.greedy.best_of = 1   // deterministic intent; closest knob to "fixed seed"
+        let decode = DecodingOptions(
+            verbose: false,
+            task: .transcribe,
+            language: config.language,
+            temperature: config.temperature,
+            temperatureIncrementOnFallback: 0.0,
+            temperatureFallbackCount: config.noTemperatureFallback ? 0 : 5,
+            usePrefillPrompt: true,
+            skipSpecialTokens: true,
+            withoutTimestamps: true,
+            wordTimestamps: false,
+            suppressBlank: true,
+            compressionRatioThreshold: 2.4,
+            logProbThreshold: -1.0,
+            noSpeechThreshold: 0.6
+        )
 
-        let rc = samples.withUnsafeBufferPointer { ptr -> Int32 in
-            whisper_full(c, params, ptr.baseAddress, Int32(samples.count))
+        let results: [TranscriptionResult]
+        do {
+            results = try await pipe.transcribe(
+                audioArray: samples,
+                decodeOptions: decode
+            )
+        } catch {
+            throw WhisperError.transcribeFailed(underlying: error)
         }
-        guard rc == 0 else { throw WhisperError.transcribeFailed(rc) }
 
-        let segCount = whisper_full_n_segments(c)
-        var text = ""
-        text.reserveCapacity(Int(segCount) * 32)
-        for i in 0..<segCount {
-            guard let cstr = whisper_full_get_segment_text(c, i) else { continue }
-            text.append(String(cString: cstr))
+        // WhisperKit returns one TranscriptionResult per chunked window. For a
+        // tap-to-record clip well under 30 s (Whisper's native context window),
+        // there's typically exactly one result. Concatenate defensively in
+        // case the user recited > 30 s.
+        let combined = results.map(\.text).joined(separator: " ")
+        let trimmed = combined.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty && results.isEmpty {
+            throw WhisperError.emptyResult
         }
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         // Whisper output may be in Gurmukhi or Devanagari; normalise to
         // Latin so the matcher sees the same surface as Phase 1.
         let latin = Latin.from(trimmed)

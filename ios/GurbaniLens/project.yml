@@ -1,19 +1,16 @@
 name: GurbaniLens
 options:
-  bundleIdPrefix: com.taajstudios
   deploymentTarget:
     iOS: "16.0"
   developmentLanguage: en
   groupSortPosition: top
   generateEmptyDirectories: true
-  # Use the personal team for free-Apple-ID signing. Override via the
-  # DEVELOPMENT_TEAM build setting when the paid Apple Developer Program
-  # account is approved — no other changes required.
   defaultConfig: Debug
 
 # iOS 16 is the deployment target because v1 uses SwiftUI NavigationStack
-# (iOS 16+). At time of writing iOS 16 is on ~95%+ of iPhones; bumping below
-# would require a state-driven NavigationView rewrite — not worth it for v1.
+# (iOS 16+) and WhisperKit requires iOS 16+. At time of writing iOS 16 is on
+# ~95%+ of iPhones; bumping below would require both a state-driven
+# NavigationView rewrite and a different ASR engine — not worth it for v1.
 
 settings:
   base:
@@ -21,18 +18,25 @@ settings:
     IPHONEOS_DEPLOYMENT_TARGET: "16.0"
     CODE_SIGN_STYLE: Automatic
     CODE_SIGN_IDENTITY: "Apple Development"
-    PRODUCT_BUNDLE_IDENTIFIER: com.taajstudios.gurbanilens
+    # Bundle id chosen to be unique under a domain Deep controls (gurbanilens.org)
+    # so personal-Apple-ID team signing doesn't clash with another sideloaded
+    # build on a different Mac. Override DEVELOPMENT_TEAM at sign time.
+    PRODUCT_BUNDLE_IDENTIFIER: org.gurbanilens.app
     SWIFT_TREAT_WARNINGS_AS_ERRORS: NO
     GCC_TREAT_WARNINGS_AS_ERRORS: NO
 
 packages:
+  # Sibling SPM package in this repo — Swift port of the matcher (11/11
+  # port-parity PASS against canonical Python).
   GurbaniLensCore:
-    # Sibling SPM package in this repo (../GurbaniLensCore/)
     path: ../GurbaniLensCore
-  whisper:
-    # whisper.cpp Swift Package — provides `import whisper`
-    url: https://github.com/ggerganov/whisper.cpp.git
-    from: "1.5.4"
+  # WhisperKit — Apple-Silicon-optimised CoreML on-device Whisper. Provides
+  # `import WhisperKit`. Auto-downloads the recommended CoreML model from
+  # huggingface.co/argmaxinc/whisperkit-coreml on first launch unless we
+  # supply a pre-bundled modelFolder. Pin to ≥1.0.0 (released 2026-05-01).
+  WhisperKit:
+    url: https://github.com/argmaxinc/WhisperKit.git
+    from: "1.0.0"
 
 targets:
   GurbaniLens:
@@ -45,13 +49,13 @@ targets:
     resources:
       - path: GurbaniLens/Resources/Assets.xcassets
         optional: true
-      # Bundled Whisper ggml-*.bin (and matching CoreML .mlmodelc when present).
-      # Populated by scripts/fetch_ios_deps.sh — directory is gitignored.
+      # Optional pre-bundled WhisperKit CoreML model tree (openai_whisper-small).
+      # If absent, WhisperKit auto-downloads on first launch. Populated by
+      # `scripts/fetch_ios_deps.sh --bundle-model`. Gitignored.
       - path: GurbaniLens/Resources/Models
         optional: true
-      # Bundled SGGS corpus (app_database.sqlite or sggs.sqlite). Populated
-      # by scripts/fetch_ios_deps.sh from data/sggs/database.sqlite —
-      # directory is gitignored.
+      # Bundled SGGS corpus (app_database.sqlite). Populated by
+      # `scripts/fetch_ios_deps.sh` from data/sggs/database.sqlite. Gitignored.
       - path: GurbaniLens/Resources/Data
         optional: true
     info:
@@ -70,16 +74,16 @@ targets:
         # listening, no recording without an explicit tap.
         NSMicrophoneUsageDescription: "GurbaniLens listens when you tap the microphone, transcribes what you recite, and looks up the matching Shabad. Audio stays on this device — nothing is uploaded."
     entitlements:
-      # Intentionally empty entitlements. Free-Apple-ID personal-team
+      # Intentionally empty entitlements file. Free-Apple-ID personal-team
       # signing rejects `com.apple.developer.kernel.increased-memory-limit`
-      # (provisioning fails), and the v1 ASR model fits comfortably under
-      # the default iOS memory cap — no entitlement needed.
+      # (provisioning fails); WhisperKit small models fit comfortably under
+      # the default iOS memory cap, so we don't need it.
       path: GurbaniLens/Resources/GurbaniLens.entitlements
     dependencies:
       - package: GurbaniLensCore
         product: GurbaniLensCore
-      - package: whisper
-        product: whisper
+      - package: WhisperKit
+        product: WhisperKit
     settings:
       base:
         TARGETED_DEVICE_FAMILY: "1,2"  # iPhone + iPad

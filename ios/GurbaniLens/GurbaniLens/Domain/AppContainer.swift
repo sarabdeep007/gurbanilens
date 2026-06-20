@@ -126,22 +126,21 @@ public final class AppContainer: ObservableObject {
         return m
     }
 
-    private func ensureAsr() async -> Asr {
+    private func ensureAsr() -> Asr {
         if let a = asr { return a }
-        do {
-            let modelURL = try Self.findBundledWhisperModel()
-            let one = try WhisperOneShot(modelURL: modelURL)
-            asr = one
-            return one
-        } catch {
-            // Graceful: keep the UI usable with a canned transcript so Deep
-            // can exercise nav before the model is in place. The error label
-            // explains the fallback so it's visible in QA.
-            NSLog("AppContainer: Whisper init failed (\(error)). Falling back to MockAsr.")
-            let mock = MockAsr()
-            asr = mock
-            return mock
-        }
+        // WhisperKit loads + downloads lazily on the first transcribe(), so
+        // constructing WhisperOneShot is free — no fallback path needed at
+        // this layer. If WhisperKit can't reach huggingface.co on first
+        // launch, the error bubbles through `session.runSearch` and surfaces
+        // as a user-visible alert. MockAsr is reserved for SwiftUI previews
+        // and unit tests.
+        let modelFolder = Self.findBundledWhisperModelFolder()
+        let one = WhisperOneShot(
+            modelName: "openai_whisper-small",
+            modelFolder: modelFolder
+        )
+        asr = one
+        return one
     }
 
     // ── Pipeline ────────────────────────────────────────────────────────
@@ -162,7 +161,7 @@ public final class AppContainer: ObservableObject {
             return
         }
         do {
-            let asr = await ensureAsr()
+            let asr = ensureAsr()
             let matcher = try ensureMatcher()
             _ = try await session.runSearch(samples: samples, asr: asr, matcher: matcher)
         } catch {
@@ -185,18 +184,24 @@ public final class AppContainer: ObservableObject {
         )
     }
 
-    private static func findBundledWhisperModel() throws -> URL {
-        // small is the Phase 2A v1 default; base/medium can be downloaded
-        // from Settings in a v1.1 follow-up.
-        for name in ["ggml-small", "ggml-base", "ggml-medium", "ggml-tiny"] {
-            if let url = Bundle.main.url(forResource: name, withExtension: "bin") {
-                return url
+    /// Look for a pre-bundled WhisperKit CoreML model directory in the app
+    /// bundle (e.g. Resources/Models/openai_whisper-small/). Returns the
+    /// absolute path so WhisperKit can load it without hitting the network.
+    /// Returns nil when no pre-bundled model is present — caller passes nil
+    /// to WhisperKit, which then auto-downloads from
+    /// huggingface.co/argmaxinc/whisperkit-coreml on first launch.
+    private static func findBundledWhisperModelFolder() -> String? {
+        let candidates = [
+            "openai_whisper-small",
+            "openai_whisper-base",
+            "openai_whisper-tiny",
+        ]
+        for name in candidates {
+            if let url = Bundle.main.url(forResource: name, withExtension: nil),
+               (try? url.checkResourceIsReachable()) == true {
+                return url.path
             }
         }
-        throw NSError(
-            domain: "GurbaniLens", code: 11,
-            userInfo: [NSLocalizedDescriptionKey:
-                "No Whisper ggml-*.bin bundled. Run `bash scripts/fetch_ios_deps.sh` then re-run XcodeGen."]
-        )
+        return nil
     }
 }
