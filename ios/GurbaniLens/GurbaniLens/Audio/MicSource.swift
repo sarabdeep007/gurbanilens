@@ -143,15 +143,17 @@ public final class MicSource: AudioSource {
         let session = AVAudioSession.sharedInstance()
         do {
             // v1: tap-to-record one-shot. `.measurement` mode minimises iOS
-            // signal processing (no AGC/EQ). `.allowBluetooth` lets the user
-            // record via AirPods if they prefer. `.defaultToSpeaker` keeps
+            // signal processing (no AGC/EQ). `.allowBluetoothHFP` lets the
+            // user record via AirPods if they prefer (modern enum spelling;
+            // the older `.allowBluetooth` is deprecated since iOS 8 — same
+            // semantics, no behaviour change). `.defaultToSpeaker` keeps
             // the VU pulse visible (no muting via the earpiece). We drop
             // `.mixWithOthers` for v1 — it triggered a categoryChange
             // route notification mid-record and risked silent input.
             try session.setCategory(
                 .playAndRecord,
                 mode: .measurement,
-                options: [.allowBluetooth, .defaultToSpeaker]
+                options: [.allowBluetoothHFP, .defaultToSpeaker]
             )
             try session.setPreferredSampleRate(Self.sampleRate)
             try session.setPreferredIOBufferDuration(0.020) // ~20 ms
