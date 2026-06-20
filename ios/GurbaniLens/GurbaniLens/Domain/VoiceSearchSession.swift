@@ -289,6 +289,14 @@ public final class VoiceSearchSession: ObservableObject {
                 try? await Task.sleep(nanoseconds: 300_000_000) // 300 ms
                 if Task.isCancelled { return }
 
+                // Bug D: explicit DIAG log right before we hit the matcher,
+                // so the next on-device test can prove the live-match wiring
+                // is firing (Phase A device test never saw any
+                // matchByFirstLetters logs, but with Bugs B/C/G stabilising
+                // the transcript that was suspected to cascade — this log
+                // confirms whether the debounce expires cleanly).
+                NSLog("[DIAG] VoiceSearchSession.startStreaming running live matcher query.len=\(scheduledQuery.count) query.head60=\"\(String(scheduledQuery.prefix(60)))\"")
+
                 let matchStart = Date()
                 let liveMatches = await Task.detached(priority: .userInitiated) {
                     matcherRef.matchByFirstLetters(scheduledQuery, topN: 5)
