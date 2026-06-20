@@ -217,13 +217,15 @@ public actor StreamingASR {
 
         // Kick off mic + decode on a child Task so we can return the
         // stream synchronously. Errors here finish the stream cleanly so
-        // the consumer's for-await loop exits.
+        // the consumer's for-await loop exits. The Task inherits this
+        // actor's isolation (Swift 5.10+), so `self.finishStream()` is a
+        // direct same-actor call — no await needed.
         Task {
             do {
                 try await t.startStreamTranscription()
             } catch {
                 NSLog("[DIAG] StreamingASR.startStreamTranscription threw: \(error.localizedDescription)")
-                await self.finishStream()
+                self.finishStream()
             }
         }
 
@@ -295,7 +297,8 @@ public actor StreamingASR {
         let latin = Latin.from(currentText)
         let confirmedGurmukhi = Gurmukhi.fromDevanagari(confirmed)
         let unconfirmedGurmukhi = Gurmukhi.fromDevanagari(unconfirmed)
-        let energy = new.bufferEnergy.last ?? 0
+        // `energy` is already in scope from the Bug G guard above —
+        // reuse it for the Partial init instead of re-declaring.
 
         let partial = Partial(
             text: currentText,
