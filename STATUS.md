@@ -1,6 +1,6 @@
 # GurbaniLens — STATUS
 
-_Last updated: 2026-06-19 by Claude (iOS agent) — Phase 2A v1 voice-search SwiftUI app written, matching Android Compose architecture._
+_Last updated: 2026-06-20 by Claude (iOS agent) — iOS ASR swapped from fictional whisper.cpp Swift Package to WhisperKit (argmaxinc/WhisperKit ≥1.0.0)._
 
 This is the up-to-the-minute state file. CLAUDE.md is the durable project doc; STATUS.md is for "what's happening right now."
 
@@ -21,9 +21,9 @@ Pivoted from "continuous-listen Paath companion" on **2026-06-17**. Original Pha
 - ✅ **Repo restructure** — `src/gurbanilens/` → `core/gurbanilens/`. Python is canonical reference; Swift and Kotlin ports validate against `core/tests/portparity/test_vectors.json`.
 - ✅ **Anvaad-js build pipeline** — `build/convert_anmol_to_unicode.js` + `build/build_app_database.py` → ~77 MB `app_database.sqlite` (bundled into iOS / Android).
 - ✅ **Swift matcher port** — `ios/GurbaniLensCore/`. 11/11 port-parity PASS against canonical Python on the full 60K-line SGGS corpus. `Corpus.shabadLines(shabadId:)` added 2026-06-19 for the v1 Shabad screen.
-- ✅ **iOS v1 voice-search app code** — `ios/GurbaniLens/`. Saffron-on-indigo `Theme`, `@MainActor` `VoiceSearchSession` state machine, five SwiftUI screens (Home / Recording / Results / Shabad / Settings) wired through `NavigationStack` + `AppNavGraph`, `AppContainer` orchestrator owning corpus/matcher/asr, `RecordingCapture` on top of `MicSource`, `WhisperOneShot` actor wrapping whisper.cpp single-shot transcription with Phase 1 deterministic config locked (greedy / temperature=0 / no fallback / `language="pa"` / `greedy.best_of=1`). Entry point switched from `SmokeTestView` to `AppNavGraph`; smoke test code preserved as v2 reference. iOS 16+ (NavigationStack). Awaiting Deep to run on device.
-- ✅ **iOS smoke-test app code** — `ios/GurbaniLens/`. XcodeGen project, `AudioSource` protocol + `MicSource` + `FileSource` + `LineInSource` stub, whisper.cpp + CoreML wrapper, SwiftUI smoke-test view. Kept as the v2 reference implementation (continuous streaming, sliding-window ASR); no longer the app entry point in v1.
-- ✅ **`scripts/fetch_ios_deps.sh`** — re-runnable bootstrap that mirrors the Android script: downloads `ggml-small.bin` (~250 MB) from HuggingFace into `ios/GurbaniLens/GurbaniLens/Resources/Models/` and copies `data/sggs/database.sqlite` into `Resources/Data/app_database.sqlite`. Both dirs gitignored.
+- ✅ **iOS v1 voice-search app code** — `ios/GurbaniLens/`. Saffron-on-indigo `Theme`, `@MainActor` `VoiceSearchSession` state machine, five SwiftUI screens (Home / Recording / Results / Shabad / Settings) wired through `NavigationStack` + `AppNavGraph`, `AppContainer` orchestrator owning corpus/matcher/asr, `RecordingCapture` on top of `MicSource`. Entry point is `AppNavGraph`. iOS 16+ (NavigationStack + WhisperKit). Awaiting Deep to build on Mac.
+- ✅ **iOS ASR = WhisperKit ≥1.0.0** (swapped 2026-06-20) — `WhisperOneShot` actor wraps `WhisperKit.transcribe(audioArray:)` for the v1 one-shot flow; `WhisperASR` actor is the v2 streaming reference (same WhisperKit backend, sliding-window). Phase 1 deterministic config locked: `task=.transcribe`, `temperature=0`, `temperatureFallbackCount=0` (no fallback ladder), `language=config.language`, `withoutTimestamps=true`, `suppressBlank=true`. Documented limitation: WhisperKit's `DecodingOptions` doesn't expose a numeric seed — greedy at T=0 with no fallback is deterministic in practice (closest equivalent). Default model `openai_whisper-small` auto-downloads from `huggingface.co/argmaxinc/whisperkit-coreml` on first launch and caches; `scripts/fetch_ios_deps.sh --bundle-model` pre-bundles it for offline first-launch.
+- ✅ **`scripts/fetch_ios_deps.sh`** — re-runnable bootstrap. Default just copies `data/sggs/database.sqlite` → `Resources/Data/app_database.sqlite`. `--bundle-model` additionally fetches the WhisperKit CoreML model tree (AudioEncoder.mlmodelc + TextDecoder.mlmodelc + MelSpectrogram.mlmodelc + tokenizer) into `Resources/Models/openai_whisper-small/`. Uses `huggingface-cli` when available, falls back to git+git-lfs. Both `Models/` and `Data/` are gitignored.
 - ✅ **Phase 2B prep tracks** — `scripts/fetch_samples.py` (Track B sample gathering), `docs/aeneas_spike.md` (Track C alignment, pivoted to `faster-whisper` word_timestamps).
 - ✅ **Server skeleton + privacy contract** — `server/` directory, FastAPI scaffold. Not deployed; documents the v2 fallback policy.
 - ✅ **Opt-in feedback channel spec** — `docs/feedback_channel_spec.md`.
@@ -43,9 +43,9 @@ Pivoted from "continuous-listen Paath companion" on **2026-06-17**. Original Pha
 - 🟢 **Deep — iOS v1 voice-search on device.** Xcode install + `bash scripts/fetch_ios_deps.sh` + `xcodegen generate` + run on iPhone with free Apple ID. See [docs/PHASE_2A_IOS_SETUP.md](./docs/PHASE_2A_IOS_SETUP.md). Independent of Android track.
 - 🟢 **Phase 2B Kirtan dataset gathering** (separate agent track) — continues feeding v2.
 - 🟡 **iOS v1 deferred polish** (next dispatch, gated on Deep's first device run):
-  - Bundle CoreML-converted `ggml-small-encoder.mlmodelc` alongside the .bin (Apple Neural Engine path; current code falls back to CPU/Metal which is fine).
   - Bundle the Anvaad-trimmed `app_database.sqlite` (~77 MB) once the build pipeline produces it. Until then the corpus is the raw shabados/database (~150 MB) — works but bigger app size.
-  - Wire `WhisperModelChoice` from `SettingsScreen` to a runtime model swap (currently the setting is persisted but `AppContainer` only looks for the bundled `ggml-small.bin`).
+  - Wire `WhisperModelChoice` from `SettingsScreen` to a runtime model swap (currently the setting is persisted but `AppContainer` hard-codes `openai_whisper-small`).
+  - Decide whether to ship the v1 release with `--bundle-model` baked in (offline first launch, ~250 MB bundle add) or rely on first-launch auto-download (smaller IPA, requires network at first run). Current default = auto-download.
 - 🟡 **Android v1 deferred polish** (next dispatch):
   - Replace `MockAsr` in `MainActivity` with `WhisperAsr.fromAssetOrNull(...)` once Robolectric + UI smoke runs land. JNI wiring + model are in place; just the activity wire-up.
   - Bundle the Anvaad-trimmed `app_database.sqlite` (~77 MB) into `app/src/main/assets/sggs.sqlite` once the build pipeline produces it. Right now `AndroidAssetCorpus` falls back to an empty matcher when the asset is absent; users see "no results" until then.
@@ -69,7 +69,18 @@ Pivoted from "continuous-listen Paath companion" on **2026-06-17**. Original Pha
 
 ## Blockers
 
-None right now. v1 Android scaffold compiles + tests pass + APK builds clean on the headless build host. v1 iOS source is written but unverified — taaj-portal has no Xcode toolchain, so a real build is on Deep's plate (`bash scripts/fetch_ios_deps.sh && cd ios/GurbaniLens && xcodegen generate && open GurbaniLens.xcodeproj`).
+None right now. v1 Android scaffold compiles + tests pass + APK builds clean on the headless build host. iOS source migrated to WhisperKit and pushed; taaj-portal has no Swift/Xcode toolchain so build verification is on Deep's Mac:
+
+```
+bash scripts/fetch_ios_deps.sh           # SGGS corpus only (recommended for first try)
+cd ios/GurbaniLens
+rm -rf GurbaniLens.xcodeproj
+xcodegen generate
+xcodebuild -project GurbaniLens.xcodeproj -scheme GurbaniLens \
+  -destination 'platform=iOS Simulator,name=iPhone 15' build
+```
+
+If the build succeeds, run on device via Xcode (Cmd-R). WhisperKit will auto-download `openai_whisper-small` (~250 MB) on first launch.
 
 ---
 
