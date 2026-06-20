@@ -104,6 +104,14 @@ public actor WhisperOneShot: Asr {
         self.modelFolder = modelFolder
     }
 
+    /// Expose the lazy-constructed WhisperKit instance to v2's
+    /// ``StreamingASR``. Sharing a single pipe means model load + cold-start
+    /// cost is paid once across both v1 and v2 modes (the user can flip
+    /// search-mode in Settings without re-downloading the CoreML tree).
+    public func sharedPipe() async throws -> WhisperKit {
+        return try await ensurePipe()
+    }
+
     private func ensurePipe() async throws -> WhisperKit {
         if let p = pipe { return p }
         do {
