@@ -19,6 +19,12 @@ final class AppContainer: ObservableObject {
     private var asr: Asr?
     private let capture = RecordingCapture()
 
+    // v2 streaming pipeline. Lazy — built on first .live tap. Shares the
+    // WhisperKit pipe with the v1 `WhisperOneShot` so model load + cold
+    // start are paid once.
+    private var streamingAsr: StreamingASR?
+    private var streamingTask: Task<Void, Never>?
+
     private var recordingTask: Task<Void, Never>?
 
     init() {
@@ -81,6 +87,40 @@ final class AppContainer: ObservableObject {
         session.reset()
     }
 
+    // ── v2 (.live) user intents ──────────────────────────────────────────
+
+    /// Phase A v2 entry point. Push the LiveResultsScreen, build / reuse
+    /// the StreamingASR, kick off VoiceSearchSession.startStreaming, and
+    /// let the for-await loop drive UI updates until either the user taps
+    /// Stop (commitLive), taps a row (commitLive(match:)), or
+    /// WhisperKit's silence-VAD finishes the stream.
+    func startLiveRecording() {
+        path.append(.liveRecording)
+        streamingTask?.cancel()
+        streamingTask = Task { [weak self] in
+            await self?.startLiveStreamAndAwait()
+        }
+    }
+
+    /// Stop the stream + run the full commit-time matcher + transition
+    /// session to .done. If `match` is supplied (tap-row path), navigate
+    /// to that match's Shabad screen as soon as the full match returns
+    /// — the user already picked, the Results screen is unnecessary.
+    func commitLive(match preselected: Match? = nil) {
+        Task { [weak self] in
+            await self?.commitLiveStream(preselected: preselected)
+        }
+    }
+
+    func cancelLiveRecording() {
+        streamingTask?.cancel()
+        Task { [weak self] in
+            await self?.streamingAsr?.stop()
+        }
+        session.reset()
+        returnHome()
+    }
+
     func openShabad(for match: Match) {
         Task { [weak self] in
             guard let self else { return }
@@ -104,17 +144,19 @@ final class AppContainer: ObservableObject {
     func handleStateChange() {
         switch session.state {
         case .done:
-            // Auto-advance once: replace the recording screen with results
-            // (so swipe-back from Results goes Home, not back into Recording).
-            let lastIsRecording: Bool = {
+            // Auto-advance once: replace the recording / liveRecording
+            // screen with results (so swipe-back from Results goes Home,
+            // not back into recording).
+            let lastIsRecordingMode: Bool = {
                 guard let last = path.last else { return false }
                 if case .recording = last { return true }
+                if case .liveRecording = last { return true }
                 return false
             }()
             let alreadyOnResults = path.contains { route in
                 if case .results = route { return true } else { return false }
             }
-            if lastIsRecording {
+            if lastIsRecordingMode {
                 path = Array(path.dropLast()) + [.results]
             } else if !alreadyOnResults {
                 path.append(.results)
@@ -149,8 +191,8 @@ final class AppContainer: ObservableObject {
         return m
     }
 
-    private func ensureAsr() -> Asr {
-        if let a = asr { return a }
+    private func ensureAsr() -> WhisperOneShot {
+        if let existing = asr as? WhisperOneShot { return existing }
         // WhisperKit loads + downloads lazily on the first transcribe(), so
         // constructing WhisperOneShot is free — no fallback path needed at
         // this layer. If WhisperKit can't reach huggingface.co on first
@@ -166,6 +208,18 @@ final class AppContainer: ObservableObject {
         return one
     }
 
+    /// Get / build the v2 streaming ASR. Shares the WhisperKit pipe with
+    /// `ensureAsr()` so model load + CoreML cold-start are paid once
+    /// across both v1 and v2 modes.
+    private func ensureStreamingAsr() async throws -> StreamingASR {
+        if let s = streamingAsr { return s }
+        let oneShot = ensureAsr()
+        let pipe = try await oneShot.sharedPipe()
+        let s = StreamingASR(pipe: pipe, language: "pa")
+        streamingAsr = s
+        return s
+    }
+
     // ── Pipeline ────────────────────────────────────────────────────────
 
     private func startCaptureAndAwait() async {
@@ -177,6 +231,64 @@ final class AppContainer: ObservableObject {
         // We don't await here — the user signals stop via the UI. The
         // recordingTask exists so cancelRecording() can drop us out.
     }
+
+    // ── v2 (.live) pipeline ──────────────────────────────────────────────
+
+    private func startLiveStreamAndAwait() async {
+        NSLog("[DIAG] AppContainer.startLiveStreamAndAwait entry")
+        do {
+            let asr = try await ensureStreamingAsr()
+            let matcher = try ensureMatcher()
+            try await session.startStreaming(asr: asr, matcher: matcher)
+            NSLog("[DIAG] AppContainer.startLiveStreamAndAwait stream finished (VAD or stop)")
+            // Stream finished naturally — VAD detected silence. Commit.
+            // Don't pass a preselected match — let the user choose from
+            // the final Results screen.
+            await commitLiveStream(preselected: nil)
+        } catch {
+            NSLog("[DIAG] AppContainer.startLiveStreamAndAwait threw: \(error.localizedDescription)")
+            session.setError(error.localizedDescription)
+        }
+    }
+
+    private func commitLiveStream(preselected: Match?) async {
+        // Guard: only commit while we're actually listening / committing.
+        // If the session is already .done (e.g. duplicate Stop tap), no-op.
+        guard case .listening = session.state else {
+            if case .committing = session.state {
+                NSLog("[DIAG] AppContainer.commitLiveStream already .committing — skipping")
+            } else {
+                NSLog("[DIAG] AppContainer.commitLiveStream skipping (state=\(String(describing: session.state)))")
+            }
+            return
+        }
+        do {
+            let asr = try await ensureStreamingAsr()
+            let matcher = try ensureMatcher()
+            let result = await session.commit(asr: asr, matcher: matcher)
+            NSLog("[DIAG] AppContainer.commitLiveStream done matches=\(result.matches.count) preselected=\(preselected?.line.id ?? "nil")")
+
+            // If the user tapped a row, open that Shabad directly instead
+            // of routing through Results. handleStateChange() already moved
+            // us to Results when .done fired; pop it back off + push Shabad.
+            if let preselected = preselected {
+                // Wait one runloop turn for handleStateChange to push
+                // .results, then replace with the shabad route. Cleaner
+                // than racing handleStateChange.
+                await MainActor.run {
+                    if case .results = self.path.last {
+                        self.path.removeLast()
+                    }
+                    self.openShabad(for: preselected)
+                }
+            }
+        } catch {
+            NSLog("[DIAG] AppContainer.commitLiveStream threw: \(error.localizedDescription)")
+            session.setError(error.localizedDescription)
+        }
+    }
+
+    // ── v1 (.oneShot) pipeline ───────────────────────────────────────────
 
     private func runSearchAndDone(samples: [Float]) async {
         NSLog("[DIAG] AppContainer.runSearchAndDone entry samples=\(samples.count)")
