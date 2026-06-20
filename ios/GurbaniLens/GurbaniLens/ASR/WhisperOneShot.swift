@@ -1,5 +1,6 @@
 import Foundation
 import CoreML
+import GurbaniLensCore
 import WhisperKit
 
 /// One-shot WhisperKit wrapper for v1 voice-search. Loads a WhisperKit pipe
@@ -229,11 +230,14 @@ public actor WhisperOneShot: Asr {
         }
 
         // Whisper output may be in Gurmukhi or Devanagari; normalise to
-        // Latin so the matcher sees the same surface as Phase 1.
+        // Latin so the matcher sees the same surface as Phase 1. ALSO
+        // produce a Gurmukhi-script rendering for display (Bug H —
+        // Sangat expect Gurmukhi, not Devanagari, in the UI).
         let latin = Latin.from(trimmed)
+        let gurmukhi = Gurmukhi.fromDevanagari(trimmed)
         let elapsed = Int64(Date().timeIntervalSince(start) * 1000)
-        NSLog("[DIAG] WhisperOneShot.transcribe latin.len=\(latin.count) latin.head120=\"\(String(latin.prefix(120)))\" elapsedMs=\(elapsed)")
-        return AsrTranscript(text: latin, language: effectiveLanguage, durationMs: elapsed)
+        NSLog("[DIAG] WhisperOneShot.transcribe latin.len=\(latin.count) latin.head120=\"\(String(latin.prefix(120)))\" gurmukhi.len=\(gurmukhi.count) gurmukhi.head60=\"\(String(gurmukhi.prefix(60)))\" elapsedMs=\(elapsed)")
+        return AsrTranscript(text: latin, gurmukhi: gurmukhi, language: effectiveLanguage, durationMs: elapsed)
     }
 
     // MARK: - Hallucination heuristic

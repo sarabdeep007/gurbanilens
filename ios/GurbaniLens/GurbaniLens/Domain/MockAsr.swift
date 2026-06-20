@@ -19,6 +19,8 @@ public final class MockAsr: Asr {
     public func transcribe(_ samples: [Float], config: AsrConfig) async throws -> AsrTranscript {
         // Tiny synthetic delay so the Transcribing state actually paints.
         try? await Task.sleep(nanoseconds: UInt64(simulatedMs) * 1_000_000)
-        return AsrTranscript(text: canned, language: config.language, durationMs: simulatedMs)
+        // gurmukhi="" — MockAsr's canned text is already Latin; the v1
+        // display path falls back to `text` when gurmukhi is empty.
+        return AsrTranscript(text: canned, gurmukhi: "", language: config.language, durationMs: simulatedMs)
     }
 }

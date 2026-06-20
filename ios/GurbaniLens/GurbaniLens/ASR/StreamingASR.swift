@@ -1,4 +1,5 @@
 import Foundation
+import GurbaniLensCore
 import WhisperKit
 
 /// v2 streaming ASR — wraps WhisperKit's `AudioStreamTranscriber` actor
@@ -59,12 +60,16 @@ public actor StreamingASR {
         /// `State.currentText` — Whisper's "best guess so far" (confirmed
         /// + latest unconfirmed). Devanagari or Latin depending on model.
         public let text: String
-        /// Confirmed segments concatenated. Locked in; won't change.
+        /// Confirmed segments concatenated (raw Devanagari from WhisperKit).
         public let confirmedText: String
         /// Unconfirmed segments — Whisper may revise these.
         public let unconfirmedText: String
         /// `Latin.from(text)` — what the matcher should see.
         public let latin: String
+        /// `Gurmukhi.fromDevanagari(confirmedText)` — for UI display.
+        public let confirmedGurmukhi: String
+        /// `Gurmukhi.fromDevanagari(unconfirmedText)` — for UI display.
+        public let unconfirmedGurmukhi: String
         /// `State.isRecording` — false means VAD has stopped the stream
         /// (silence-based auto-commit) or `stop()` was called.
         public let isSpeaking: Bool
@@ -76,6 +81,8 @@ public actor StreamingASR {
             confirmedText: String,
             unconfirmedText: String,
             latin: String,
+            confirmedGurmukhi: String,
+            unconfirmedGurmukhi: String,
             isSpeaking: Bool,
             bufferEnergy: Float
         ) {
@@ -83,6 +90,8 @@ public actor StreamingASR {
             self.confirmedText = confirmedText
             self.unconfirmedText = unconfirmedText
             self.latin = latin
+            self.confirmedGurmukhi = confirmedGurmukhi
+            self.unconfirmedGurmukhi = unconfirmedGurmukhi
             self.isSpeaking = isSpeaking
             self.bufferEnergy = bufferEnergy
         }
@@ -284,6 +293,8 @@ public actor StreamingASR {
         let unconfirmed = new.unconfirmedText.joined(separator: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let latin = Latin.from(currentText)
+        let confirmedGurmukhi = Gurmukhi.fromDevanagari(confirmed)
+        let unconfirmedGurmukhi = Gurmukhi.fromDevanagari(unconfirmed)
         let energy = new.bufferEnergy.last ?? 0
 
         let partial = Partial(
@@ -291,11 +302,13 @@ public actor StreamingASR {
             confirmedText: confirmed,
             unconfirmedText: unconfirmed,
             latin: latin,
+            confirmedGurmukhi: confirmedGurmukhi,
+            unconfirmedGurmukhi: unconfirmedGurmukhi,
             isSpeaking: new.isRecording,
             bufferEnergy: energy
         )
 
-        NSLog("[DIAG] StreamingASR partial isSpeaking=\(new.isRecording) confirmed.len=\(confirmed.count) unconfirmed.len=\(unconfirmed.count) latin.head60=\"\(String(latin.prefix(60)))\" energy=\(String(format: "%.3f", energy))")
+        NSLog("[DIAG] StreamingASR partial isSpeaking=\(new.isRecording) confirmed.len=\(confirmed.count) unconfirmed.len=\(unconfirmed.count) latin.head60=\"\(String(latin.prefix(60)))\" gurmukhi.head60=\"\(String(confirmedGurmukhi.prefix(60)))\" energy=\(String(format: "%.3f", energy))")
 
         continuation?.yield(partial)
 

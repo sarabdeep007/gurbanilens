@@ -53,10 +53,19 @@ public struct AsrConfig: Sendable, Equatable {
 }
 
 public struct AsrTranscript: Sendable, Equatable {
+    /// Latin-normalised transcript — matcher input.
     public let text: String
+    /// Gurmukhi-script rendering of the source Devanagari transcript —
+    /// what the UI should display in "You said: …" surfaces. Empty when
+    /// the source wasn't Devanagari (e.g. MockAsr canned text); callers
+    /// should fall back to ``text`` for display in that case.
+    public let gurmukhi: String
     public let language: String
     public let durationMs: Int64
-    public init(text: String, language: String, durationMs: Int64) {
-        self.text = text; self.language = language; self.durationMs = durationMs
+    public init(text: String, gurmukhi: String = "", language: String, durationMs: Int64) {
+        self.text = text
+        self.gurmukhi = gurmukhi
+        self.language = language
+        self.durationMs = durationMs
     }
 }

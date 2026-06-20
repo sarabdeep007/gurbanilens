@@ -1,6 +1,6 @@
 import Foundation
 import SwiftUI
-import GurbaniLensCore
+import GurbaniLensCore  // Gurmukhi.fromDevanagari + Matcher
 
 /// Cross-screen state for one voice-search round-trip. Held by ``AppContainer``
 /// (app-scoped) and observed by the nav graph. Mirrors
@@ -182,7 +182,14 @@ public final class VoiceSearchSession: ObservableObject {
         }
 
         let raw = transcript.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        NSLog("[DIAG] VoiceSearchSession.runSearch ASR done transcribeMs=\(transcript.durationMs) raw.len=\(raw.count) raw.head120=\"\(String(raw.prefix(120)))\"")
+        // Bug H: SearchResult.transcript is the DISPLAY field — show
+        // Gurmukhi when WhisperOneShot was able to produce it from the
+        // source Devanagari, fall back to Latin otherwise (MockAsr +
+        // tests). Latin remains matcher input via `raw`.
+        let displayText = transcript.gurmukhi.isEmpty
+            ? raw
+            : transcript.gurmukhi.trimmingCharacters(in: .whitespacesAndNewlines)
+        NSLog("[DIAG] VoiceSearchSession.runSearch ASR done transcribeMs=\(transcript.durationMs) raw.len=\(raw.count) raw.head120=\"\(String(raw.prefix(120)))\" gurmukhi.len=\(transcript.gurmukhi.count)")
 
         let matches: [Match]
         if raw.isEmpty {
@@ -200,7 +207,7 @@ public final class VoiceSearchSession: ObservableObject {
             NSLog("[DIAG] VoiceSearchSession.runSearch matcher done matchMs=\(matchMs) matches=\(matches.count) topScore=\(matches.first.map { String(format: "%.1f", $0.score) } ?? "n/a")")
         }
 
-        let result = SearchResult.from(transcript: raw, matches: matches)
+        let result = SearchResult.from(transcript: displayText, matches: matches)
         setDone(result)
         return result
     }
@@ -345,7 +352,12 @@ public final class VoiceSearchSession: ObservableObject {
         NSLog("[DIAG] VoiceSearchSession.commit source.len=\(devanagariSource.count) queryLatin.len=\(queryLatin.count) queryLatin.head60=\"\(String(queryLatin.prefix(60)))\"")
 
         await asr.stop()
-        setCommitting(query: devanagariSource)
+        // setCommitting carries the query so the LiveResultsScreen header
+        // can keep showing the same text during the ~2-5 s full-fuzzy
+        // window. Bug H: pass the Gurmukhi rendering, not Devanagari.
+        let committingDisplay = Gurmukhi.fromDevanagari(devanagariSource)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        setCommitting(query: committingDisplay)
 
         let matches: [Match]
         if queryLatin.isEmpty {
@@ -362,12 +374,11 @@ public final class VoiceSearchSession: ObservableObject {
             NSLog("[DIAG] VoiceSearchSession.commit full matcher done matchMs=\(matchMs) matches=\(matches.count) topScore=\(matches.first.map { String(format: "%.1f", $0.score) } ?? "n/a")")
         }
 
-        // SearchResult.transcript is the display field — Phase B's Bug H
-        // commit replaces this with Gurmukhi.fromDevanagari(devanagariSource)
-        // so the user sees Gurmukhi script, not Devanagari. Until then we
-        // ship the Devanagari source; better than showing the Latin form
-        // which would surprise Sangat readers either way.
-        let result = SearchResult.from(transcript: devanagariSource, matches: matches)
+        // Bug H: display field is Gurmukhi-script transliteration of the
+        // Devanagari source. Latin was the matcher input above.
+        let gurmukhiDisplay = Gurmukhi.fromDevanagari(devanagariSource)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let result = SearchResult.from(transcript: gurmukhiDisplay, matches: matches)
         setDone(result)
         return result
     }

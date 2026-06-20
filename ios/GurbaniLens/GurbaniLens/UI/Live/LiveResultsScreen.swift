@@ -101,10 +101,16 @@ struct LiveResultsScreen: View {
 
     // MARK: - Derived state
 
+    /// Header text. Bug H — translate Devanagari source from
+    /// `.listening` into Gurmukhi at render time. `.committing.query`
+    /// is already Gurmukhi (transliterated in VoiceSearchSession.commit
+    /// before transitioning).
     private var transcriptText: String {
         switch session.state {
         case .listening(let c, let u, _, _):
-            return (c + " " + u).trimmingCharacters(in: .whitespacesAndNewlines)
+            let cG = Gurmukhi.fromDevanagari(c)
+            let uG = Gurmukhi.fromDevanagari(u)
+            return (cG + " " + uG).trimmingCharacters(in: .whitespacesAndNewlines)
         case .committing(let q):
             return q
         default:
