@@ -56,26 +56,34 @@ public final class Matcher: @unchecked Sendable {
     /// First letter of each token (concatenated) for each indexed line.
     /// Used by the Stage 0 first-letters pre-filter.
     let firstLetters: [String]
+    /// `firstLetters` after ``PhoneticEquivalence`` canonicalisation. Used
+    /// by ``matchByFirstLetters(_:topN:)`` to make v2 live-matching robust
+    /// to Whisper's voiced/unvoiced confusion (b↔p, g↔k, d↔t, j↔c).
+    let phoneticFirstLetters: [String]
 
     public init(corpus: Corpus) throws {
         var ls: [Line] = []
         var nt: [String] = []
         var ts: [[String]] = []
         var fl: [String] = []
+        var pfl: [String] = []
         for line in try corpus.allLines() {
             guard let translit = line.transliterationEn else { continue }
             let normalized = normalize(translit)
             if normalized.isEmpty { continue }
             let toks = normalized.split(separator: " ").map { String($0) }
+            let flValue = Self.firstLettersOf(tokens: toks)
             ls.append(line)
             nt.append(normalized)
             ts.append(toks)
-            fl.append(Self.firstLettersOf(tokens: toks))
+            fl.append(flValue)
+            pfl.append(PhoneticEquivalence.canonicalize(flValue))
         }
         self.lines = ls
         self.normalizedTexts = nt
         self.tokens = ts
         self.firstLetters = fl
+        self.phoneticFirstLetters = pfl
     }
 
     /// Convenience init for tests / future use that bypasses Corpus.
@@ -83,7 +91,9 @@ public final class Matcher: @unchecked Sendable {
         self.lines = prebuilt.map(\.line)
         self.normalizedTexts = prebuilt.map(\.normalised)
         self.tokens = prebuilt.map(\.tokens)
-        self.firstLetters = prebuilt.map { Self.firstLettersOf(tokens: $0.tokens) }
+        let fl = prebuilt.map { Self.firstLettersOf(tokens: $0.tokens) }
+        self.firstLetters = fl
+        self.phoneticFirstLetters = fl.map { PhoneticEquivalence.canonicalize($0) }
     }
 
     public var count: Int { lines.count }
@@ -97,6 +107,62 @@ public final class Matcher: @unchecked Sendable {
             if let first = tok.first { fl.append(first) }
         }
         return fl
+    }
+
+    /// **v2 live-matching fast path.** Scores corpus lines purely by
+    /// `partial_ratio(canonicalisedQueryFL, canonicalisedLineFL)` over the
+    /// pre-computed phonetic first-letters index. No Stage 1 full
+    /// `partial_ratio` over normalised text, no Stage 2 token coverage.
+    ///
+    /// Why: v2's search-as-you-speak UX needs sub-100 ms matcher latency so
+    /// the live result list feels responsive on every Whisper partial. The
+    /// full ``match(_:topN:)`` takes 2–5 s on iPhone over a 60K-line corpus
+    /// — too slow for live; appropriate only at commit time.
+    ///
+    /// Phonetic equivalence: Whisper-small frequently confuses voiced /
+    /// unvoiced plosive pairs (b↔p, g↔k, d↔t) and palatal pairs (j↔c) on
+    /// Punjabi audio. ``PhoneticEquivalence/canonicalize(_:)`` collapses
+    /// each pair to a single canonical char before scoring so that
+    /// "babbamn" and "pappamn" match identically.
+    ///
+    /// Returns up to `topN` matches with:
+    ///   - `score` = `partialRatio` = phonetic first-letters ratio (0–100)
+    ///   - `coverage = 1.0` — first-letters mode does not compute coverage;
+    ///                       the field is filled in so callers can use the
+    ///                       same `Match` struct uniformly. v2 callers
+    ///                       (`VoiceSearchSession.commit`) re-rank by the
+    ///                       full ``match(_:topN:)`` before showing the
+    ///                       final Results screen.
+    public func matchByFirstLetters(_ query: String, topN: Int = 5) -> [Match] {
+        let totalStart = Date()
+        let normalised = normalize(query)
+        if normalised.isEmpty { return [] }
+        let qTokens = normalised.split(separator: " ").map { String($0) }
+        let qFL = Self.firstLettersOf(tokens: qTokens)
+        if qFL.isEmpty { return [] }
+        let qFLp = PhoneticEquivalence.canonicalize(qFL)
+
+        var scored: [(score: Double, index: Int)] = []
+        scored.reserveCapacity(phoneticFirstLetters.count)
+        for (i, lineFLp) in phoneticFirstLetters.enumerated() {
+            if lineFLp.isEmpty { continue }
+            let s = StringMetrics.partialRatio(qFLp, lineFLp)
+            scored.append((s, i))
+        }
+        scored.sort { $0.score > $1.score }
+        let top = Array(scored.prefix(topN))
+        let totalMs = Int(Date().timeIntervalSince(totalStart) * 1000)
+
+        NSLog("[DIAG] Matcher.matchByFirstLetters totalLines=\(phoneticFirstLetters.count) qFL=\"\(qFL)\" qFLp=\"\(qFLp)\" topScore=\(top.first.map { String(format: "%.1f", $0.score) } ?? "n/a") totalMs=\(totalMs)")
+
+        return top.map { entry in
+            Match(
+                line: lines[entry.index],
+                score: entry.score,
+                partialRatio: entry.score,
+                coverage: 1.0
+            )
+        }
     }
 
     public func match(_ query: String, topN: Int = 5) -> [Match] {
