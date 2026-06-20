@@ -1,6 +1,6 @@
 # GurbaniLens — STATUS
 
-_Last updated: 2026-06-20 by Claude (iOS agent) — UX polish for Sangat testers: Done-tap idempotency + new `.matching` state with "Searching…" feedback._
+_Last updated: 2026-06-20 by Claude (iOS spec agent) — v2 incremental search-as-you-speak SPEC drafted; awaiting Deep approval at [docs/PHASE_2A_V2_INCREMENTAL_SEARCH.md](./docs/PHASE_2A_V2_INCREMENTAL_SEARCH.md) before any v2 code work begins._
 
 This is the up-to-the-minute state file. CLAUDE.md is the durable project doc; STATUS.md is for "what's happening right now."
 
@@ -49,6 +49,7 @@ Pivoted from "continuous-listen Paath companion" on **2026-06-17**. Original Pha
 
 - 🟢 **Deep — iOS v1 voice-search on device.** Xcode install + `bash scripts/fetch_ios_deps.sh` + `xcodegen generate` + run on iPhone with free Apple ID. See [docs/PHASE_2A_IOS_SETUP.md](./docs/PHASE_2A_IOS_SETUP.md). Independent of Android track.
 - 🟢 **Phase 2B Kirtan dataset gathering** (separate agent track) — continues feeding v2.
+- 🟡 **Deep — review v2 incremental search-as-you-speak SPEC.** [docs/PHASE_2A_V2_INCREMENTAL_SEARCH.md](./docs/PHASE_2A_V2_INCREMENTAL_SEARCH.md) is a code-free architecture spec answering all 10 open questions about live transcription + live matching. **No v2 implementation work begins until the Spec sign-off section is marked APPROVED.** Key decisions baked in: WhisperKit's `AudioStreamTranscriber` (confirmed to ship in v1.0.0+) for true streaming partial transcripts; `Matcher.matchByFirstLetters()` fast-path for live matching (sub-100 ms on iPhone over 60K lines); new `LiveResultsScreen` with sticky transcript header + animated candidate list; v2 coexists with v1 via a Settings toggle, default v2 once approved. Top risks: `pa → hi` remap behaviour under streaming (untested), first-letters quality on partial Whisper transcripts (mitigation: trigram index as v2.1), WhisperKit AudioProcessor session conflict with our `MicSource` (mitigation: app-restart-on-mode-change). 4-day phased implementation plan inside the spec.
 - 🟡 **iOS v1 deferred polish** (next dispatch, gated on Deep's first device run):
   - Bundle the Anvaad-trimmed `app_database.sqlite` (~77 MB) once the build pipeline produces it. Until then the corpus is the raw shabados/database (~150 MB) — works but bigger app size.
   - Wire `WhisperModelChoice` from `SettingsScreen` to a runtime model swap (currently the setting is persisted but `AppContainer` hard-codes `openai_whisper-small`).
