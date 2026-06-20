@@ -12,6 +12,7 @@ public final class RecordingCapture {
     private let mic = MicSource()
     private var samples: [Float] = []
     private let lock = NSLock()
+    private var startedAt: Date?
 
     /// Called on the audio thread for each delivered buffer.
     public var onPeak: ((Float) -> Void)?
@@ -22,6 +23,8 @@ public final class RecordingCapture {
 
     public func start() throws {
         lock.lock(); samples.removeAll(keepingCapacity: true); lock.unlock()
+        startedAt = Date()
+        NSLog("[DIAG] RecordingCapture.start")
         try mic.start { [weak self] buffer, _ in
             guard let self, let chan = buffer.floatChannelData?[0] else { return }
             let frames = Int(buffer.frameLength)
@@ -44,6 +47,10 @@ public final class RecordingCapture {
         lock.lock(); defer { lock.unlock() }
         let out = samples
         samples.removeAll(keepingCapacity: false)
+        let wallDur = startedAt.map { Date().timeIntervalSince($0) } ?? 0
+        let audioDur = Double(out.count) / 16_000.0
+        let stats = quickStats(out)
+        NSLog("[DIAG] RecordingCapture.stop samples=\(out.count) audioSec=\(String(format: "%.3f", audioDur)) wallSec=\(String(format: "%.3f", wallDur)) min=\(stats.min) max=\(stats.max) mean|abs|=\(stats.meanAbs)")
         return out
     }
 
@@ -52,5 +59,17 @@ public final class RecordingCapture {
         lock.lock()
         samples.removeAll(keepingCapacity: false)
         lock.unlock()
+        NSLog("[DIAG] RecordingCapture.cancel")
+    }
+
+    private func quickStats(_ s: [Float]) -> (min: Float, max: Float, meanAbs: Float) {
+        if s.isEmpty { return (0, 0, 0) }
+        var lo: Float = .infinity, hi: Float = -.infinity, sum: Float = 0
+        for v in s {
+            if v < lo { lo = v }
+            if v > hi { hi = v }
+            sum += abs(v)
+        }
+        return (lo, hi, sum / Float(s.count))
     }
 }

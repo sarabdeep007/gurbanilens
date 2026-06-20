@@ -68,6 +68,8 @@ public final class MicSource: AudioSource {
         onBuffer = nil
         unregisterObservers()
 
+        NSLog("[DIAG] MicSource.stop tapCalls=\(diagTapCallCount) inputFrames=\(diagInputFrameTotal) outputFrames=\(diagOutputFrameTotal) zeroOutputs=\(diagZeroOutputCount) convertErrors=\(diagConvertErrorCount)")
+
         // Deactivate the session politely so other audio apps regain control.
         try? AVAudioSession.sharedInstance().setActive(
             false,
@@ -118,10 +120,26 @@ public final class MicSource: AudioSource {
 
     // MARK: - Tap installation + resampling
 
+    // Diagnostics counters — flushed via stop().
+    private var diagTapCallCount: Int = 0
+    private var diagZeroOutputCount: Int = 0
+    private var diagInputFrameTotal: Int = 0
+    private var diagOutputFrameTotal: Int = 0
+    private var diagConvertErrorCount: Int = 0
+
     private func installTap() {
         let inputNode = engine.inputNode
         let nativeFormat = inputNode.outputFormat(forBus: 0)
         converter = AVAudioConverter(from: nativeFormat, to: outputFormat)
+
+        NSLog("[DIAG] MicSource.installTap nativeFormat sampleRate=\(nativeFormat.sampleRate) channels=\(nativeFormat.channelCount) commonFormat=\(nativeFormat.commonFormat.rawValue) interleaved=\(nativeFormat.isInterleaved) targetSampleRate=\(outputFormat.sampleRate)")
+
+        // Reset counters
+        diagTapCallCount = 0
+        diagZeroOutputCount = 0
+        diagInputFrameTotal = 0
+        diagOutputFrameTotal = 0
+        diagConvertErrorCount = 0
 
         // Tap returns native-format buffers; we resample inside the handler.
         let tapBufferSize: AVAudioFrameCount = 1024
@@ -141,6 +159,9 @@ public final class MicSource: AudioSource {
         converter: AVAudioConverter,
         deliver: @escaping (AVAudioPCMBuffer, AVAudioTime) -> Void
     ) {
+        diagTapCallCount += 1
+        diagInputFrameTotal += Int(input.frameLength)
+
         // Approximate output frame count after resample
         let ratio = outputFormat.sampleRate / input.format.sampleRate
         let outputFrameCapacity = AVAudioFrameCount(Double(input.frameLength) * ratio + 32)
@@ -161,7 +182,17 @@ public final class MicSource: AudioSource {
             return input
         }
         let status = converter.convert(to: output, error: &error, withInputFrom: inputBlock)
-        guard status != .error, error == nil, output.frameLength > 0 else { return }
+        if status == .error || error != nil {
+            diagConvertErrorCount += 1
+            NSLog("[DIAG] MicSource.resample CONVERT ERROR status=\(status.rawValue) error=\(String(describing: error))")
+            return
+        }
+        diagOutputFrameTotal += Int(output.frameLength)
+        if output.frameLength == 0 {
+            diagZeroOutputCount += 1
+            // Don't log every zero — that's the bug we're catching; the count summary at stop() is enough.
+            return
+        }
         deliver(output, time)
     }
 

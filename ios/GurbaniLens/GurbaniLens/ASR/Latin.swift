@@ -34,7 +34,9 @@ public enum Latin {
         }
         let doubled = doubleLongVowels(iast)
         let stripped = stripCombining(doubled)
-        return stripFinalSchwa(stripped)
+        let final = stripFinalSchwa(stripped)
+        NSLog("[DIAG] Latin.from script=\(script) in.len=\(text.count) in.head100=\"\(String(text.prefix(100)))\" out.len=\(final.count) out.head100=\"\(String(final.prefix(100)))\"")
+        return final
     }
 
     // MARK: - Script detection

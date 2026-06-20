@@ -102,6 +102,11 @@ public actor WhisperOneShot: Asr {
         let start = Date()
         let pipe = try await ensurePipe()
 
+        let audioSec = Double(samples.count) / 16_000.0
+        let stats = sampleStats(samples)
+        let head = samples.prefix(20).map { String(format: "%.4f", $0) }.joined(separator: ",")
+        NSLog("[DIAG] WhisperOneShot.transcribe input samples=\(samples.count) sec=\(String(format: "%.3f", audioSec)) min=\(stats.min) max=\(stats.max) mean|abs|=\(stats.meanAbs) head20=[\(head)]")
+
         let decode = DecodingOptions(
             verbose: false,
             task: .transcribe,
@@ -118,6 +123,7 @@ public actor WhisperOneShot: Asr {
             logProbThreshold: -1.0,
             noSpeechThreshold: 0.6
         )
+        NSLog("[DIAG] WhisperOneShot.transcribe decode task=transcribe language=\(decode.language ?? "nil") temperature=\(decode.temperature) tempFallback=\(decode.temperatureFallbackCount) compressionRatioThold=\(String(describing: decode.compressionRatioThreshold)) noSpeechThold=\(String(describing: decode.noSpeechThreshold)) withoutTimestamps=\(decode.withoutTimestamps) suppressBlank=\(decode.suppressBlank)")
 
         let results: [TranscriptionResult]
         do {
@@ -126,6 +132,7 @@ public actor WhisperOneShot: Asr {
                 decodeOptions: decode
             )
         } catch {
+            NSLog("[DIAG] WhisperOneShot.transcribe THROW \(error.localizedDescription)")
             throw WhisperError.transcribeFailed(underlying: error)
         }
 
@@ -135,6 +142,8 @@ public actor WhisperOneShot: Asr {
         // case the user recited > 30 s.
         let combined = results.map(\.text).joined(separator: " ")
         let trimmed = combined.trimmingCharacters(in: .whitespacesAndNewlines)
+        NSLog("[DIAG] WhisperOneShot.transcribe raw segments=\(results.count) rawText.len=\(trimmed.count) rawText.head120=\"\(String(trimmed.prefix(120)))\"")
+
         if trimmed.isEmpty && results.isEmpty {
             throw WhisperError.emptyResult
         }
@@ -142,6 +151,18 @@ public actor WhisperOneShot: Asr {
         // Latin so the matcher sees the same surface as Phase 1.
         let latin = Latin.from(trimmed)
         let elapsed = Int64(Date().timeIntervalSince(start) * 1000)
+        NSLog("[DIAG] WhisperOneShot.transcribe latin.len=\(latin.count) latin.head120=\"\(String(latin.prefix(120)))\" elapsedMs=\(elapsed)")
         return AsrTranscript(text: latin, language: config.language, durationMs: elapsed)
+    }
+
+    private nonisolated func sampleStats(_ s: [Float]) -> (min: Float, max: Float, meanAbs: Float) {
+        if s.isEmpty { return (0, 0, 0) }
+        var lo: Float = .infinity, hi: Float = -.infinity, sum: Float = 0
+        for v in s {
+            if v < lo { lo = v }
+            if v > hi { hi = v }
+            sum += abs(v)
+        }
+        return (lo, hi, sum / Float(s.count))
     }
 }
