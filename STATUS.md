@@ -1,6 +1,6 @@
 # GurbaniLens — STATUS
 
-_Last updated: 2026-06-20 by Claude (iOS agent) — iOS ASR swapped from fictional whisper.cpp Swift Package to WhisperKit (argmaxinc/WhisperKit ≥1.0.0)._
+_Last updated: 2026-06-20 by Claude (iOS agent) — diagnosed + fixed v1 voice-search runtime bug (WhisperKit hallucinating nukta-spam from truncated streaming-converter audio)._
 
 This is the up-to-the-minute state file. CLAUDE.md is the durable project doc; STATUS.md is for "what's happening right now."
 
@@ -22,7 +22,10 @@ Pivoted from "continuous-listen Paath companion" on **2026-06-17**. Original Pha
 - ✅ **Anvaad-js build pipeline** — `build/convert_anmol_to_unicode.js` + `build/build_app_database.py` → ~77 MB `app_database.sqlite` (bundled into iOS / Android).
 - ✅ **Swift matcher port** — `ios/GurbaniLensCore/`. 11/11 port-parity PASS against canonical Python on the full 60K-line SGGS corpus. `Corpus.shabadLines(shabadId:)` added 2026-06-19 for the v1 Shabad screen.
 - ✅ **iOS v1 voice-search app code** — `ios/GurbaniLens/`. Saffron-on-indigo `Theme`, `@MainActor` `VoiceSearchSession` state machine, five SwiftUI screens (Home / Recording / Results / Shabad / Settings) wired through `NavigationStack` + `AppNavGraph`, `AppContainer` orchestrator owning corpus/matcher/asr, `RecordingCapture` on top of `MicSource`. Entry point is `AppNavGraph`. iOS 16+ (NavigationStack + WhisperKit). Awaiting Deep to build on Mac.
-- ✅ **iOS ASR = WhisperKit ≥1.0.0** (swapped 2026-06-20) — `WhisperOneShot` actor wraps `WhisperKit.transcribe(audioArray:)` for the v1 one-shot flow; `WhisperASR` actor is the v2 streaming reference (same WhisperKit backend, sliding-window). Phase 1 deterministic config locked: `task=.transcribe`, `temperature=0`, `temperatureFallbackCount=0` (no fallback ladder), `language=config.language`, `withoutTimestamps=true`, `suppressBlank=true`. Documented limitation: WhisperKit's `DecodingOptions` doesn't expose a numeric seed — greedy at T=0 with no fallback is deterministic in practice (closest equivalent). Default model `openai_whisper-small` auto-downloads from `huggingface.co/argmaxinc/whisperkit-coreml` on first launch and caches; `scripts/fetch_ios_deps.sh --bundle-model` pre-bundles it for offline first-launch.
+- ✅ **iOS ASR = WhisperKit ≥1.0.0** (swapped 2026-06-20) — `WhisperOneShot` actor wraps `WhisperKit.transcribe(audioArray:)` for the v1 one-shot flow; `WhisperASR` actor is the v2 streaming reference (same WhisperKit backend, sliding-window). Phase 1 deterministic config locked: `task=.transcribe`, `temperature=0`, `temperatureFallbackCount=0` (no fallback ladder), `language=config.language`, `withoutTimestamps=true`, `suppressBlank=true`. Also: `detectLanguage=false`, `compressionRatioThreshold=2.0`, `noSpeechThreshold=0.45` — tightened post-bug to stop language-auto-detect override and catch hallucination loops earlier. Documented limitation: WhisperKit's `DecodingOptions` doesn't expose a numeric seed — greedy at T=0 with no fallback is deterministic in practice (closest equivalent). Default model `openai_whisper-small` auto-downloads from `huggingface.co/argmaxinc/whisperkit-coreml` on first launch and caches; `scripts/fetch_ios_deps.sh --bundle-model` pre-bundles it for offline first-launch.
+- ✅ **iOS audio capture = bulk-convert at stop** (2026-06-20) — `MicSource` was streaming AVAudioConverter on every ~21 ms tap buffer with a one-shot input block. The converter's resampling filter needs more than one input chunk to prime, so the first calls returned zero output frames and the rest were truncated; the code silently dropped both. Net: WhisperKit received much less audio than Deep spoke, and Whisper hallucinated nukta-spam to fill the gap. Fixed by switching to accumulate-native + bulk-convert: tap collects native-rate Float32 mono samples (downmixed on the fly if multi-channel), `stop()` runs ONE `AVAudioConverter` pass over the entire buffer with `.endOfStream` so the filter flushes. Tap buffer bumped 1024 → 4096 frames; `.mixWithOthers` dropped from the audio-session category options (it was triggering a mid-record categoryChange route notification).
+- ✅ **iOS capture WAV persistence** (2026-06-20) — every successful stopRecording writes the 16 kHz mono Float32 buffer to `Documents/capture-<unix-ms>.wav` (raw IEEE-float-32 RIFF WAV via `WaveWriter`) BEFORE the ASR runs. Extract via Xcode → Window → Devices and Simulators → iPhone → Installed Apps → GurbaniLens → Download Container. Lets us hear exactly what WhisperKit received when transcription is wrong.
+- ✅ **iOS audio pipeline `[DIAG]` logging** (2026-06-20) — `NSLog("[DIAG] ...")` breadcrumbs across `MicSource.installTap/stop/bulkConvert`, `RecordingCapture.start/stop`, `WhisperOneShot.transcribe` (input stats + decode options + raw text + post-Latin text), and `Latin.from`. `grep "\[DIAG\]"` against the Xcode console gives a complete pipeline trace per recording.
 - ✅ **`scripts/fetch_ios_deps.sh`** — re-runnable bootstrap. Default just copies `data/sggs/database.sqlite` → `Resources/Data/app_database.sqlite`. `--bundle-model` additionally fetches the WhisperKit CoreML model tree (AudioEncoder.mlmodelc + TextDecoder.mlmodelc + MelSpectrogram.mlmodelc + tokenizer) into `Resources/Models/openai_whisper-small/`. Uses `huggingface-cli` when available, falls back to git+git-lfs. Both `Models/` and `Data/` are gitignored.
 - ✅ **Phase 2B prep tracks** — `scripts/fetch_samples.py` (Track B sample gathering), `docs/aeneas_spike.md` (Track C alignment, pivoted to `faster-whisper` word_timestamps).
 - ✅ **Server skeleton + privacy contract** — `server/` directory, FastAPI scaffold. Not deployed; documents the v2 fallback policy.
@@ -69,7 +72,7 @@ Pivoted from "continuous-listen Paath companion" on **2026-06-17**. Original Pha
 
 ## Blockers
 
-None right now. v1 Android scaffold compiles + tests pass + APK builds clean on the headless build host. iOS source migrated to WhisperKit and pushed; taaj-portal has no Swift/Xcode toolchain so build verification is on Deep's Mac:
+None right now. v1 Android scaffold compiles + tests pass + APK builds clean on the headless build host. iOS source migrated to WhisperKit, bulk-convert + WAV-persistence + tightened decode options + concurrency fixes all pushed; taaj-portal has no Swift/Xcode toolchain so build verification is on Deep's Mac:
 
 ```
 bash scripts/fetch_ios_deps.sh           # SGGS corpus only (recommended for first try)
@@ -81,6 +84,8 @@ xcodebuild -project GurbaniLens.xcodeproj -scheme GurbaniLens \
 ```
 
 If the build succeeds, run on device via Xcode (Cmd-R). WhisperKit will auto-download `openai_whisper-small` (~250 MB) on first launch.
+
+**Bug-test recipe:** record yourself reciting "ek oankaar sat naam karataa purakh" slowly and clearly for 5 seconds, tap Done. Expected: transcript matches the recitation (Latin/Gurmukhi), top match = Ang 1 Pangti 1 (Mool Mantar opening), confidence = Strong (green). If still nukta-spam, grep the Xcode console for `[DIAG]` lines and the WAV file in Documents/ — together those pinpoint which stage broke.
 
 ---
 
