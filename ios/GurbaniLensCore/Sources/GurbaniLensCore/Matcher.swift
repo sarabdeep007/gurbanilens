@@ -2,7 +2,13 @@ import Foundation
 
 /// Fuzzy Pangti matcher. Swift port of `core/gurbanilens/matcher.py:Matcher`.
 /// Validated against `core/tests/portparity/test_vectors.json`.
-public final class Matcher {
+///
+/// Sendable: `Matcher` is immutable after init (`let` lines / normalizedTexts /
+/// tokens), so it's safe to hand to a `Task.detached` from MainActor without
+/// touching mutable state. We declare `@unchecked Sendable` to make that
+/// explicit at the type level — the app target moves match() off MainActor
+/// to keep the UI thread snappy on long queries.
+public final class Matcher: @unchecked Sendable {
     // Thresholds — must match test_vectors.json#/thresholds
     public static let tokenMatchThreshold: Double = 55.0
     public static let longTokenMin: Int = 3

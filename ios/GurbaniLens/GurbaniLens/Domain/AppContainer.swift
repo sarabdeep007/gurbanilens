@@ -156,6 +156,7 @@ final class AppContainer: ObservableObject {
     }
 
     private func runSearchAndDone(samples: [Float]) async {
+        NSLog("[DIAG] AppContainer.runSearchAndDone entry samples=\(samples.count)")
         if samples.isEmpty {
             session.setError("No audio captured. Try again.")
             return
@@ -174,7 +175,9 @@ final class AppContainer: ObservableObject {
             let asr = ensureAsr()
             let matcher = try ensureMatcher()
             _ = try await session.runSearch(samples: samples, asr: asr, matcher: matcher)
+            NSLog("[DIAG] AppContainer.runSearchAndDone runSearch returned cleanly")
         } catch {
+            NSLog("[DIAG] AppContainer.runSearchAndDone runSearch threw: \(error.localizedDescription)")
             session.setError(error.localizedDescription)
         }
     }
