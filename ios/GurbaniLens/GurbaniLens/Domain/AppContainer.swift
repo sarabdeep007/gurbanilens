@@ -34,6 +34,17 @@ final class AppContainer: ObservableObject {
     // defer so the next legitimate commit cycle can run.
     private var commitInFlight: Bool = false
 
+    /// Bug J helper. Clear the streaming ASR with a logged reason so the
+    /// next on-device test reveals exactly which terminal cleanup path
+    /// released the instance. Idempotent — clearing a nil field logs and
+    /// returns without further effect.
+    private func clearStreamingAsr(reason: String) {
+        if streamingAsr != nil {
+            NSLog("[DIAG] AppContainer.streamingAsr nilled (reason=\(reason))")
+        }
+        streamingAsr = nil
+    }
+
     private var recordingTask: Task<Void, Never>?
 
     init() {
@@ -120,7 +131,7 @@ final class AppContainer: ObservableObject {
         // "Try again" callbacks. Either path is a terminal state — release
         // the streaming ASR so the next mic tap (live OR oneShot) isn't
         // blocked by the Bug F guard. Idempotent: nil-ing nil is fine.
-        streamingAsr = nil
+        clearStreamingAsr(reason: "returnHome")
         path.removeAll()
         session.reset(reason: "returnHome")
     }
@@ -165,7 +176,7 @@ final class AppContainer: ObservableObject {
         // by the Phase A.1 Bug F guard that checks `streamingAsr != nil`.
         // The instance is held in `asrToStop` so the async stop still
         // runs cleanly against the original actor.
-        streamingAsr = nil
+        clearStreamingAsr(reason: "cancelLive")
         Task { await asrToStop?.stop() }
         session.reset(reason: "cancelLive")
         returnHome()
@@ -222,7 +233,7 @@ final class AppContainer: ObservableObject {
         showErrorAlert = false
         // Bug J: error acknowledgement is a terminal cleanup point —
         // release the streaming ASR so a subsequent attempt is unblocked.
-        streamingAsr = nil
+        clearStreamingAsr(reason: "acknowledgeError")
         session.reset(reason: "acknowledgeError")
         path.removeAll()
     }
@@ -359,7 +370,7 @@ final class AppContainer: ObservableObject {
             // streaming ASR so the Bug F guards stop refusing future
             // startRecording / startLiveRecording calls. The instance has
             // already stopped its mic via session.commit → asr.stop().
-            streamingAsr = nil
+            clearStreamingAsr(reason: "commitDone")
 
             // If the user tapped a row, open that Shabad directly instead
             // of routing through Results. handleStateChange() already moved
@@ -379,7 +390,7 @@ final class AppContainer: ObservableObject {
             NSLog("[DIAG] AppContainer.commitLiveStream threw: \(error.localizedDescription)")
             // Bug J: also release on the error path so a retry isn't
             // permanently blocked by the Bug F guard.
-            streamingAsr = nil
+            clearStreamingAsr(reason: "commitError")
             session.setError(error.localizedDescription)
         }
     }
