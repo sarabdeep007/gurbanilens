@@ -6,12 +6,12 @@ import GurbaniLensCore
 /// (lazy), the recording capture, the ``VoiceSearchSession`` state, and the
 /// ``NavigationStack`` path. Mirrors `android/.../MainActivity.kt`'s role.
 @MainActor
-public final class AppContainer: ObservableObject {
+final class AppContainer: ObservableObject {
 
     // ── Published UI state ───────────────────────────────────────────────
-    @Published public var path: [Route] = []
-    @Published public var session = VoiceSearchSession()
-    @Published public var showErrorAlert: Bool = false
+    @Published var path: [Route] = []
+    @Published var session = VoiceSearchSession()
+    @Published var showErrorAlert: Bool = false
 
     // ── Backing pipeline (lazy because each is heavy) ────────────────────
     private var corpus: Corpus?
@@ -21,7 +21,7 @@ public final class AppContainer: ObservableObject {
 
     private var recordingTask: Task<Void, Never>?
 
-    public init() {
+    init() {
         capture.onPeak = { [weak self] peak in
             // Trampoline back to main; SwiftUI views must be touched on @MainActor.
             Task { @MainActor in self?.session.setRecording(peak: peak) }
@@ -30,7 +30,7 @@ public final class AppContainer: ObservableObject {
 
     // ── User intents ─────────────────────────────────────────────────────
 
-    public func startRecording() {
+    func startRecording() {
         // Push the Recording screen immediately so the UI feels responsive
         // even if mic permission needs to be requested.
         path.append(.recording)
@@ -41,24 +41,24 @@ public final class AppContainer: ObservableObject {
         }
     }
 
-    public func stopRecording() {
+    func stopRecording() {
         let samples = capture.stop()
         Task { [weak self] in await self?.runSearchAndDone(samples: samples) }
     }
 
-    public func cancelRecording() {
+    func cancelRecording() {
         recordingTask?.cancel()
         capture.cancel()
         session.reset()
         returnHome()
     }
 
-    public func returnHome() {
+    func returnHome() {
         path.removeAll()
         session.reset()
     }
 
-    public func openShabad(for match: Match) {
+    func openShabad(for match: Match) {
         Task { [weak self] in
             guard let self else { return }
             do {
@@ -78,7 +78,7 @@ public final class AppContainer: ObservableObject {
         }
     }
 
-    public func handleStateChange() {
+    func handleStateChange() {
         switch session.state {
         case .done:
             // Auto-advance once: replace the recording screen with results
@@ -103,7 +103,7 @@ public final class AppContainer: ObservableObject {
         }
     }
 
-    public func acknowledgeError() {
+    func acknowledgeError() {
         showErrorAlert = false
         session.reset()
         path.removeAll()

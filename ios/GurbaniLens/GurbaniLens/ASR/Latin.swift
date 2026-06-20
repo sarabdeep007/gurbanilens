@@ -172,8 +172,8 @@ public enum Latin {
         "य": "ya", "र": "ra", "ल": "la", "व": "va",
         "श": "śa", "ष": "ṣa", "स": "sa", "ह": "ha",
         // Nukta variants common in Punjabi-via-Devanagari
-        "क़": "qa", "ख़": "ḵha", "ग़": "ġa", "ज़": "za", "ड़": "ṛa",
-        "ढ़": "ṛha", "फ़": "fa",
+        "क़": "qa", "ख़": "ḵha", "ग़": "ġa", "ज़": "za", "ड़": "ṛa",
+        "ढ़": "ṛha", "य़": "fa",
         // Halant / virama
         "्": "",
         // Anusvara / visarga

@@ -143,5 +143,3 @@ private struct RadioRow: View {
         .buttonStyle(.plain)
     }
 }
-
-#Preview { NavigationStack { SettingsScreen(onBack: {}) } }

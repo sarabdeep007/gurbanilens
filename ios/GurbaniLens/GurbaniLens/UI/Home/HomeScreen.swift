@@ -52,5 +52,3 @@ struct HomeScreen: View {
         }
     }
 }
-
-#Preview { HomeScreen(onSearchTap: {}, onSettingsTap: {}) }

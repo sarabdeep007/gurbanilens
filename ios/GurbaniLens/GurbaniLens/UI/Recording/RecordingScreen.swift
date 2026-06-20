@@ -91,14 +91,3 @@ struct RecordingScreen: View {
         .navigationBarBackButtonHidden(true)
     }
 }
-
-#Preview {
-    let session = VoiceSearchSession()
-    session.setRecording(peak: 0.6)
-    return RecordingScreen(
-        session: session,
-        livePreview: "",
-        onStop: {},
-        onCancel: {}
-    )
-}

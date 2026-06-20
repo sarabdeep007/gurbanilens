@@ -135,20 +135,3 @@ private struct ToggleChip: View {
         .buttonStyle(.plain)
     }
 }
-
-#Preview {
-    let lines: [Line] = [
-        Line(id: "a", shabadId: "CWK", ang: 462, pangti: 1, lineType: "Sirlekh",
-             gurmukhi: "Aasaa", gurmukhiUnicode: nil, transliterationEn: "aasaa",
-             firstLetters: nil, orderId: 9998),
-        Line(id: "b", shabadId: "CWK", ang: 462, pangti: 2, lineType: "Pankti",
-             gurmukhi: "kbIr", gurmukhiUnicode: nil, transliterationEn: "kabeer",
-             firstLetters: nil, orderId: 9999),
-        Line(id: "c", shabadId: "CWK", ang: 462, pangti: 3, lineType: "Pankti",
-             gurmukhi: "mInw", gurmukhiUnicode: nil,
-             transliterationEn: "meenaa jalaheen", firstLetters: nil, orderId: 10000),
-    ]
-    return NavigationStack {
-        ShabadScreen(title: "CWK", lines: lines, focusLineId: "c", onBack: {})
-    }
-}

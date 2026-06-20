@@ -140,18 +140,3 @@ private struct MatchCard: View {
         .buttonStyle(.plain)
     }
 }
-
-#Preview {
-    let line = Line(
-        id: "ABC", shabadId: "CWK", ang: 462, pangti: 3,
-        lineType: "Pankti", gurmukhi: "mInw jlhIn",
-        gurmukhiUnicode: nil,
-        transliterationEn: "meenaa jalaheen meenaa jalaheen he",
-        firstLetters: "mjmjh", orderId: 10000
-    )
-    let match = Match(line: line, score: 95.0, partialRatio: 95.0, coverage: 1.0)
-    let result = SearchResult.from(transcript: "meena jalheen meena jalheen he", matches: [match])
-    return NavigationStack {
-        ResultsScreen(result: result, onBack: {}, onTryAgain: {}, onOpenShabad: { _ in })
-    }
-}
