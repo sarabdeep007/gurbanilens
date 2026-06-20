@@ -1,4 +1,5 @@
 import Foundation
+import CoreML
 import WhisperKit
 
 /// One-shot WhisperKit wrapper for v1 voice-search. Loads a WhisperKit pipe
@@ -106,9 +107,23 @@ public actor WhisperOneShot: Asr {
     private func ensurePipe() async throws -> WhisperKit {
         if let p = pipe { return p }
         do {
+            // Compute units: WhisperKit's defaults are already
+            // textDecoderCompute = .cpuAndNeuralEngine and
+            // audioEncoderCompute = .cpuAndNeuralEngine on iOS 17+. We pass
+            // the struct explicitly so future WhisperKit bumps or default
+            // changes can't silently regress us to CPU-only. Setting these
+            // does NOT close Deep's 6.4× realtime gap on its own — that's
+            // first-launch CoreML cold-start cost, not a wrong-device
+            // assignment. Subsequent runs warm the model and run faster.
+            let compute = ModelComputeOptions(
+                melCompute: .cpuAndGPU,
+                audioEncoderCompute: .cpuAndNeuralEngine,
+                textDecoderCompute: .cpuAndNeuralEngine
+            )
             let config = WhisperKitConfig(
                 model: modelName,
                 modelFolder: modelFolder,
+                computeOptions: compute,
                 verbose: false,
                 logLevel: .info,
                 prewarm: true,
