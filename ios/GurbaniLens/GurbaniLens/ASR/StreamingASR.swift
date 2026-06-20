@@ -264,6 +264,25 @@ public actor StreamingASR {
             return
         }
 
+        // Bug L: WhisperKit emits English placeholder hints like
+        // "Waiting for speech..." or model special tokens (<|...|>) into
+        // currentText during warmup or low-confidence states. These leak
+        // into the matcher pipeline + the Gurmukhi-mode UI header where
+        // they don't belong. We pass non-empty currentText only if it
+        // contains at least one Devanagari codepoint (U+0900..U+097F) —
+        // that's the script our pa→hi remap is meant to produce. Empty
+        // currentText still passes through so the initial empty
+        // .listening state is correctly published.
+        if !currentText.isEmpty {
+            let hasDevanagari = currentText.unicodeScalars.contains { scalar in
+                scalar.value >= 0x0900 && scalar.value <= 0x097F
+            }
+            if !hasDevanagari {
+                NSLog("[DIAG] StreamingASR placeholder filter suppressed non-Devanagari partial (head60=\"\(String(currentText.prefix(60)))\")")
+                return
+            }
+        }
+
         // Hallucination guard. If the running currentText looks like a
         // repetition loop, swallow the update entirely — UI keeps the
         // last good partial.
