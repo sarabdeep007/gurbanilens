@@ -112,6 +112,17 @@ public actor StreamingASR {
     private var transcriber: AudioStreamTranscriber?
     private var continuation: AsyncStream<Partial>.Continuation?
 
+    // Bug G low-energy hallucination guard. Track recent per-partial
+    // energies; if the last `energyHistorySize` partials all read below
+    // `lowEnergyThreshold`, we're getting near-silence from the mic but
+    // Whisper is still producing tokens — classic small-model
+    // hallucination. Suppress partials in this regime UNTIL the text
+    // stops growing OR energy rises.
+    private var energyHistory: [Float] = []
+    private var lastEmittedTextLength: Int = 0
+    private let energyHistorySize: Int = 8
+    private let lowEnergyThreshold: Float = 0.1
+
     /// - Parameters:
     ///   - pipe: a constructed `WhisperKit` (typically obtained via
     ///     `WhisperOneShot.sharedPipe()` so v1 and v2 share one load).
@@ -249,6 +260,24 @@ public actor StreamingASR {
             NSLog("[DIAG] StreamingASR suppressed repetition hallucination on partial (len=\(currentText.count))")
             return
         }
+
+        // Bug G: low-energy hallucination guard. Track the last
+        // `energyHistorySize` partial energies; if all of them are below
+        // `lowEnergyThreshold` AND the text is still growing, we're
+        // hallucinating on near-silence. Suppress the partial.
+        let energy = new.bufferEnergy.last ?? 0
+        energyHistory.append(energy)
+        if energyHistory.count > energyHistorySize {
+            energyHistory.removeFirst()
+        }
+        let sustainedLowEnergy = energyHistory.count >= energyHistorySize
+            && energyHistory.allSatisfy { $0 < lowEnergyThreshold }
+        let textGrew = currentText.count > lastEmittedTextLength
+        if sustainedLowEnergy && textGrew {
+            NSLog("[DIAG] StreamingASR low-energy hallucination guard tripped — energy<\(lowEnergyThreshold) for \(energyHistorySize) partials, currentText grew \(lastEmittedTextLength)→\(currentText.count)")
+            return
+        }
+        lastEmittedTextLength = currentText.count
 
         let confirmed = new.confirmedSegments.map(\.text).joined(separator: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
