@@ -59,7 +59,6 @@ public actor WhisperOneShot: Asr {
     public enum WhisperError: LocalizedError {
         case pipeInitFailed(underlying: Error)
         case transcribeFailed(underlying: Error)
-        case emptyResult
 
         public var errorDescription: String? {
             switch self {
@@ -70,10 +69,20 @@ public actor WhisperOneShot: Asr {
                        "`bash scripts/fetch_ios_deps.sh --bundle-model` to pre-bundle it."
             case .transcribeFailed(let e):
                 return "WhisperKit transcribe failed: \(e.localizedDescription)"
-            case .emptyResult:
-                return "WhisperKit returned no transcription segments."
             }
         }
+    }
+
+    /// Repetition / length thresholds for ``isRepetitionHallucination(_:)``.
+    public enum HallucinationGuard {
+        /// Any single char repeating this many times consecutively trips the guard.
+        public static let maxConsecutiveChar = 10
+        /// Any 2-char pair repeating this many times consecutively trips the guard.
+        public static let maxConsecutivePair = 5
+        /// Any transcript longer than this many compacted chars trips the guard.
+        /// 5 s of honest recitation is usually < 100 chars; 500 is generously above
+        /// any honest length and well below the matcher-blocking threshold.
+        public static let maxTranscriptLength = 500
     }
 
     private let modelName: String
@@ -134,13 +143,20 @@ public actor WhisperOneShot: Asr {
             task: .transcribe,
             language: effectiveLanguage,
             temperature: config.temperature,
-            temperatureIncrementOnFallback: 0.0,
-            temperatureFallbackCount: config.noTemperatureFallback ? 0 : 5,
+            // Re-enable the temperature ladder. At T=0 with no fallback,
+            // the decoder can lock into a single-glyph repetition loop on
+            // ambiguous Indic-script audio (Deep's on-device test caught
+            // this). The ladder retries at slightly higher temperatures,
+            // which usually breaks the lock. We accept the determinism
+            // trade-off — Phase 1's "no fallback" finding was about the
+            // medium model; the small model needs the retry.
+            temperatureIncrementOnFallback: 0.2,
+            temperatureFallbackCount: 5,
             usePrefillPrompt: true,
             // Force the explicit language above. WhisperKit's DecodingOptions
             // treats `detectLanguage: nil` as "auto" on some paths, which
-            // can override our `language: "pa"` for short or noisy clips
-            // and is one of the hypothesised causes of the nukta-spam.
+            // can override our `language:` and is one of the hypothesised
+            // causes of the nukta/Telugu hallucination.
             detectLanguage: false,
             skipSpecialTokens: true,
             withoutTimestamps: true,
@@ -178,15 +194,82 @@ public actor WhisperOneShot: Asr {
         let trimmed = combined.trimmingCharacters(in: .whitespacesAndNewlines)
         NSLog("[DIAG] WhisperOneShot.transcribe raw segments=\(results.count) rawText.len=\(trimmed.count) rawText.head120=\"\(String(trimmed.prefix(120)))\"")
 
-        if trimmed.isEmpty && results.isEmpty {
-            throw WhisperError.emptyResult
+        // Hallucination guard. Treat detection as "no speech" — empty
+        // transcript → matcher receives empty query → SearchResult with
+        // no matches → UI lands on Results screen's "No matches found,
+        // try again" empty state. No throw; this is a model failure mode,
+        // not an app crash, and a red Error alert would be the wrong UX.
+        if Self.isRepetitionHallucination(trimmed) {
+            NSLog("[DIAG] WhisperOneShot suppressed repetition hallucination (raw.len=\(trimmed.count) prefix=\"\(String(trimmed.prefix(40)))\")")
+            let elapsed = Int64(Date().timeIntervalSince(start) * 1000)
+            return AsrTranscript(text: "", language: effectiveLanguage, durationMs: elapsed)
         }
+
         // Whisper output may be in Gurmukhi or Devanagari; normalise to
         // Latin so the matcher sees the same surface as Phase 1.
         let latin = Latin.from(trimmed)
         let elapsed = Int64(Date().timeIntervalSince(start) * 1000)
         NSLog("[DIAG] WhisperOneShot.transcribe latin.len=\(latin.count) latin.head120=\"\(String(latin.prefix(120)))\" elapsedMs=\(elapsed)")
         return AsrTranscript(text: latin, language: effectiveLanguage, durationMs: elapsed)
+    }
+
+    // MARK: - Hallucination heuristic
+
+    /// Returns true if `text` looks like a Whisper repetition-loop
+    /// hallucination. Tripwires:
+    ///   - Compacted (whitespace-stripped) length above
+    ///     ``HallucinationGuard/maxTranscriptLength``.
+    ///   - Any single char repeating ``HallucinationGuard/maxConsecutiveChar``
+    ///     times in a row.
+    ///   - Any 2-char pair repeating
+    ///     ``HallucinationGuard/maxConsecutivePair`` times in a row.
+    nonisolated static func isRepetitionHallucination(_ text: String) -> Bool {
+        if text.isEmpty { return false }
+        // Strip whitespace — Whisper sometimes interleaves repeats with
+        // single spaces and we want to catch those too.
+        let compact = text.replacingOccurrences(of: " ", with: "")
+            .replacingOccurrences(of: "\u{00A0}", with: "")
+            .replacingOccurrences(of: "\n", with: "")
+            .replacingOccurrences(of: "\t", with: "")
+        if compact.isEmpty { return false }
+
+        if compact.count > HallucinationGuard.maxTranscriptLength {
+            return true
+        }
+
+        // Rule 1: any single char repeats > maxConsecutiveChar times in a row.
+        var prev: Character? = nil
+        var run = 1
+        for ch in compact {
+            if ch == prev {
+                run += 1
+                if run >= HallucinationGuard.maxConsecutiveChar { return true }
+            } else {
+                prev = ch
+                run = 1
+            }
+        }
+
+        // Rule 2: any 2-char pair repeats > maxConsecutivePair times in a row.
+        let chars = Array(compact)
+        if chars.count >= HallucinationGuard.maxConsecutivePair * 2 + 2 {
+            var prevPair: (Character, Character)? = nil
+            var pairRun = 1
+            var i = 0
+            while i + 1 < chars.count {
+                let p: (Character, Character) = (chars[i], chars[i + 1])
+                if let pp = prevPair, pp.0 == p.0 && pp.1 == p.1 {
+                    pairRun += 1
+                    if pairRun >= HallucinationGuard.maxConsecutivePair { return true }
+                } else {
+                    prevPair = p
+                    pairRun = 1
+                }
+                i += 2
+            }
+        }
+
+        return false
     }
 
     private nonisolated func sampleStats(_ s: [Float]) -> (min: Float, max: Float, meanAbs: Float) {
