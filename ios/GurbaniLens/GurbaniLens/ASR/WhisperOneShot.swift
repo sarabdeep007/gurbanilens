@@ -19,9 +19,25 @@ import WhisperKit
 /// The bundled path is gated on `scripts/fetch_ios_deps.sh --bundle-model`;
 /// the auto-download path is the default behaviour and works out of the box.
 ///
+/// Language remap (v1 ship, 2026-06-20)
+/// ------------------------------------
+/// Whisper-small was severely undertrained on Punjabi. Even with explicit
+/// `language="pa"` + `detectLanguage=false`, the decoder routinely drifts
+/// to Telugu glyphs (the closest Indic-script cluster in the model's
+/// embedding space) for clean Punjabi recitation — Deep's on-device test
+/// captured 88000 samples of clean "ek oankaar sat naam karataa purakh"
+/// and got back ~3000 chars of the single Telugu glyph ఀ repeating.
+///
+/// Workaround: silently remap `pa` → `hi` (Hindi) at the WhisperKit call
+/// boundary. Hindi has orders-of-magnitude more training data, Whisper-
+/// small's Hindi transcription is reliable, and Devanagari output is
+/// exactly what `Latin.from` already handles (Phase 1 found Whisper
+/// transcribes Punjabi audio to Devanagari on the medium model anyway).
+/// v2's Punjabi-fine-tuned model can drop this remap.
+///
 /// Phase 1 deterministic-ASR config (locked in `DecodingOptions`):
 ///   - task = .transcribe
-///   - language = config.language ("pa" by default)
+///   - language = config.language (remapped per above)
 ///   - temperature = 0.0
 ///   - temperatureFallbackCount = 0          (no fallback ladder)
 ///   - withoutTimestamps = true              (one-shot — we don't need timing)
@@ -107,10 +123,16 @@ public actor WhisperOneShot: Asr {
         let head = samples.prefix(20).map { String(format: "%.4f", $0) }.joined(separator: ",")
         NSLog("[DIAG] WhisperOneShot.transcribe input samples=\(samples.count) sec=\(String(format: "%.3f", audioSec)) min=\(stats.min) max=\(stats.max) mean|abs|=\(stats.meanAbs) head20=[\(head)]")
 
+        // Language remap — see file-level kdoc.
+        let effectiveLanguage: String = (config.language == "pa") ? "hi" : config.language
+        if effectiveLanguage != config.language {
+            NSLog("[DIAG] WhisperOneShot.transcribe language remap \(config.language) → \(effectiveLanguage) (small-model Punjabi workaround)")
+        }
+
         let decode = DecodingOptions(
             verbose: false,
             task: .transcribe,
-            language: config.language,
+            language: effectiveLanguage,
             temperature: config.temperature,
             temperatureIncrementOnFallback: 0.0,
             temperatureFallbackCount: config.noTemperatureFallback ? 0 : 5,
@@ -164,7 +186,7 @@ public actor WhisperOneShot: Asr {
         let latin = Latin.from(trimmed)
         let elapsed = Int64(Date().timeIntervalSince(start) * 1000)
         NSLog("[DIAG] WhisperOneShot.transcribe latin.len=\(latin.count) latin.head120=\"\(String(latin.prefix(120)))\" elapsedMs=\(elapsed)")
-        return AsrTranscript(text: latin, language: config.language, durationMs: elapsed)
+        return AsrTranscript(text: latin, language: effectiveLanguage, durationMs: elapsed)
     }
 
     private nonisolated func sampleStats(_ s: [Float]) -> (min: Float, max: Float, meanAbs: Float) {
