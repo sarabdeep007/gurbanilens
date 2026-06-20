@@ -288,34 +288,45 @@ public final class VoiceSearchSession: ObservableObject {
     /// accumulated transcript. Transitions through `.committing` →
     /// `.done(result)`.
     ///
-    /// Returns the final `SearchResult`. If the caller wants to open a
-    /// specific match (tap-row path), pass it as `selectedMatch` — we'll
-    /// still run the full fuzzy match but the caller can navigate to that
-    /// match's Shabad immediately.
+    /// **Bug E fix (2026-06-20).** Phase A passed `confirmed + " " +
+    /// unconfirmed` directly to the matcher — but those fields hold
+    /// WhisperKit's raw Devanagari text and the matcher's index is Latin,
+    /// so it would never produce useful matches. (The v1 MicSource path
+    /// inadvertently took over via the Bug F audio-conflict and produced
+    /// the only matches Deep saw.) We now route the Devanagari source
+    /// through `Latin.from` at commit time before handing it to the full
+    /// fuzzy matcher.
+    ///
+    /// Returns the final `SearchResult`.
     @discardableResult
     public func commit(
         asr: StreamingASR,
         matcher: Matcher
     ) async -> SearchResult {
         // Snapshot the listening payload BEFORE stopping the asr —
-        // otherwise the snapshot may race against a final VAD-stop
-        // setListening from the for-await loop.
-        let query: String = {
+        // otherwise a final VAD-stop setListening from the for-await
+        // loop could race.
+        let devanagariSource: String = {
             if case .listening(let c, let u, _, _) = state {
                 return (c + " " + u).trimmingCharacters(in: .whitespacesAndNewlines)
             }
             return ""
         }()
+        let queryLatin = Latin.from(devanagariSource)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        NSLog("[DIAG] VoiceSearchSession.commit source.len=\(devanagariSource.count) queryLatin.len=\(queryLatin.count) queryLatin.head60=\"\(String(queryLatin.prefix(60)))\"")
+
         await asr.stop()
-        setCommitting(query: query)
+        setCommitting(query: devanagariSource)
 
         let matches: [Match]
-        if query.isEmpty {
+        if queryLatin.isEmpty {
             matches = []
             NSLog("[DIAG] VoiceSearchSession.commit query empty — skipping full matcher")
         } else {
             let matcherRef = matcher
-            let q = query
+            let q = queryLatin
             let matchStart = Date()
             matches = await Task.detached(priority: .userInitiated) {
                 matcherRef.match(q, topN: 5)
@@ -324,7 +335,12 @@ public final class VoiceSearchSession: ObservableObject {
             NSLog("[DIAG] VoiceSearchSession.commit full matcher done matchMs=\(matchMs) matches=\(matches.count) topScore=\(matches.first.map { String(format: "%.1f", $0.score) } ?? "n/a")")
         }
 
-        let result = SearchResult.from(transcript: query, matches: matches)
+        // SearchResult.transcript is the display field — Phase B's Bug H
+        // commit replaces this with Gurmukhi.fromDevanagari(devanagariSource)
+        // so the user sees Gurmukhi script, not Devanagari. Until then we
+        // ship the Devanagari source; better than showing the Latin form
+        // which would surprise Sangat readers either way.
+        let result = SearchResult.from(transcript: devanagariSource, matches: matches)
         setDone(result)
         return result
     }
