@@ -127,22 +127,35 @@ public actor SarvamProvider: ASRProvider {
         self.partialsStream = stream
         self.partialsContinuation = cont
 
-        // Build the WebSocket URL with config as query params — Sarvam
-        // does NOT take a JSON config message (that was the previous bug;
-        // it returned "bad response from server" on every config send).
-        // Per Sarvam docs + LiveKit / AVR / Rust SDK reference: pass
-        // model + language_code + high_vad_sensitivity in the URL.
+        // Build the WebSocket URL with config as query params per the
+        // AVR production reference (agentvoiceresponse/avr-asr-sarvam,
+        // index.js) + Sarvam docs. Param-name details that matter:
+        //   - `language-code` uses a HYPHEN, not an underscore (was a
+        //     bug in hotfix-4: `language_code`).
+        //   - `input_audio_codec=pcm_s16le` declares the wire format;
+        //     CloudMicCapture emits 16 kHz mono s16le. Required.
+        //   - `sample_rate=16000` is explicit even though docs say it
+        //     defaults to 16000 — safer.
+        //   - `mode=transcribe` is the documented default but we set it
+        //     explicitly so model-config drift can't surprise us.
+        //   - `high_vad_sensitivity=true` improves cut-in for short
+        //     Pangti recitations.
         var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false)
         var queryItems = components?.queryItems ?? []
         queryItems.append(URLQueryItem(name: "model", value: model))
-        queryItems.append(URLQueryItem(name: "language_code", value: language))
+        queryItems.append(URLQueryItem(name: "language-code", value: language))
+        queryItems.append(URLQueryItem(name: "mode", value: "transcribe"))
+        queryItems.append(URLQueryItem(name: "sample_rate", value: "16000"))
+        queryItems.append(URLQueryItem(name: "input_audio_codec", value: "pcm_s16le"))
         queryItems.append(URLQueryItem(name: "high_vad_sensitivity", value: "true"))
         components?.queryItems = queryItems
         guard let urlWithParams = components?.url else {
             throw SarvamError.webSocketFailed(underlying: NSError(domain: "SarvamProvider", code: 1, userInfo: [NSLocalizedDescriptionKey: "Could not build URL with query params"]))
         }
         var req = URLRequest(url: urlWithParams)
-        req.setValue(apiKey, forHTTPHeaderField: "api-subscription-key")
+        // Header name is case-insensitive per HTTP, but mirror AVR's
+        // exact spelling (`Api-Subscription-Key`) for parity.
+        req.setValue(apiKey, forHTTPHeaderField: "Api-Subscription-Key")
 
         let urlSession = URLSession(configuration: .default)
         self.session = urlSession
@@ -182,10 +195,10 @@ public actor SarvamProvider: ASRProvider {
 
     public func stop() async {
         NSLog("[DIAG] SarvamProvider.stop()")
-        // Tell server we're done. Best-effort — the close itself stops the stream.
+        // Per AVR reference, end-of-stream is just a WS close — Sarvam
+        // does NOT take a `{"type":"stop"}` message (previous impl sent
+        // one speculatively; harmless if ignored but cleaner to drop).
         if let task = task {
-            let stopMsg = #"{"type":"stop"}"#
-            try? await task.send(.string(stopMsg))
             task.cancel(with: .normalClosure, reason: nil)
         }
         capture.stop()
@@ -203,12 +216,43 @@ public actor SarvamProvider: ASRProvider {
         lastIsSpeaking = peak > 0.02
     }
 
+    /// Send one s16le audio chunk to Sarvam as a JSON-wrapped base64
+    /// text frame per AVR `index.js`:
+    ///
+    /// ```
+    /// sarvamWs.send(JSON.stringify({
+    ///   audio: {
+    ///     data: Buffer.from(chunk).toString('base64'),
+    ///     sample_rate: "16000",
+    ///     encoding: "audio/wav"
+    ///   }
+    /// }));
+    /// ```
+    ///
+    /// The previous impl sent `chunk` as a raw binary WebSocket frame
+    /// (`.data(chunk)`) which Sarvam rejected by closing the
+    /// connection — Deep's [DIAG] logs showed `readLoop terminated:
+    /// Socket is not connected` ~500-700 ms after the first audio
+    /// frame, on 4/4 attempts. JSON-wrapping is the fix.
     private func sendAudio(_ chunk: Data) async {
         guard let task = task else { return }
+        let base64 = chunk.base64EncodedString()
+        let payload: [String: Any] = [
+            "audio": [
+                "data": base64,
+                "sample_rate": "16000",
+                "encoding": "audio/wav"
+            ]
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload),
+              let jsonString = String(data: data, encoding: .utf8) else {
+            NSLog("[DIAG] SarvamProvider sendAudio JSON serialize FAILED chunkBytes=\(chunk.count)")
+            return
+        }
         do {
-            try await task.send(.data(chunk))
+            try await task.send(.string(jsonString))
         } catch {
-            NSLog("[DIAG] SarvamProvider sendAudio FAILED: \(error.localizedDescription)")
+            NSLog("[DIAG] SarvamProvider sendAudio FAILED: \(error.localizedDescription) chunkBytes=\(chunk.count)")
         }
     }
 
@@ -249,15 +293,44 @@ public actor SarvamProvider: ASRProvider {
             return
         }
 
-        // Surface server errors so they don't silently get treated as transcripts.
+        // Sarvam server envelope (per AVR `index.js` + docs):
+        //   { "type": "data" | "events" | "error", "data": { ... } }
+        // The transcript path is type=="data", data.transcript.
+        // VAD events arrive as type=="events" (when vad_signals=true) —
+        // we don't surface those to the UI yet, just log.
+        if let type = dict["type"] as? String {
+            switch type {
+            case "data":
+                break // fall through to extractTranscript below
+            case "events":
+                if let inner = dict["data"] as? [String: Any] {
+                    NSLog("[DIAG] SarvamProvider VAD event: \(inner)")
+                }
+                return
+            case "error":
+                let msg = (dict["data"] as? [String: Any])?["message"] as? String
+                    ?? "unknown Sarvam error"
+                NSLog("[DIAG] SarvamProvider server error: \(msg) full=\(String(jsonStr.prefix(200)))")
+                return
+            default:
+                NSLog("[DIAG] SarvamProvider unknown message type=\(type) head=\(String(jsonStr.prefix(120)))")
+                return
+            }
+        }
+
+        // Legacy / fallback path: some Sarvam endpoints return a flat
+        // `{transcript: ...}` or `{error: ...}` without the type
+        // envelope. Surface server errors so they don't silently get
+        // treated as transcripts.
         if let err = dict["error"] as? String ?? (dict["error"] as? [String: Any])?["message"] as? String {
-            NSLog("[DIAG] SarvamProvider server error: \(err)")
+            NSLog("[DIAG] SarvamProvider server error (no-type envelope): \(err)")
             return
         }
 
-        // Sarvam's interim/final result shape (verify against docs.sarvam.ai):
-        //   { "transcript": "...", "is_final": bool, ... }
-        // Other endpoints may use { "data": { "transcript": "..." } }.
+        // extractSarvamTranscript handles `transcript`, `text`,
+        // `data.transcript`, `data.text`, and Google-style
+        // `results.alternatives.transcript`. Covers both type-enveloped
+        // and flat shapes.
         let transcript = Self.extractTranscript(from: dict)
         guard let raw = transcript, !raw.isEmpty else { return }
 
