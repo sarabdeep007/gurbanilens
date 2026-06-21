@@ -1,6 +1,8 @@
 # GurbaniLens — STATUS
 
-_Last updated: 2026-06-21 by Claude (iOS A.4b agent) — Phase A.4b: **two cloud ASR providers wired + debug Compare mode shipped.** `SarvamProvider` (Saaras-v3 WebSocket streaming, REST batch one-shot for Compare) and `GeminiProvider` (2.5 Flash chunked REST, ~2 sec/chunk) conform to A.4a's `ASRProvider` protocol; both slotted into `StreamingASR`'s @AppStorage switch. New shared `CloudMicCapture` actor-y class emits 16 kHz mono s16le PCM chunks via AsyncStream (sibling to MicSource's Float32 bulk path). Settings → Voice recognition gains a Cloud sub-section (toggle + Sarvam/Gemini picker + 50/month free-trial counter with monthly auto-reset). 5 rapid taps on the Settings → Version footer unlock a `CompareScreen` debug modal in LiveResultsScreen toolbar that fan-outs one recording to all three providers in parallel and side-by-sides the transcripts; Save writes JSON to Documents/ for Deep to pull. `scripts/inject_env_to_plist.sh` postBuildScript pulls SARVAM_API_KEY + GEMINI_API_KEY from repo-root .env into the built Info.plist without committing keys. 23 new `CloudParsing` unit tests in GurbaniLensCore (extractSarvamTranscript / extractGeminiText / detectScript / sanitize / joinAccumulator)._
+_Last updated: 2026-06-22 by Claude (overnight Sarvam/Gemini protocol investigation) — **Root causes identified for both cloud providers and fixed with cited evidence.** Sarvam: was sending audio as raw binary WS frames; Sarvam expects JSON-wrapped base64 text frames per AVR production reference + Pipecat + official docs (commit `de786bf`, full investigation at [`docs/SARVAM_PROTOCOL_INVESTIGATION.md`](./docs/SARVAM_PROTOCOL_INVESTIGATION.md)). Gemini: was sending `inline_data` / `mime_type` snake_case; Google's REST gateway silently drops these per `ai.google.dev/gemini-api/docs/audio` + LangChain4j #3559, so the model was being called with text-only input (commit `6afe5f6`, full investigation at [`docs/GEMINI_PROTOCOL_INVESTIGATION.md`](./docs/GEMINI_PROTOCOL_INVESTIGATION.md)). Both fixes use evidence-cited reference implementations, not speculative guesses. **Confidence Sarvam works in morning rebuild: medium-high (3 independent sources agree on wire format). Confidence Gemini works: medium (fix is well-cited but no working iOS-Gemini-Punjabi-audio reference to compare against).** Deep's morning recipe at the bottom of this file under "Resume 2026-06-22"._
+
+_Prior: 2026-06-21 by Claude (iOS A.4b agent) — Phase A.4b: **two cloud ASR providers wired + debug Compare mode shipped.** `SarvamProvider` (Saaras-v3 WebSocket streaming, REST batch one-shot for Compare) and `GeminiProvider` (2.5 Flash chunked REST, ~2 sec/chunk) conform to A.4a's `ASRProvider` protocol; both slotted into `StreamingASR`'s @AppStorage switch. New shared `CloudMicCapture` actor-y class emits 16 kHz mono s16le PCM chunks via AsyncStream (sibling to MicSource's Float32 bulk path). Settings → Voice recognition gains a Cloud sub-section (toggle + Sarvam/Gemini picker + 50/month free-trial counter with monthly auto-reset). 5 rapid taps on the Settings → Version footer unlock a `CompareScreen` debug modal in LiveResultsScreen toolbar that fan-outs one recording to all three providers in parallel and side-by-sides the transcripts; Save writes JSON to Documents/ for Deep to pull. `scripts/inject_env_to_plist.sh` postBuildScript pulls SARVAM_API_KEY + GEMINI_API_KEY from repo-root .env into the built Info.plist without committing keys. 23 new `CloudParsing` unit tests in GurbaniLensCore (extractSarvamTranscript / extractGeminiText / detectScript / sanitize / joinAccumulator)._
 
 _Prior: 2026-06-21 by Claude (iOS A.4a agent) — Phase A.4a: **default Whisper model bumped to large-v3** (best Punjabi). Extracted `ASRProvider` protocol; refactored WhisperKit into pluggable `WhisperKitProvider` conforming to it. `StreamingASR` is now a thin facade picking the provider from Settings. Settings UI scroll-wrap polish + new "Voice recognition > Local model (Whisper)" picker. LiveResultsScreen gains a model-download progress header for first-launch fetch._
 
@@ -127,6 +129,60 @@ Pivoted from "continuous-listen Paath companion" on **2026-06-17**. Original Pha
 | Hyyro / n-gram prefilter for Swift+Kotlin partial_ratio | v1 single-shot query is latency-tolerant; brute-force port is fine | v2 (full-corpus continuous search needs it) |
 | `language="pa"` + fixed Whisper seed | Prebuilt .so JNI hardcodes `language="en"` + no seed knob | Replace prebuilt with NDK-compiled-from-source (next chunk) |
 | Real-device validation of `WhisperAsr` | Headless taaj-portal can't run an APK against the mic | Deep runs `./gradlew :app:installDebug` on a connected device |
+
+---
+
+## Resume 2026-06-22 — cloud-provider morning recipe (Deep)
+
+After overnight investigation, the cloud providers should now work. **Pull, regen, rebuild, retry:**
+
+```bash
+cd ~/claude-workspace/projects/gurbanilens
+git pull origin main
+cd ios/GurbaniLens
+rm -rf GurbaniLens.xcodeproj && xcodegen generate
+xcodebuild -project GurbaniLens.xcodeproj -scheme GurbaniLens \
+  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' build 2>&1 | tail -50
+```
+
+Expect BUILD SUCCEEDED. Then Cmd-R on device.
+
+**Sarvam test (most likely to work — confidence MEDIUM-HIGH):**
+1. Settings → Voice recognition → Cloud → toggle ON → pick Sarvam.
+2. Return Home, tap mic, recite **"ek oankaar sat naam"** for ~5 sec.
+3. Expected Xcode console log:
+   ```
+   [DIAG] SarvamProvider WS connecting to wss://api.sarvam.ai/speech-to-text/ws?model=saaras:v3&language-code=pa-IN&mode=transcribe&sample_rate=16000&input_audio_codec=pcm_s16le&high_vad_sensitivity=true
+   [DIAG] SarvamProvider.start streaming begun
+   [DIAG] SarvamProvider partial transcript.len=<N> script=gurmukhi latin.head60="..." gurmukhi.head60="ਏਕ ਓਅੰਕਾਰ ..."
+   ```
+4. If you see partials → working. Tap Stop, expect Results screen.
+5. If `readLoop terminated: Socket is not connected` reappears → paste the full xcodebuild + run log; the fallback is `mode` or `input_audio_codec` mismatch documented in [`docs/SARVAM_PROTOCOL_INVESTIGATION.md`](./docs/SARVAM_PROTOCOL_INVESTIGATION.md#confidence-the-morning-rebuild-will-work).
+
+**Gemini test (probably works — confidence MEDIUM):**
+1. Settings → Cloud → pick Gemini → Home → mic → recite same line.
+2. Wait ~2-4 sec per chunk. Expected:
+   ```
+   [DIAG] GeminiProvider.start streaming begun (chunkBytes=64000)
+   [DIAG] GeminiProvider chunk.sec=2.00 elapsedMs=<N> response.len=<N> response.head80="ਏਕ ..."
+   ```
+3. If you see HTTP 400 → paste the body (probably another field name issue).
+4. If you see HTTP 200 but response.len=0 → Gemini doesn't want to transcribe; tighten the prompt or try Gemini 2.5 Pro (see [`docs/GEMINI_PROTOCOL_INVESTIGATION.md`](./docs/GEMINI_PROTOCOL_INVESTIGATION.md)).
+
+**Then Compare mode** (the deciding A/B test):
+1. Settings → tap Version line 5x rapidly → "Compare mode unlocked" alert.
+2. Home → mic → tap the rectangle.split icon top-right → CompareScreen sheet.
+3. Tap Record → recite "ek oankaar sat naam" → tap Stop.
+4. Three rows fill in side-by-side. Save Comparison → pull JSON via Xcode → Devices → Download Container.
+5. Decision: pick whichever Gurmukhi transcript is closest to ground truth + has acceptable latency. Free-trial counter (46/50 after last night's burn) gets decremented one more credit per cloud row per Compare run.
+
+**If both providers still fail** after pulling `6afe5f6`:
+- Sarvam: paste the full xcodebuild stderr/run log including the URL line and the first `readLoop terminated` error. The investigation doc has 3 fallback hypotheses prioritised.
+- Gemini: paste the full HTTP response body when status != 200. The fix is field-name-level and well-cited, so a failure means there's an account / quota / safety-policy issue rather than a wire-format issue.
+
+**Trial counter:** Started June 2026 at 50, was at 46 after last night. Sarvam burns 1 per commit; Gemini same; CompareScreen NOT yet wired to consume (it directly calls the static `transcribeOneShot` helpers, bypassing `CloudTrialPolicy.tryConsume`). If you want Compare runs to count, that's a 5-line follow-up — say the word.
+
+**WhisperKit large-v3** is unaffected by all of this; it's the local default + the always-available fallback if either cloud provider fails. Toggle Cloud OFF in Settings to use it.
 
 ---
 
