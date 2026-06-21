@@ -37,6 +37,7 @@ public extension AudioSource {
 /// Errors thrown by audio sources.
 public enum AudioSourceError: LocalizedError {
     case microphonePermissionDenied
+    case microphonePermissionRequested
     case sessionConfigurationFailed(underlying: Error)
     case engineStartFailed(underlying: Error)
     case fileLoadFailed(URL, underlying: Error)
@@ -46,6 +47,8 @@ public enum AudioSourceError: LocalizedError {
         switch self {
         case .microphonePermissionDenied:
             return "Microphone permission was denied. Enable it in iOS Settings → Privacy → Microphone → GurbaniLens."
+        case .microphonePermissionRequested:
+            return "Microphone permission requested — please allow access and try again."
         case .sessionConfigurationFailed(let e):
             return "Couldn't configure the audio session: \(e.localizedDescription)"
         case .engineStartFailed(let e):

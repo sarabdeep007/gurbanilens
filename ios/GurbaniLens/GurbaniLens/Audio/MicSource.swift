@@ -171,16 +171,22 @@ public final class MicSource: AudioSource {
         case .denied:
             throw AudioSourceError.microphonePermissionDenied
         case .undetermined:
-            // We block here briefly. In the UI we'll call this from a Task
-            // and surface the prompt before the user taps "listen".
-            let semaphore = DispatchSemaphore(value: 0)
-            var granted = false
-            session.requestRecordPermission { result in
-                granted = result
-                semaphore.signal()
-            }
-            semaphore.wait()
-            if !granted { throw AudioSourceError.microphonePermissionDenied }
+            // Bug R (Phase A.3 2026-06-21). The previous implementation used
+            // DispatchSemaphore.wait() to block on the async permission
+            // callback. That blocks the calling thread; when called from a
+            // Task continuation on MainActor it tripped Swift 5.10's
+            // `unsafeForcedSync` runtime check. We can't trivially make
+            // `start(_:)` async because it satisfies the AudioSource
+            // protocol's sync signature.
+            //
+            // Workaround: fire the permission request asynchronously
+            // (the system will show the prompt), then throw immediately
+            // with a message that tells the user to grant + try again.
+            // Once permission is recorded as `.granted`, the second tap
+            // succeeds. This is a one-time UX hit for new installs and
+            // avoids the cross-thread block entirely.
+            session.requestRecordPermission { _ in /* result handled on next tap */ }
+            throw AudioSourceError.microphonePermissionRequested
         @unknown default:
             throw AudioSourceError.microphonePermissionDenied
         }
