@@ -1,6 +1,8 @@
 # GurbaniLens — STATUS
 
-_Last updated: 2026-06-21 by Claude (android-build agent) — **Android v1 APK builds clean on the headless build host** after reviving a previously OOM-killed build. Debug APK at `android/app/build/outputs/apk/debug/app-debug.apk` (372 MB) bundles SGGS sqlite + Whisper ggml-base.bin + 4-ABI libwhisper.so. Port-parity tests 11/11 PASS. QA session [cmqn4w13j007zwezdbi02ielh](https://qa.taajsingh.com/sessions/cmqn4w13j007zwezdbi02ielh) seeded for Deep to sideload + real-device test._
+_Last updated: 2026-06-21 by Claude (iOS A.4a agent) — Phase A.4a: **default Whisper model bumped to large-v3** (best Punjabi). Extracted `ASRProvider` protocol; refactored WhisperKit into pluggable `WhisperKitProvider` conforming to it. `StreamingASR` is now a thin facade picking the provider from Settings. Settings UI scroll-wrap polish + new "Voice recognition > Local model (Whisper)" picker. LiveResultsScreen gains a model-download progress header for first-launch fetch._
+
+_Prior: 2026-06-21 by Claude (android-build agent) — **Android v1 APK builds clean on the headless build host** after reviving a previously OOM-killed build. Debug APK at `android/app/build/outputs/apk/debug/app-debug.apk` (372 MB) bundles SGGS sqlite + Whisper ggml-base.bin + 4-ABI libwhisper.so. Port-parity tests 11/11 PASS. QA session [cmqn4w13j007zwezdbi02ielh](https://qa.taajsingh.com/sessions/cmqn4w13j007zwezdbi02ielh) seeded for Deep to sideload + real-device test._
 
 _Prior: 2026-06-21 by Claude (iOS agent) — Phase A.3 **architectural reset**: dropped the WhisperKit segment-split that was producing concatenated junk; v2 now flows `State.currentText` directly. LiveResultsScreen rebuilt for Amrit-Kirtan-style bounded header + prominent results list. unsafeForcedSync resolved._
 
