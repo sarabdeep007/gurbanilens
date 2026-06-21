@@ -52,6 +52,7 @@ struct AppNavGraph: View {
                 case .liveRecording:
                     LiveResultsScreen(
                         session: session,
+                        downloadProgress: container.modelDownloadProgress,
                         onStop: { container.commitLive() },
                         onCancel: { container.cancelLiveRecording() },
                         onCommit: { match in container.commitLive(match: match) }

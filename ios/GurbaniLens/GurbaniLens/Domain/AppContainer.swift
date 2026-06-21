@@ -13,6 +13,12 @@ final class AppContainer: ObservableObject {
     @Published var session = VoiceSearchSession()
     @Published var showErrorAlert: Bool = false
 
+    /// Phase A.4a: live WhisperKit model-download progress (0.0..1.0).
+    /// Set non-nil while a fresh model is downloading; cleared back to
+    /// nil once the pipe is loaded. LiveResultsScreen swaps the
+    /// "ਸੁਣ ਰਿਹਾ ਹਾਂ…" placeholder for a progress UI while non-nil.
+    @Published var modelDownloadProgress: Float?
+
     // ── Backing pipeline (lazy because each is heavy) ────────────────────
     private var corpus: Corpus?
     private var matcher: Matcher?
@@ -301,6 +307,30 @@ final class AppContainer: ObservableObject {
 
     private func startLiveStreamAndAwait() async {
         NSLog("[DIAG] AppContainer.startLiveStreamAndAwait entry")
+
+        // Phase A.4a: spin up a download-progress mirror Task if the
+        // active provider is WhisperKit. WhisperKitProvider yields 0.0
+        // at init start and 1.0 once the pipe loads; we mirror those
+        // into `modelDownloadProgress` so LiveResultsScreen can render
+        // a progress UI in the header instead of "ਸੁਣ ਰਿਹਾ ਹਾਂ…".
+        let asr = ensureStreamingAsr()
+        if let progress = asr.whisperDownloadProgress {
+            Task { [weak self] in
+                for await value in progress {
+                    await MainActor.run {
+                        // 1.0 means "loaded" → clear after a beat so the
+                        // header swaps back to the live-listening UI.
+                        if value >= 1.0 {
+                            self?.modelDownloadProgress = nil
+                        } else {
+                            self?.modelDownloadProgress = value
+                        }
+                    }
+                }
+                await MainActor.run { self?.modelDownloadProgress = nil }
+            }
+        }
+
         // Bug A: establish .listening state on @MainActor BEFORE we await
         // anything heavy (matcher build, WhisperKit pipe construction,
         // stream startup). Otherwise the first ~30 s of cold-start
@@ -316,13 +346,10 @@ final class AppContainer: ObservableObject {
         )
 
         do {
-            let asr = ensureStreamingAsr()
             let matcher = try ensureMatcher()
             try await session.startStreaming(asr: asr, matcher: matcher)
             NSLog("[DIAG] AppContainer.startLiveStreamAndAwait stream finished (VAD or stop)")
             // Stream finished naturally — VAD detected silence. Commit.
-            // Don't pass a preselected match — let the user choose from
-            // the final Results screen.
             await commitLiveStream(preselected: nil)
         } catch {
             NSLog("[DIAG] AppContainer.startLiveStreamAndAwait threw: \(error.localizedDescription)")

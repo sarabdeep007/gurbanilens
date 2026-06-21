@@ -29,6 +29,10 @@ import GurbaniLensCore
 ///   └────────────────────────────────┘
 struct LiveResultsScreen: View {
     @ObservedObject var session: VoiceSearchSession
+    /// Phase A.4a — Whisper model download progress (nil unless a
+    /// download is in flight). When non-nil, the transcript header
+    /// shows a `ProgressView` instead of the listening placeholder.
+    let downloadProgress: Float?
     let onStop: () -> Void
     let onCancel: () -> Void
     let onCommit: (Match) -> Void
@@ -80,6 +84,37 @@ struct LiveResultsScreen: View {
     // MARK: - Header
 
     private var transcriptHeader: some View {
+        Group {
+            if let progress = downloadProgress {
+                // Phase A.4a: WhisperKit model is downloading. Swap the
+                // listening placeholder for a progress UI.
+                modelDownloadHeader(progress: progress)
+            } else {
+                liveTranscriptHeader
+            }
+        }
+    }
+
+    private func modelDownloadHeader(progress: Float) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Downloading voice model")
+                .font(.system(size: 13))
+                .foregroundColor(Theme.onSurfaceVariant)
+            Text(String(format: "%.0f%%", max(0, min(progress, 1)) * 100))
+                .font(.system(size: 22, weight: .semibold))
+                .foregroundColor(Theme.onSurface)
+            ProgressView(value: max(0, min(Double(progress), 1)))
+                .progressViewStyle(.linear)
+                .tint(Theme.primary)
+            Text("Only on first launch — subsequent searches are instant.")
+                .font(.system(size: 12))
+                .foregroundColor(Theme.onSurfaceVariant)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var liveTranscriptHeader: some View {
         ScrollViewReader { proxy in
             ScrollView {
                 VStack(alignment: .leading, spacing: 4) {
@@ -97,7 +132,6 @@ struct LiveResultsScreen: View {
             }
             .frame(maxHeight: Self.headerMaxHeight)
             .onChange(of: transcriptText) { _ in
-                // Keep the latest text in view as it grows.
                 withAnimation(.easeOut(duration: 0.15)) {
                     proxy.scrollTo("bottom", anchor: .bottom)
                 }
