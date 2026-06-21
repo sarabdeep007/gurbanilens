@@ -314,8 +314,7 @@ final class AppContainer: ObservableObject {
         // "[DIAG] AppContainer.commitLiveStream skipping (state=idle)"
         // lines before the user gave up).
         session.setListening(
-            confirmedText: "",
-            unconfirmedText: "",
+            text: "",
             liveMatches: [],
             bufferEnergy: 0
         )
