@@ -1,0 +1,316 @@
+import Foundation
+import GurbaniLensCore
+import WhisperKit
+
+/// On-device WhisperKit ASR backend conforming to ``ASRProvider``.
+///
+/// Wraps `WhisperKit.AudioStreamTranscriber` with Phase A.3's filter
+/// stack (U+FFFD skip, hasDevanagari, "Waiting for speech…" blocklist,
+/// repetition guard, low-energy + sustained-silence guard, warmup grace
+/// for VAD-stop). All of that logic lived in `StreamingASR` through
+/// Phase A.3; Phase A.4a moved it here so the StreamingASR facade can
+/// pick a provider per `@AppStorage("settings.asrProvider")`.
+///
+/// **Model selection (Phase A.4a default = large-v3).** Caller passes
+/// a ``WhisperModel`` enum case. Whisper-large-v3 jumps significantly
+/// on Punjabi vs small (Phase 1 finding: large-v3 scored 96.6 on Japji
+/// recitation, small drifted to Telugu). First-time load downloads
+/// ~1.5 GB from `huggingface.co/argmaxinc/whisperkit-coreml`.
+public actor WhisperKitProvider: ASRProvider {
+
+    // MARK: - ASRProvider identity (nonisolated)
+
+    public nonisolated let providerId: ASRProviderId = .whisperKit
+    public nonisolated var displayName: String { "WhisperKit (\(model.shortDisplayName))" }
+    public nonisolated var requiresNetwork: Bool { false }  // only on first model fetch
+
+    // MARK: - Configuration
+
+    private let model: WhisperModel
+    private let language: String
+    private let silenceThreshold: Float
+
+    // MARK: - WhisperKit state
+
+    private var pipe: WhisperKit?
+    private var transcriber: AudioStreamTranscriber?
+    private var decodeOptions: DecodingOptions?
+
+    // MARK: - Streams
+
+    private var currentStream: AsyncStream<Partial>?
+    private var currentContinuation: AsyncStream<Partial>.Continuation?
+    /// Latest active stream of partial transcripts. Empty (`finished`)
+    /// before `start()` is first called and after `stop()`. Caller
+    /// pattern: call `start()`, then iterate `await provider.partials`.
+    public var partials: AsyncStream<Partial> {
+        currentStream ?? AsyncStream { $0.finish() }
+    }
+
+    // MARK: - Model download progress (Phase A.4a — coarse-grained)
+    //
+    // WhisperKit ≥ 1.0 doesn't expose per-byte progress through its
+    // public API; the closest is the `prewarm` / `load` knobs which
+    // either block or don't. We emit `0.0` when init starts and `1.0`
+    // when the pipe is loaded. A finer-grained progress hook is a
+    // Phase B improvement once we audit WhisperKit's download path.
+    private var downloadProgressContinuation: AsyncStream<Float>.Continuation?
+    private let downloadProgressStream: AsyncStream<Float>
+    public nonisolated let downloadProgress: AsyncStream<Float>
+
+    // MARK: - Filters & guards (Phase A.3 carry-over)
+
+    private static let placeholderBlocklist: [String] = [
+        "Waiting for speech",
+        "<|"
+    ]
+
+    private var energyHistory: [Float] = []
+    private var lastEmittedTextLength: Int = 0
+    private let energyHistorySize: Int = 8
+    private let lowEnergyThreshold: Float = 0.1
+
+    private var streamStartTime: Date?
+    private var maxEnergySeen: Float = 0
+    private let warmupGracePeriod: TimeInterval = 1.5
+    private let realAudioEnergyThreshold: Float = 0.1
+
+    // MARK: - Init
+
+    public init(
+        model: WhisperModel = .largeV3,
+        language: String = "pa",
+        silenceThreshold: Float = 0.6
+    ) {
+        self.model = model
+        self.language = (language == "pa") ? "hi" : language
+        self.silenceThreshold = silenceThreshold
+
+        // Set up the download-progress stream once at init so it can be
+        // observed for the lifetime of the provider.
+        let (dstream, dcont) = AsyncStream.makeStream(of: Float.self)
+        self.downloadProgressStream = dstream
+        self.downloadProgress = dstream
+        self.downloadProgressContinuation = dcont
+
+        if self.language != language {
+            NSLog("[DIAG] WhisperKitProvider.init language remap \(language) → \(self.language) (small-model Punjabi workaround)")
+        }
+        NSLog("[DIAG] WhisperKitProvider.init model=\(model.rawValue) silenceThreshold=\(silenceThreshold)")
+    }
+
+    // MARK: - ASRProvider
+
+    public func start() async throws {
+        // Create a fresh stream every start so a stale `finished`
+        // continuation from a previous `stop()` doesn't surface.
+        let (stream, cont) = AsyncStream.makeStream(of: Partial.self)
+        self.currentStream = stream
+        self.currentContinuation = cont
+
+        // Build / reuse the WhisperKit pipe.
+        let pipe: WhisperKit
+        if let existing = self.pipe {
+            pipe = existing
+        } else {
+            downloadProgressContinuation?.yield(0.0)
+            let compute = ModelComputeOptions(
+                melCompute: .cpuAndGPU,
+                audioEncoderCompute: .cpuAndNeuralEngine,
+                textDecoderCompute: .cpuAndNeuralEngine
+            )
+            let config = WhisperKitConfig(
+                model: model.rawValue,
+                modelFolder: nil,
+                computeOptions: compute,
+                verbose: false,
+                logLevel: .info,
+                prewarm: true,
+                load: true,
+                download: true
+            )
+            NSLog("[DIAG] WhisperKitProvider.start loading \(model.rawValue) (this may download ~\(model.approximateSize) on first launch)")
+            pipe = try await WhisperKit(config)
+            self.pipe = pipe
+            downloadProgressContinuation?.yield(1.0)
+            NSLog("[DIAG] WhisperKitProvider.start pipe loaded")
+        }
+
+        guard let tokenizer = pipe.tokenizer else {
+            throw WhisperKitProviderError.missingTokenizer
+        }
+
+        // Build DecodingOptions once per provider instance.
+        if self.decodeOptions == nil {
+            self.decodeOptions = DecodingOptions(
+                verbose: false,
+                task: .transcribe,
+                language: self.language,
+                temperature: 0.0,
+                temperatureIncrementOnFallback: 0.2,
+                temperatureFallbackCount: 5,
+                usePrefillPrompt: true,
+                detectLanguage: false,
+                skipSpecialTokens: true,
+                withoutTimestamps: true,
+                wordTimestamps: false,
+                suppressBlank: true,
+                compressionRatioThreshold: 2.0,
+                logProbThreshold: -1.0,
+                noSpeechThreshold: 0.45
+            )
+        }
+
+        // Reset per-session guards.
+        self.streamStartTime = Date()
+        self.maxEnergySeen = 0
+        self.energyHistory.removeAll(keepingCapacity: true)
+        self.lastEmittedTextLength = 0
+
+        let cb: AudioStreamTranscriberCallback = { [weak self] (old, new) in
+            Task { await self?.handleStateChange(old: old, new: new) }
+        }
+
+        let t = AudioStreamTranscriber(
+            audioEncoder: pipe.audioEncoder,
+            featureExtractor: pipe.featureExtractor,
+            segmentSeeker: pipe.segmentSeeker,
+            textDecoder: pipe.textDecoder,
+            tokenizer: tokenizer,
+            audioProcessor: pipe.audioProcessor,
+            decodingOptions: self.decodeOptions!,
+            requiredSegmentsForConfirmation: 2,
+            silenceThreshold: silenceThreshold,
+            compressionCheckWindow: 60,
+            useVAD: true,
+            stateChangeCallback: cb
+        )
+        self.transcriber = t
+
+        cont.onTermination = { @Sendable _ in
+            Task { await self.stop() }
+        }
+
+        NSLog("[DIAG] WhisperKitProvider.start streaming begins language=\(self.language) silenceThreshold=\(silenceThreshold)")
+
+        // Kick off the actual decode in a child Task so start() returns
+        // promptly. Errors finish the stream cleanly.
+        Task {
+            do {
+                try await t.startStreamTranscription()
+            } catch {
+                NSLog("[DIAG] WhisperKitProvider.startStreamTranscription threw: \(error.localizedDescription)")
+                self.finishStream()
+            }
+        }
+    }
+
+    public func stop() async {
+        guard let t = transcriber else { return }
+        NSLog("[DIAG] WhisperKitProvider.stop()")
+        Task { await t.stopStreamTranscription() }
+        transcriber = nil
+        currentContinuation?.finish()
+        currentContinuation = nil
+    }
+
+    // MARK: - Internals
+
+    public enum WhisperKitProviderError: LocalizedError {
+        case missingTokenizer
+        public var errorDescription: String? {
+            switch self {
+            case .missingTokenizer:
+                return "WhisperKit pipe has no tokenizer loaded — model download / load may have failed."
+            }
+        }
+    }
+
+    /// Static helper exposed for unit tests + reuse downstream.
+    public nonisolated static func hasDevanagari(_ s: String) -> Bool {
+        s.unicodeScalars.contains { scalar in
+            scalar.value >= 0x0900 && scalar.value <= 0x097F
+        }
+    }
+
+    private func handleStateChange(
+        old: AudioStreamTranscriber.State,
+        new: AudioStreamTranscriber.State
+    ) {
+        let currentText = new.currentText.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Filter 1 — Bug C: U+FFFD mid-grapheme replacement char.
+        if currentText.contains("\u{FFFD}") {
+            NSLog("[DIAG] WhisperKitProvider skipping partial — U+FFFD in currentText (len=\(currentText.count))")
+            return
+        }
+
+        // Filter 2 — Bug L / O: literal blocklist.
+        for prefix in Self.placeholderBlocklist {
+            if currentText.hasPrefix(prefix) {
+                NSLog("[DIAG] WhisperKitProvider placeholder blocklist matched (prefix=\"\(prefix)\")")
+                return
+            }
+        }
+
+        // Filter 3 — Bug O: non-empty text must contain Devanagari.
+        if !currentText.isEmpty && !Self.hasDevanagari(currentText) {
+            NSLog("[DIAG] WhisperKitProvider placeholder filter suppressed non-Devanagari partial (head60=\"\(String(currentText.prefix(60)))\")")
+            return
+        }
+
+        // Filter 4 — Bug G: repetition hallucination.
+        if WhisperOneShot.isRepetitionHallucination(currentText) {
+            NSLog("[DIAG] WhisperKitProvider suppressed repetition hallucination on partial (len=\(currentText.count))")
+            return
+        }
+
+        // Filter 5 — Bug G: sustained low-energy + text growth.
+        let energy = new.bufferEnergy.last ?? 0
+        energyHistory.append(energy)
+        if energyHistory.count > energyHistorySize {
+            energyHistory.removeFirst()
+        }
+        if energy > maxEnergySeen { maxEnergySeen = energy }
+        let sustainedLowEnergy = energyHistory.count >= energyHistorySize
+            && energyHistory.allSatisfy { $0 < lowEnergyThreshold }
+        let textGrew = currentText.count > lastEmittedTextLength
+        if sustainedLowEnergy && textGrew {
+            NSLog("[DIAG] WhisperKitProvider low-energy hallucination guard tripped — energy<\(lowEnergyThreshold) for \(energyHistorySize) partials, currentText grew \(lastEmittedTextLength)→\(currentText.count)")
+            return
+        }
+        lastEmittedTextLength = currentText.count
+
+        let latin = Latin.from(currentText)
+        let gurmukhi = Gurmukhi.fromDevanagari(currentText)
+
+        let partial = Partial(
+            text: currentText,
+            latin: latin,
+            gurmukhi: gurmukhi,
+            isSpeaking: new.isRecording,
+            bufferEnergy: energy
+        )
+
+        NSLog("[DIAG] WhisperKitProvider partial isSpeaking=\(new.isRecording) text.len=\(currentText.count) latin.head60=\"\(String(latin.prefix(60)))\" gurmukhi.head60=\"\(String(gurmukhi.prefix(60)))\" energy=\(String(format: "%.3f", energy))")
+
+        currentContinuation?.yield(partial)
+
+        // Bug M: VAD-stop gate.
+        if !new.isRecording && old.isRecording {
+            let elapsed = streamStartTime.map { Date().timeIntervalSince($0) } ?? 0
+            let realAudio = maxEnergySeen > realAudioEnergyThreshold
+            if elapsed < warmupGracePeriod && !realAudio {
+                NSLog("[DIAG] WhisperKitProvider VAD-stop SUPPRESSED (warmup or no-real-audio: elapsedMs=\(Int(elapsed * 1000)) maxEnergy=\(String(format: "%.3f", maxEnergySeen)))")
+            } else {
+                NSLog("[DIAG] WhisperKitProvider VAD-stop detected, finishing stream (elapsedMs=\(Int(elapsed * 1000)) maxEnergy=\(String(format: "%.3f", maxEnergySeen)))")
+                finishStream()
+            }
+        }
+    }
+
+    private func finishStream() {
+        currentContinuation?.finish()
+        currentContinuation = nil
+    }
+}
