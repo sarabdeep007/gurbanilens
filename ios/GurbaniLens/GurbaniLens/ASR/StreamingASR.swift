@@ -45,7 +45,12 @@ public actor StreamingASR {
 
     // MARK: - Provider lookup
 
-    private let provider: any ASRProvider
+    /// Explicitly nonisolated so the `nonisolated var activeProviderId`
+    /// getter (and friends) can read it without a Swift 6 actor-isolation
+    /// diagnostic. `any ASRProvider` is Sendable (ASRProvider: Actor →
+    /// Sendable) and the property is `let`, both prerequisites for
+    /// nonisolated stored access.
+    private nonisolated let provider: any ASRProvider
     private var streamInFlight: Bool = false
 
     /// Read the provider id from `@AppStorage` synchronously. UserDefaults

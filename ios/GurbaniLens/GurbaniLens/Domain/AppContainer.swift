@@ -339,10 +339,15 @@ final class AppContainer: ObservableObject {
         // refuse the commit (Deep's 2026-06-20 log: three consecutive
         // "[DIAG] AppContainer.commitLiveStream skipping (state=idle)"
         // lines before the user gave up).
+        //
+        // Explicit `[Match]()` rather than `[]` and explicit `Float(0)`
+        // so type inference can't get confused by the parallel A.4a/A.4b
+        // merge — Xcode 16 has been seen to fail to infer empty-literal
+        // types in some merge-conflict-adjacent contexts.
         session.setListening(
             text: "",
-            liveMatches: [],
-            bufferEnergy: 0
+            liveMatches: [Match](),
+            bufferEnergy: Float(0)
         )
 
         do {
