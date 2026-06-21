@@ -1,6 +1,8 @@
 # GurbaniLens — STATUS
 
-_Last updated: 2026-06-21 by Claude (iOS agent) — Phase A.3 **architectural reset**: dropped the WhisperKit segment-split that was producing concatenated junk; v2 now flows `State.currentText` directly. LiveResultsScreen rebuilt for Amrit-Kirtan-style bounded header + prominent results list. unsafeForcedSync resolved._
+_Last updated: 2026-06-21 by Claude (android-build agent) — **Android v1 APK builds clean on the headless build host** after reviving a previously OOM-killed build. Debug APK at `android/app/build/outputs/apk/debug/app-debug.apk` (372 MB) bundles SGGS sqlite + Whisper ggml-base.bin + 4-ABI libwhisper.so. Port-parity tests 11/11 PASS. QA session [cmqn4w13j007zwezdbi02ielh](https://qa.taajsingh.com/sessions/cmqn4w13j007zwezdbi02ielh) seeded for Deep to sideload + real-device test._
+
+_Prior: 2026-06-21 by Claude (iOS agent) — Phase A.3 **architectural reset**: dropped the WhisperKit segment-split that was producing concatenated junk; v2 now flows `State.currentText` directly. LiveResultsScreen rebuilt for Amrit-Kirtan-style bounded header + prominent results list. unsafeForcedSync resolved._
 
 This is the up-to-the-minute state file. CLAUDE.md is the durable project doc; STATUS.md is for "what's happening right now."
 
@@ -89,6 +91,14 @@ Pivoted from "continuous-listen Paath companion" on **2026-06-17**. Original Pha
   - Replace `MockAsr` in `MainActivity` with `WhisperAsr.fromAssetOrNull(...)` once Robolectric + UI smoke runs land. JNI wiring + model are in place; just the activity wire-up.
   - Bundle the Anvaad-trimmed `app_database.sqlite` (~77 MB) into `app/src/main/assets/sggs.sqlite` once the build pipeline produces it. Right now `AndroidAssetCorpus` falls back to an empty matcher when the asset is absent; users see "no results" until then.
   - Move JNI prebuilt source off the 2023 litongjava demo to either (a) self-built NDK CMake against whisper.cpp upstream (gets us `language="pa"` + fixed seed) or (b) a more recent community AAR. Current deviation documented in `WhisperLib.kt` class kdoc.
+- 🟡 **Android v1 APK build revival** (2026-06-21, this dispatch):
+  - **Build host RAM** is 3.7 GB + 2 GB swap with sibling Claude agents resident (~1.5 GB collective RSS). Previous dispatch's `org.gradle.jvmargs=-Xmx4g` + `parallel=true` + Kotlin daemon = three concurrent ~1.5 GB JVMs that the kernel OOM-killed mid-build. Reset to `-Xmx1700m`, `parallel=false`, `workers.max=1`, `kotlin.compiler.execution.strategy=in-process`. Builds clean on this host now; bigger machines can override the strategy via env var.
+  - **Material Icons swap**: `material-icons-extended` (~30 MB of generated Kotlin for 5000+ icons) was OOM-killing the dex merger. Swapped to `material-icons-core` for Check/Close/Settings/Share/Refresh/ArrowBack; added a single hand-vectored `res/drawable/ic_mic.xml` for the only non-core icon the app uses (Mic).
+  - **Asset compression**: added `androidResources { noCompress.addAll(listOf("sqlite", "bin")) }`. Three wins: SQLite is mmap-able from the APK (no first-launch 158 MB copy), Whisper .bin doesn't waste cycles deflating already-packed weights, and crucially the packager streams asset bytes straight to the APK zip instead of buffering the deflate output (the OOM trigger on the final `packageDebug` task).
+  - **Debug-only `ui-tooling` removed**: bring it back when building on a beefier machine if you want `@Preview` to render in Android Studio. Production app is unaffected — `ui-tooling-preview` (the runtime stub) stays.
+  - **APK contents verified via `aapt dump badging`**: package `com.taajsingh.gurbanilens`, version `0.1.0-v1-alpha`, minSdk 26 / targetSdk 34, `RECORD_AUDIO` permission present, label "GurbaniLens", all 4 ABIs of `libwhisper.so` + `ggml-base.bin` + `sggs.sqlite` present inside the zip (`unzip -l`).
+  - **Port-parity preserved**: `:core:test` PASSES (single parametrized test runs all 11 vectors against the canonical Python source-of-truth).
+  - **NOT FIXED**: `MainActivity` still wires `MockAsr`. Real-device test under QA session [cmqn4w13j007zwezdbi02ielh](https://qa.taajsingh.com/sessions/cmqn4w13j007zwezdbi02ielh) validates install + launch + permission + recording UI; full Mool-Mantar end-to-end waits for the WhisperAsr wire-up.
 
 ---
 
