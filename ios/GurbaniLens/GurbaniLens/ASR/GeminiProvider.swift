@@ -219,7 +219,8 @@ public actor GeminiProvider: ASRProvider {
         let snapshotEnergy = lastEnergy
         let snapshotSpeaking = lastIsSpeaking
         let task = Task { [weak self] in
-            await self?.transcribeChunk(pcm: pcm, energy: snapshotEnergy, isSpeaking: snapshotSpeaking)
+            guard let self else { return }
+            await self.transcribeChunk(pcm: pcm, energy: snapshotEnergy, isSpeaking: snapshotSpeaking)
         }
         inFlightTasks.append(task)
     }
