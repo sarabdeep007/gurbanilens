@@ -18,9 +18,12 @@ import com.taajsingh.gurbanilens.data.AndroidAssetCorpus
 import com.taajsingh.gurbanilens.domain.Asr
 import com.taajsingh.gurbanilens.domain.MockAsr
 import com.taajsingh.gurbanilens.domain.VoiceSearchSession
+import com.taajsingh.gurbanilens.domain.WhisperAsr
 import com.taajsingh.gurbanilens.ui.AppNavGraph
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -49,11 +52,20 @@ class MainActivity : ComponentActivity() {
     private var matcher: Matcher? = null
     private var corpus: AndroidAssetCorpus? = null
 
-    // v1 wires a [MockAsr] when no whisper.cpp model is bundled. Once the
-    // model is dropped into assets and the JNI binding is loaded,
-    // WhisperAsr will replace this. The replacement is a deferred follow-up
-    // commit on this brief.
-    private val asr: Asr = MockAsr(canned = "ik onkar sat naam karataa purakh")
+    // Warmup the JNI Whisper context off the main thread the moment the
+    // activity is created so the user's first mic tap doesn't pay a 3-5 s
+    // cold-start tax. `fromAssetOrNull` returns null if either the bundled
+    // ggml-*.bin asset is missing or libwhisper.so failed to load — fall
+    // back to an empty-canned MockAsr so the app still launches cleanly
+    // and the UI surfaces "no matches" instead of crashing.
+    private val asrDeferred: Deferred<Asr> by lazy {
+        lifecycleScope.async(Dispatchers.IO) {
+            WhisperAsr.fromAssetOrNull(applicationContext) ?: run {
+                Log.w(TAG, "WhisperAsr unavailable; falling back to degraded MockAsr")
+                MockAsr(canned = "")
+            }
+        }
+    }
 
     private val micPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -64,6 +76,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Touch `asrDeferred` to kick off the Whisper warmup in the
+        // background. Result is consumed when the user taps the mic.
+        asrDeferred
         setContent {
             AppNavGraph(
                 session = session,
@@ -97,9 +112,10 @@ class MainActivity : ComponentActivity() {
                     session.setError("No audio captured. Try again.")
                     return@launch
                 }
-                session.runSearch(samples = samples, asr = asr, matcher = matcherInstance)
+                val asrInstance = asrDeferred.await()
+                session.runSearch(samples = samples, asr = asrInstance, matcher = matcherInstance)
             } catch (t: Throwable) {
-                Log.e("MainActivity", "search failed", t)
+                Log.e(TAG, "search failed", t)
                 session.setError(t.message ?: "Unknown error")
             }
         }
@@ -128,7 +144,7 @@ class MainActivity : ComponentActivity() {
                     corpus = c
                     Matcher.fromCorpus(c)
                 } catch (t: Throwable) {
-                    Log.w("MainActivity", "Corpus asset missing; matcher empty", t)
+                    Log.w(TAG, "Corpus asset missing; matcher empty", t)
                     Matcher.fromLines(emptyList())
                 }
                 matcher = built
@@ -147,6 +163,18 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         lifecycleScope.coroutineContext.cancelChildren()
+        runCatching {
+            // If the Whisper warmup completed before destroy, free its
+            // native context. If it was still in flight, cancelChildren
+            // above already cancelled the async so we have nothing to free.
+            if (asrDeferred.isCompleted && !asrDeferred.isCancelled) {
+                (asrDeferred.getCompleted() as? AutoCloseable)?.close()
+            }
+        }
         runCatching { corpus?.close() }
+    }
+
+    companion object {
+        private const val TAG = "MainActivity"
     }
 }
