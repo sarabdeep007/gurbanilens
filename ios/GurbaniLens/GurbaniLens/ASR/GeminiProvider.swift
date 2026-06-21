@@ -12,14 +12,17 @@ import GurbaniLensCore
 /// ``Partial`` per chunk so the live transcript view updates ~every 2-4
 /// seconds (vs Sarvam's ~sub-second).
 ///
-/// **API contract (verify against ai.google.dev/api/generate-content).**
+/// **API contract (per ai.google.dev/gemini-api/docs/audio).**
 ///   - Endpoint: `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=<KEY>`
+///   - Field names use **camelCase** — Google's REST gateway silently
+///     drops unknown snake_case keys (per LangChain4j #3559); send
+///     `inlineData` + `mimeType`, NOT `inline_data` + `mime_type`.
 ///   - Body:
 ///       { "contents": [{ "role": "user",
 ///                        "parts": [
 ///                          { "text": "<prompt>" },
-///                          { "inline_data": { "mime_type": "audio/wav",
-///                                             "data": "<base64>" } }
+///                          { "inlineData": { "mimeType": "audio/wav",
+///                                            "data": "<base64>" } }
 ///                        ] }],
 ///         "generationConfig": { "temperature": 0 } }
 ///   - Response: candidates[0].content.parts[0].text
@@ -238,13 +241,22 @@ public actor GeminiProvider: ASRProvider {
         components.queryItems = [URLQueryItem(name: "key", value: apiKey)]
         guard let url = components.url else { return }
 
+        // Field names MUST be camelCase. Google's REST gateway accepts
+        // unknown snake_case fields silently — it does NOT 4xx — so
+        // sending `inline_data` / `mime_type` results in the audio part
+        // being dropped server-side and the model being called with
+        // text-only input. Output is then either an empty response or
+        // a generic hallucination. Per official audio docs
+        // (ai.google.dev/gemini-api/docs/audio) the correct shape is
+        // `inlineData` + `mimeType`. See LangChain4j #3559 for the
+        // silent-drop bug pattern.
         let body: [String: Any] = [
             "contents": [[
                 "role": "user",
                 "parts": [
                     ["text": prompt],
-                    ["inline_data": [
-                        "mime_type": "audio/wav",
+                    ["inlineData": [
+                        "mimeType": "audio/wav",
                         "data": base64
                     ]]
                 ]
@@ -351,13 +363,15 @@ public actor GeminiProvider: ASRProvider {
         guard let url = components.url else { throw GeminiError.invalidEndpoint }
 
         let base64 = wav.base64EncodedString()
+        // camelCase required (see transcribeChunk above for context +
+        // ai.google.dev/gemini-api/docs/audio + LangChain4j #3559).
         let body: [String: Any] = [
             "contents": [[
                 "role": "user",
                 "parts": [
                     ["text": prompt],
-                    ["inline_data": [
-                        "mime_type": "audio/wav",
+                    ["inlineData": [
+                        "mimeType": "audio/wav",
                         "data": base64
                     ]]
                 ]
