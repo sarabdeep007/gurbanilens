@@ -39,6 +39,12 @@ struct LiveResultsScreen: View {
 
     private static let headerMaxHeight: CGFloat = 120
 
+    /// Phase A.4b — debug Compare button, unlocked by 5 taps on the
+    /// Settings → Version footer. When false the toolbar button is
+    /// hidden entirely (production users never see it).
+    @AppStorage("settings.debugCompareEnabled") private var debugCompareEnabled: Bool = false
+    @State private var showCompareSheet: Bool = false
+
     var body: some View {
         VStack(spacing: 0) {
             // Bounded transcript header.
@@ -77,6 +83,19 @@ struct LiveResultsScreen: View {
                 Button(action: onCancel) {
                     Image(systemName: "xmark").foregroundColor(Theme.onBackground)
                 }.accessibilityLabel("Cancel")
+            }
+            if debugCompareEnabled {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button(action: { showCompareSheet = true }) {
+                        Image(systemName: "rectangle.split.3x1")
+                            .foregroundColor(Theme.onBackground)
+                    }.accessibilityLabel("Compare providers (debug)")
+                }
+            }
+        }
+        .sheet(isPresented: $showCompareSheet) {
+            NavigationStack {
+                CompareScreen(onDismiss: { showCompareSheet = false })
             }
         }
     }

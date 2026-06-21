@@ -341,6 +341,71 @@ public actor SarvamProvider: ASRProvider {
         )
     }
 
+    // MARK: - Batch helper (used by CompareScreen)
+
+    /// REST batch endpoint for one-shot Saaras transcription. Streaming
+    /// is the live-search path; Compare mode (record-once-then-compare)
+    /// needs a synchronous request/response per recording.
+    ///
+    /// Endpoint: POST https://api.sarvam.ai/speech-to-text
+    ///   - multipart/form-data with `file` (WAV blob), `model`, `language_code`
+    ///   - header `api-subscription-key: <key>`
+    ///   - response JSON: { "transcript": "..." }
+    public static let batchEndpoint = "https://api.sarvam.ai/speech-to-text"
+
+    /// One-shot transcribe of a WAV blob via Sarvam's REST batch endpoint.
+    /// Used by ``CompareScreen``. Returns the transcript text (Gurmukhi
+    /// or Devanagari depending on what the model emits — caller routes
+    /// through `Latin.from` / `Gurmukhi.fromDevanagari` for display).
+    public nonisolated static func transcribeOneShot(
+        wav: Data,
+        apiKey: String,
+        endpoint: String = batchEndpoint,
+        model: String = defaultModel,
+        languageCode: String = "pa-IN",
+        urlSession: URLSession = .shared
+    ) async throws -> String {
+        if apiKey.isEmpty { throw SarvamError.missingApiKey }
+        guard let url = URL(string: endpoint) else { throw SarvamError.invalidEndpoint }
+
+        // Build a tiny multipart/form-data body.
+        let boundary = "Boundary-\(UUID().uuidString)"
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue(apiKey, forHTTPHeaderField: "api-subscription-key")
+        req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+
+        var body = Data()
+        func appendField(_ name: String, _ value: String) {
+            body.append("--\(boundary)\r\n".data(using: .utf8)!)
+            body.append("Content-Disposition: form-data; name=\"\(name)\"\r\n\r\n".data(using: .utf8)!)
+            body.append("\(value)\r\n".data(using: .utf8)!)
+        }
+        appendField("model", model)
+        appendField("language_code", languageCode)
+        body.append("--\(boundary)\r\n".data(using: .utf8)!)
+        body.append("Content-Disposition: form-data; name=\"file\"; filename=\"compare.wav\"\r\n".data(using: .utf8)!)
+        body.append("Content-Type: audio/wav\r\n\r\n".data(using: .utf8)!)
+        body.append(wav)
+        body.append("\r\n".data(using: .utf8)!)
+        body.append("--\(boundary)--\r\n".data(using: .utf8)!)
+        req.httpBody = body
+
+        let (data, response) = try await urlSession.data(for: req)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+        if status != 200 {
+            let bodyStr = String(data: data, encoding: .utf8) ?? ""
+            throw SarvamError.webSocketFailed(underlying: NSError(
+                domain: "SarvamProvider", code: status,
+                userInfo: [NSLocalizedDescriptionKey: "HTTP \(status): \(String(bodyStr.prefix(200)))"]
+            ))
+        }
+        guard let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return ""
+        }
+        return extractTranscript(from: dict) ?? ""
+    }
+
     private nonisolated static func sanitize(_ s: String) -> String {
         var out = s.trimmingCharacters(in: .whitespacesAndNewlines)
         // Drop common LLM/transcription prefixes that sometimes leak.
