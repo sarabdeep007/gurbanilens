@@ -272,19 +272,15 @@ final class AppContainer: ObservableObject {
         return one
     }
 
-    /// Get / build the v2 streaming ASR. Shares the WhisperKit pipe with
-    /// `ensureAsr()` so model load + CoreML cold-start are paid once
-    /// across both v1 and v2 modes. Silence-VAD threshold comes from
-    /// Settings (`settings.silenceThreshold`); see ``SilenceThresholdChoice``.
-    private func ensureStreamingAsr() async throws -> StreamingASR {
+    /// Get / build the v2 streaming ASR (Phase A.4a facade). The
+    /// underlying provider is selected from Settings — see
+    /// ``StreamingASR/init()``. WhisperKitProvider manages its own
+    /// WhisperKit pipe; v1's `WhisperOneShot` continues to manage its
+    /// own. The cold-start cost is paid once per provider; toggling
+    /// model size in Settings forces a re-load on the next session.
+    private func ensureStreamingAsr() -> StreamingASR {
         if let s = streamingAsr { return s }
-        let oneShot = ensureAsr()
-        let pipe = try await oneShot.sharedPipe()
-        let thresholdRaw = UserDefaults.standard.string(forKey: "settings.silenceThreshold")
-            ?? SilenceThresholdChoice.balanced.rawValue
-        let threshold = SilenceThresholdChoice(rawValue: thresholdRaw)?.value
-            ?? SilenceThresholdChoice.balanced.value
-        let s = StreamingASR(pipe: pipe, language: "pa", silenceThreshold: threshold)
+        let s = StreamingASR()
         streamingAsr = s
         return s
     }
@@ -320,7 +316,7 @@ final class AppContainer: ObservableObject {
         )
 
         do {
-            let asr = try await ensureStreamingAsr()
+            let asr = ensureStreamingAsr()
             let matcher = try ensureMatcher()
             try await session.startStreaming(asr: asr, matcher: matcher)
             NSLog("[DIAG] AppContainer.startLiveStreamAndAwait stream finished (VAD or stop)")
@@ -360,7 +356,7 @@ final class AppContainer: ObservableObject {
             return
         }
         do {
-            let asr = try await ensureStreamingAsr()
+            let asr = ensureStreamingAsr()
             let matcher = try ensureMatcher()
             let result = await session.commit(asr: asr, matcher: matcher)
             NSLog("[DIAG] AppContainer.commitLiveStream done matches=\(result.matches.count) preselected=\(preselected?.line.id ?? "nil")")
