@@ -70,9 +70,9 @@ public actor SarvamProvider: ASRProvider {
     // expressions. Swift requires default-argument symbols to be at least
     // as visible as the enclosing function — bumping these from private to
     // public is the minimum-friction fix and matches `batchEndpoint`.
-    public static let defaultEndpoint = URL(string: "wss://api.sarvam.ai/speech-to-text/streaming")!
+    public static let defaultEndpoint = URL(string: "wss://api.sarvam.ai/speech-to-text/ws")!
     public static let defaultModel = "saaras:v3"
-    public static let defaultLanguage = "pa"
+    public static let defaultLanguage = "pa-IN"
 
     private let endpoint: URL
     private let apiKey: String
@@ -127,10 +127,22 @@ public actor SarvamProvider: ASRProvider {
         self.partialsStream = stream
         self.partialsContinuation = cont
 
-        // Build WebSocket task with the API key on the upgrade request.
-        var req = URLRequest(url: endpoint)
+        // Build the WebSocket URL with config as query params — Sarvam
+        // does NOT take a JSON config message (that was the previous bug;
+        // it returned "bad response from server" on every config send).
+        // Per Sarvam docs + LiveKit / AVR / Rust SDK reference: pass
+        // model + language_code + high_vad_sensitivity in the URL.
+        var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false)
+        var queryItems = components?.queryItems ?? []
+        queryItems.append(URLQueryItem(name: "model", value: model))
+        queryItems.append(URLQueryItem(name: "language_code", value: language))
+        queryItems.append(URLQueryItem(name: "high_vad_sensitivity", value: "true"))
+        components?.queryItems = queryItems
+        guard let urlWithParams = components?.url else {
+            throw SarvamError.webSocketFailed(underlying: NSError(domain: "SarvamProvider", code: 1, userInfo: [NSLocalizedDescriptionKey: "Could not build URL with query params"]))
+        }
+        var req = URLRequest(url: urlWithParams)
         req.setValue(apiKey, forHTTPHeaderField: "api-subscription-key")
-        req.setValue(apiKey, forHTTPHeaderField: "Authorization") // some Sarvam endpoints use Bearer-style — send both, server picks one
 
         let urlSession = URLSession(configuration: .default)
         self.session = urlSession
@@ -138,27 +150,7 @@ public actor SarvamProvider: ASRProvider {
         self.task = wsTask
         wsTask.resume()
 
-        // Tell the server what's coming. Config message format follows
-        // Sarvam's documented streaming setup; adjust here if the live
-        // contract differs.
-        let configMessage: [String: Any] = [
-            "type": "config",
-            "model": model,
-            "language": language,
-            "encoding": "linear16",
-            "sample_rate": 16000,
-            "interim_results": true
-        ]
-        if let configData = try? JSONSerialization.data(withJSONObject: configMessage),
-           let configStr = String(data: configData, encoding: .utf8) {
-            do {
-                try await wsTask.send(.string(configStr))
-                NSLog("[DIAG] SarvamProvider config sent: \(configStr)")
-            } catch {
-                NSLog("[DIAG] SarvamProvider config send FAILED: \(error.localizedDescription)")
-                throw SarvamError.webSocketFailed(underlying: error)
-            }
-        }
+        NSLog("[DIAG] SarvamProvider WS connecting to \(urlWithParams.absoluteString.replacingOccurrences(of: apiKey, with: "<KEY>"))")
 
         // Start the read loop and the mic uploader. Both are detached
         // Tasks; they share the `task` socket and exit when stop() is
