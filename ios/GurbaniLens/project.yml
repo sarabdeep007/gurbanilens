@@ -84,6 +84,20 @@ targets:
         product: GurbaniLensCore
       - package: WhisperKit
         product: WhisperKit
+    # Inject SARVAM_API_KEY + GEMINI_API_KEY from repo-root .env into the
+    # built Info.plist so SarvamProvider + GeminiProvider can read them
+    # via Bundle.main.object(forInfoDictionaryKey:). Wired here as a
+    # postBuildScript so it runs after the Info.plist is copied into the
+    # .app and before code signing — the signed bundle includes our
+    # additions. The script is a no-op when .env is missing or the keys
+    # are blank; cloud providers will surface "missing key" at start
+    # time and the user falls back to WhisperKit via Settings.
+    postBuildScripts:
+      - name: Inject .env keys into Info.plist
+        runOnlyWhenInstalling: false
+        showEnvVars: false
+        script: |
+          "$SRCROOT/../../scripts/inject_env_to_plist.sh"
     settings:
       base:
         TARGETED_DEVICE_FAMILY: "1,2"  # iPhone + iPad
