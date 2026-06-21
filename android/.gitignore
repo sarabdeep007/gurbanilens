@@ -11,7 +11,13 @@ captures/
 *.aab
 *.keystore
 
-# Bundled SGGS SQLite — over GitHub 100 MB per-file limit until the Anvaad-trimmed
-# build pipeline produces a ~77 MB artifact. Do NOT commit this asset directly.
+# Native and large binary deps — fetched on demand by scripts/fetch_android_deps.sh.
+# Each of these is too large for the GitHub 100 MB per-file limit, or otherwise
+# externally sourced. Do NOT commit them directly.
+app/src/main/jniLibs/
+app/src/main/assets/ggml-*.bin
 app/src/main/assets/sggs.sqlite
+
+# Kotlin compiler scratch
+.kotlin/
 

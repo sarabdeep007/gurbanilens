@@ -73,8 +73,20 @@ class WhisperAsr private constructor(
     companion object {
         private const val TAG = "WhisperAsr"
 
-        /** Default bundled model filename in `app/src/main/assets/`. */
-        const val DEFAULT_MODEL_ASSET: String = "ggml-tiny.en.bin"
+        /**
+         * Default bundled model filename in `app/src/main/assets/`.
+         *
+         * Multilingual `ggml-base.bin` (~148 MB). The previous bundled
+         * `ggml-tiny.en.bin` was English-only and couldn't transcribe
+         * Punjabi — the multilingual base model is the smallest one that
+         * actually handles Punjabi input. The .so still passes
+         * `language="en"`; with a multilingual model that yields a
+         * Punjabi → English-Latin phonetic transcript, which is exactly
+         * the matcher's input format.
+         *
+         * Populated by `scripts/fetch_android_deps.sh`.
+         */
+        const val DEFAULT_MODEL_ASSET: String = "ggml-base.bin"
 
         /**
          * Build a [WhisperAsr] backed by a `ggml-*.bin` model bundled in

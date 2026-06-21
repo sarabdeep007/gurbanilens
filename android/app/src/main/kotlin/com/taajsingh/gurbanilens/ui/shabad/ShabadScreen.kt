@@ -154,10 +154,11 @@ private fun LineRow(
                     fontWeight = FontWeight.Medium,
                 )
             }
-            if (script != ScriptToggle.Gurmukhi && line.transliterationEn != null) {
+            val translit = line.transliterationEn
+            if (script != ScriptToggle.Gurmukhi && translit != null) {
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    text = line.transliterationEn,
+                    text = translit,
                     style = MaterialTheme.typography.bodyLarge,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     fontFamily = FontFamily.Monospace,
