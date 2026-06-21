@@ -64,9 +64,15 @@ public actor SarvamProvider: ASRProvider {
 
     // MARK: - Config
 
-    private static let defaultEndpoint = URL(string: "wss://api.sarvam.ai/speech-to-text/streaming")!
-    private static let defaultModel = "saaras:v3"
-    private static let defaultLanguage = "pa"
+    // Defaults exposed as `public static let` so the `public nonisolated
+    // static func transcribeOneShot(... model: String = defaultModel,
+    // ...)` batch helper below can reference them in its default-argument
+    // expressions. Swift requires default-argument symbols to be at least
+    // as visible as the enclosing function — bumping these from private to
+    // public is the minimum-friction fix and matches `batchEndpoint`.
+    public static let defaultEndpoint = URL(string: "wss://api.sarvam.ai/speech-to-text/streaming")!
+    public static let defaultModel = "saaras:v3"
+    public static let defaultLanguage = "pa"
 
     private let endpoint: URL
     private let apiKey: String
