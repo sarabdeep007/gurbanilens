@@ -12,7 +12,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.filled.Mic
+import androidx.compose.ui.res.painterResource
+import com.taajsingh.gurbanilens.R
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
@@ -102,7 +103,7 @@ fun HomeScreen(
                     contentAlignment = Alignment.Center,
                 ) {
                     Icon(
-                        imageVector = Icons.Default.Mic,
+                        painter = painterResource(id = R.drawable.ic_mic),
                         contentDescription = "Search by voice",
                         modifier = Modifier.size(72.dp),
                     )

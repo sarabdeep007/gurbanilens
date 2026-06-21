@@ -31,10 +31,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import com.taajsingh.gurbanilens.R
 import com.taajsingh.gurbanilens.domain.VoiceSearchSession
 import com.taajsingh.gurbanilens.ui.theme.GurbaniLensTheme
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -91,8 +93,8 @@ fun RecordingScreen(
                         .background(MaterialTheme.colorScheme.primary),
                     contentAlignment = Alignment.Center,
                 ) {
-                    androidx.compose.material3.Icon(
-                        imageVector = androidx.compose.material.icons.Icons.Default.Mic,
+                    Icon(
+                        painter = painterResource(id = R.drawable.ic_mic),
                         contentDescription = null,
                         tint = MaterialTheme.colorScheme.onPrimary,
                         modifier = Modifier.size(80.dp),

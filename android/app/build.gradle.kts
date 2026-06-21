@@ -51,12 +51,23 @@ android {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
-        // Don't compress the bundled SQLite asset — lets the SQLite driver
-        // mmap it from the APK directly. Whisper .bin model is already
-        // tightly packed; leave it uncompressed too for fast startup.
         jniLibs {
             useLegacyPackaging = false
         }
+    }
+
+    // Don't compress the bundled SQLite + Whisper ggml model assets:
+    //  1. SQLite must stay store-mode so the driver can mmap it from inside
+    //     the APK (compressed assets can't be mmap'd; the driver would have
+    //     to copy 158 MB to internal storage on first launch).
+    //  2. The .bin Whisper weights are already a tightly packed binary format;
+    //     compression adds no benefit and bloats the packager's working set.
+    //  3. Crucially, store-mode lets `packageDebug` stream the asset bytes
+    //     straight from disk into the APK zip instead of buffering the deflate
+    //     output in memory — without this the packager OOM-kills the Gradle
+    //     daemon on the 3.7 GB build host.
+    androidResources {
+        noCompress.addAll(listOf("sqlite", "bin"))
     }
 
     testOptions {
@@ -87,10 +98,19 @@ dependencies {
     implementation(libs.androidx.ui.graphics)
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
-    implementation(libs.androidx.material.icons.extended)
+    // Icons used by v1 (Mic / Settings / Close / Check / Share / Refresh /
+    // ArrowBack) all live in `material-icons-core`. The much larger
+    // `material-icons-extended` (~30 MB of generated Kotlin) was previously
+    // listed; on memory-constrained build hosts its dex/merge pass OOM-kills
+    // the Gradle daemon. Switched to core 2026-06-21.
+    implementation(libs.androidx.material.icons.core)
     implementation(libs.kotlinx.coroutines.android)
 
-    debugImplementation(libs.androidx.ui.tooling)
+    // ui-tooling brings the Android Studio @Preview runtime + Layout Inspector.
+    // It's debug-only and useful in the IDE, but it ~doubles the debug dex size
+    // and OOM-kills the dex merger on our 3.7 GB build host. Re-enable when
+    // building on a bigger machine if you want to use `@Preview` in Studio.
+    // debugImplementation(libs.androidx.ui.tooling)
 
     // Unit tests (host JVM). Robolectric lets us drive AudioRecord and
     // AssetManager without an emulator.
