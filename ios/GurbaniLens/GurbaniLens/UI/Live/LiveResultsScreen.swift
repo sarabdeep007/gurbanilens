@@ -1,76 +1,68 @@
 import SwiftUI
 import GurbaniLensCore
 
-/// Phase A v2 live search-as-you-speak screen. **Minimal foundation —
-/// Phase B will add the sticky animated header, VU underline, confirmed/
-/// unconfirmed text styling, list-diff animations, etc.** Per the Phase A
-/// dispatch the goal is correctness + plumbing, not polish.
+/// **Phase A.3 reset (2026-06-21).** Rebuilt for the Amrit-Kirtan-style
+/// layout Deep flagged: small bounded transcript area at the top, the
+/// candidate results list as the dominant content area, single Stop
+/// pill at the bottom. The previous Phase A header had no max-height
+/// and grew with concatenated junk, pushing the results list below the
+/// screen.
 ///
-/// Shows:
-///   - the running transcript text (confirmed + unconfirmed concatenated)
-///   - a plain List of liveMatches (Ang · Pankti · transliteration)
-///   - a Stop button → `onStop()` triggers commit + full fuzzy match
-///   - Cancel in the nav bar → `onCancel()` returns home
-///   - Tap a row → `onCommit(match)` runs commit then navigates to the
-///     tapped match's Shabad screen
+/// Layout:
+///   ┌────────────────────────────────┐
+///   │ ✕                              │   nav bar — cancel
+///   ├────────────────────────────────┤
+///   │ ਸ੍ਰੀ ਆਸਾ ਜੀ                    │   bounded scrollable header
+///   │ ਏਕ ਓਅੰਕਾਰ ਸਤਿ ਨਾਮ            │   max 120pt; scrolls to bottom
+///   ├────────────────────────────────┤   on new content
+///   │ N Shabads found                │   count line
+///   ├────────────────────────────────┤
+///   │ Ang … Pankti …                 │   List (LazyVStack), takes
+///   │ ਏਕ ਓਅੰਕਾਰ ਸਤਿ ਨਾਮੁ           │   remaining vertical space.
+///   │                                │   Empty state row when no
+///   │ Ang … Pankti …                 │   matches yet.
+///   │ ਆਸਾ ਮਹਲਾ ੧                   │
+///   │                                │
+///   │ …                              │
+///   ├────────────────────────────────┤
+///   │ [        Stop        ]         │   full-width pill
+///   └────────────────────────────────┘
 struct LiveResultsScreen: View {
     @ObservedObject var session: VoiceSearchSession
     let onStop: () -> Void
     let onCancel: () -> Void
     let onCommit: (Match) -> Void
 
+    private static let headerMaxHeight: CGFloat = 120
+
     var body: some View {
         VStack(spacing: 0) {
-            // Plain header — Phase B turns this into the sticky animated
-            // transcript with confirmed/unconfirmed colour split + VU bar.
+            // Bounded transcript header.
             transcriptHeader
+                .frame(maxWidth: .infinity)
+                .background(Theme.surface)
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+                .padding(.horizontal, 16)
+                .padding(.top, 8)
+
+            // Match count above list (Amrit-Kirtan-style "N Shabads found").
+            matchCountStrip
+                .padding(.horizontal, 16)
+                .padding(.top, 12)
+                .padding(.bottom, 4)
+
+            // Results list takes the remaining vertical space.
+            if liveMatches.isEmpty {
+                listeningEmptyState
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                resultsList
+            }
+
+            // Stop button — bottom-pinned full-width pill.
+            stopButton
                 .padding(.horizontal, 16)
                 .padding(.vertical, 12)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Theme.surface)
-
-            // Live results list. Phase B replaces with a LazyVStack +
-            // SwiftUI .transition + .animation for smooth row insert/move
-            // animations as the matcher refreshes.
-            List {
-                ForEach(liveMatches, id: \.line.id) { match in
-                    Button {
-                        onCommit(match)
-                    } label: {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Ang \(match.line.ang)" + (match.line.pangti.map { " · Pankti \($0)" } ?? ""))
-                                .font(.system(size: 13))
-                                .foregroundColor(Theme.onSurfaceVariant)
-                            Text(match.line.transliterationEn ?? match.line.gurmukhi)
-                                .font(.system(size: 16))
-                                .foregroundColor(Theme.onSurface)
-                                .multilineTextAlignment(.leading)
-                            Text(String(format: "FL score %.0f", match.score))
-                                .font(.system(size: 11))
-                                .foregroundColor(Theme.onSurfaceVariant)
-                        }
-                        .padding(.vertical, 4)
-                    }
-                    .buttonStyle(.plain)
-                    .listRowBackground(Theme.background)
-                }
-            }
-            .listStyle(.plain)
-            .scrollContentBackground(.hidden)
-
-            // Stop button. Always enabled while we're listening / committing.
-            Button(action: onStop) {
-                Text(stopLabel)
-                    .font(.system(size: 17, weight: .semibold))
-                    .foregroundColor(Theme.onPrimary)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 14)
-                    .background(Theme.primary)
-                    .clipShape(Capsule())
-            }
-            .padding(.horizontal, 24)
-            .padding(.bottom, 24)
-            .padding(.top, 12)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .themed()
@@ -85,32 +77,143 @@ struct LiveResultsScreen: View {
         }
     }
 
-    // MARK: - Subviews
+    // MARK: - Header
 
     private var transcriptHeader: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("You said:")
-                .font(.system(size: 13))
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("You said:")
+                        .font(.system(size: 13))
+                        .foregroundColor(Theme.onSurfaceVariant)
+                    Text(transcriptText.isEmpty ? "ਸੁਣ ਰਿਹਾ ਹਾਂ…" : transcriptText)
+                        .font(.system(size: 18, weight: .medium))
+                        .foregroundColor(Theme.onSurface)
+                        .multilineTextAlignment(.leading)
+                        .id("bottom")
+                }
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxHeight: Self.headerMaxHeight)
+            .onChange(of: transcriptText) { _ in
+                // Keep the latest text in view as it grows.
+                withAnimation(.easeOut(duration: 0.15)) {
+                    proxy.scrollTo("bottom", anchor: .bottom)
+                }
+            }
+        }
+    }
+
+    // MARK: - Match count
+
+    private var matchCountStrip: some View {
+        HStack {
+            Text(matchCountLabel)
+                .font(.system(size: 13, weight: .medium))
                 .foregroundColor(Theme.onSurfaceVariant)
-            Text(transcriptText.isEmpty ? "(listening…)" : transcriptText)
-                .font(.system(size: 17, design: .monospaced))
+            Spacer()
+        }
+    }
+
+    private var matchCountLabel: String {
+        let n = liveMatches.count
+        if n == 0 {
+            return isListening ? "Listening…" : "No matches yet"
+        }
+        return "\(n) Shabad\(n == 1 ? "" : "s") found"
+    }
+
+    // MARK: - Results list
+
+    private var resultsList: some View {
+        ScrollView {
+            LazyVStack(spacing: 8) {
+                ForEach(liveMatches, id: \.line.id) { match in
+                    Button {
+                        onCommit(match)
+                    } label: {
+                        liveMatchRow(match)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 12)
+        }
+    }
+
+    private func liveMatchRow(_ match: Match) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Ang \(match.line.ang)" + (match.line.pangti.map { " · Pankti \($0)" } ?? ""))
+                    .font(.system(size: 12))
+                    .foregroundColor(Theme.onSurfaceVariant)
+                Spacer()
+            }
+            Text(rowGurmukhi(match.line))
+                .font(.system(size: 18, weight: .medium))
                 .foregroundColor(Theme.onSurface)
                 .multilineTextAlignment(.leading)
+                .lineLimit(2)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Theme.surface)
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+
+    /// Prefer the Unicode Gurmukhi column once the Anvaad-augmented
+    /// app DB lands; until then fall back to the raw `gurmukhi` column
+    /// (Anmol Lipi, renders as Gurmukhi when the bundled font is
+    /// active). The dispatch explicitly forbids `transliterationEn`
+    /// here — Sangat want to see Gurmukhi, not Latin.
+    private func rowGurmukhi(_ line: Line) -> String {
+        if let unicode = line.gurmukhiUnicode, !unicode.isEmpty {
+            return unicode
+        }
+        return line.gurmukhi
+    }
+
+    // MARK: - Empty state row
+
+    private var listeningEmptyState: some View {
+        VStack(spacing: 8) {
+            Spacer()
+            Image(systemName: "ear")
+                .font(.system(size: 28))
+                .foregroundColor(Theme.onSurfaceVariant)
+            Text("Listening for kirtan…")
+                .font(.system(size: 15))
+                .foregroundColor(Theme.onSurfaceVariant)
+            Text("Speak a line of Gurbani.")
+                .font(.system(size: 13))
+                .foregroundColor(Theme.onSurfaceVariant.opacity(0.7))
+            Spacer()
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    // MARK: - Stop button
+
+    private var stopButton: some View {
+        Button(action: onStop) {
+            Text(stopLabel)
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundColor(Theme.onPrimary)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 14)
+                .background(Theme.primary)
+                .clipShape(Capsule())
         }
     }
 
     // MARK: - Derived state
 
-    /// Header text. Bug H — translate Devanagari source from
-    /// `.listening` into Gurmukhi at render time. `.committing.query`
-    /// is already Gurmukhi (transliterated in VoiceSearchSession.commit
-    /// before transitioning).
     private var transcriptText: String {
         switch session.state {
-        case .listening(let c, let u, _, _):
-            let cG = Gurmukhi.fromDevanagari(c)
-            let uG = Gurmukhi.fromDevanagari(u)
-            return (cG + " " + uG).trimmingCharacters(in: .whitespacesAndNewlines)
+        case .listening(let t, _, _):
+            return t
         case .committing(let q):
             return q
         default:
@@ -119,8 +222,13 @@ struct LiveResultsScreen: View {
     }
 
     private var liveMatches: [Match] {
-        if case .listening(_, _, let m, _) = session.state { return m }
+        if case .listening(_, let m, _) = session.state { return m }
         return []
+    }
+
+    private var isListening: Bool {
+        if case .listening = session.state { return true }
+        return false
     }
 
     private var stopLabel: String {
