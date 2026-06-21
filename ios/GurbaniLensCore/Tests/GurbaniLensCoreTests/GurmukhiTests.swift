@@ -74,12 +74,18 @@ final class GurmukhiTests: XCTestCase {
         // Whisper-small produces. Should map cleanly to Gurmukhi.
         let dev = "तत् ट्वम् असि"
         let gur = Gurmukhi.fromDevanagari(dev)
-        // We don't assert the exact output here (font-dependent), but
-        // assert (a) no U+FFFD bleeds through, (b) length is roughly
-        // preserved, (c) every Devanagari scalar is gone, (d) some
-        // Gurmukhi scalars appear.
+        // We don't assert exact grapheme equality — Swift's grapheme
+        // clustering can differ slightly between the two scripts for the
+        // same logical syllables, so `.count` (which returns Characters,
+        // not scalars) may differ by ±1 across the mapping. Assert
+        // instead that:
+        //   (a) no U+FFFD bleeds through,
+        //   (b) scalar count is preserved (every Devanagari scalar maps
+        //       to exactly one Gurmukhi scalar; ASCII pass-through),
+        //   (c) every Devanagari scalar is gone,
+        //   (d) some Gurmukhi scalars appear.
         XCTAssertFalse(gur.contains("\u{FFFD}"))
-        XCTAssertEqual(gur.count, dev.count)
+        XCTAssertEqual(gur.unicodeScalars.count, dev.unicodeScalars.count)
         for scalar in gur.unicodeScalars {
             if scalar.value >= 0x0900 && scalar.value <= 0x097F {
                 XCTFail("Devanagari scalar leaked into Gurmukhi output: U+\(String(scalar.value, radix: 16))")
