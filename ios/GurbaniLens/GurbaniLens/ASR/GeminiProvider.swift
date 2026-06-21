@@ -288,22 +288,13 @@ public actor GeminiProvider: ASRProvider {
         }
     }
 
-    // MARK: - Pure parsing helpers (exposed for tests)
+    // MARK: - Pure parsing helpers (thin wrappers over CloudParsing)
 
     /// Pull the text out of a Gemini `generateContent` JSON response.
-    /// Returns nil if no `candidates[0].content.parts[].text` is present.
+    /// Thin wrapper over ``CloudParsing/extractGeminiText`` (testable
+    /// via swift test against GurbaniLensCore).
     public nonisolated static func extractText(fromResponseJson data: Data) -> String? {
-        guard let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-        guard let candidates = parsed["candidates"] as? [[String: Any]],
-              let first = candidates.first,
-              let content = first["content"] as? [String: Any],
-              let parts = content["parts"] as? [[String: Any]] else {
-            return nil
-        }
-        let collected = parts.compactMap { $0["text"] as? String }
-            .joined(separator: " ")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return sanitize(collected).isEmpty ? nil : sanitize(collected)
+        return CloudParsing.extractGeminiText(fromResponseJson: data)
     }
 
     /// Build a ``Partial`` for an arbitrary accumulated Gemini transcript.
@@ -335,45 +326,10 @@ public actor GeminiProvider: ASRProvider {
     }
 
     /// Join the running accumulated transcript with the latest chunk.
-    /// Gemini returns each chunk as its own complete transcript (not
-    /// incremental), so we concat with a separating space — but if the
-    /// new chunk already starts with the tail of the previous, we skip
-    /// the overlap to avoid duplicate words at chunk boundaries.
+    /// Thin wrapper over ``CloudParsing/joinAccumulator`` (testable via
+    /// swift test).
     public nonisolated static func joinAccumulator(prev: String, next: String) -> String {
-        let p = prev.trimmingCharacters(in: .whitespacesAndNewlines)
-        let n = next.trimmingCharacters(in: .whitespacesAndNewlines)
-        if p.isEmpty { return n }
-        if n.isEmpty { return p }
-        // Cheap overlap dedup: if the last 20 chars of prev appear at
-        // the start of next, drop the duplicate from next.
-        let tailLen = min(20, p.count)
-        let tail = String(p.suffix(tailLen))
-        if !tail.isEmpty && n.hasPrefix(tail) {
-            return p + String(n.dropFirst(tail.count))
-        }
-        return p + " " + n
-    }
-
-    private nonisolated static func sanitize(_ s: String) -> String {
-        var out = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        let dropPrefixes = ["Transcript:", "transcript:", "Text:", "Transcription:", "transcription:"]
-        for p in dropPrefixes where out.hasPrefix(p) {
-            out = String(out.dropFirst(p.count)).trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        // Strip a leading/trailing triple-backtick block — Gemini
-        // sometimes wraps output in ``` even when prompted not to.
-        if out.hasPrefix("```") {
-            // Drop the opening fence (and optional language tag) up to newline.
-            if let nl = out.firstIndex(of: "\n") {
-                out = String(out[out.index(after: nl)...])
-            } else {
-                out = String(out.dropFirst(3))
-            }
-        }
-        if out.hasSuffix("```") {
-            out = String(out.dropLast(3))
-        }
-        return out.trimmingCharacters(in: .whitespacesAndNewlines)
+        return CloudParsing.joinAccumulator(prev: prev, next: next)
     }
 
     /// Synchronous one-shot transcribe of a WAV blob. Used by

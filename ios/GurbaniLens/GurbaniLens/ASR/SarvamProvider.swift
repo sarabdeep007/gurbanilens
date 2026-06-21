@@ -273,45 +273,21 @@ public actor SarvamProvider: ASRProvider {
         partialsContinuation?.yield(partial)
     }
 
-    // MARK: - Pure parsing helpers (exposed for tests)
+    // MARK: - Pure parsing helpers (thin wrappers over CloudParsing)
 
     /// Pluck the transcript text out of a parsed Sarvam JSON envelope.
-    /// Handles the common shapes documented for the streaming endpoint
-    /// at the time of writing; falls back to the most likely candidate
-    /// keys if the wire format drifts. Returns nil when no plausible
-    /// transcript field is present.
+    /// Thin wrapper over ``CloudParsing/extractSarvamTranscript`` so the
+    /// provider keeps its own type-level API surface while the actual
+    /// parsing rules live in `GurbaniLensCore` (testable via swift test).
     public nonisolated static func extractTranscript(from dict: [String: Any]) -> String? {
-        if let s = dict["transcript"] as? String { return Self.sanitize(s) }
-        if let s = dict["text"] as? String { return Self.sanitize(s) }
-        if let data = dict["data"] as? [String: Any] {
-            if let s = data["transcript"] as? String { return Self.sanitize(s) }
-            if let s = data["text"] as? String { return Self.sanitize(s) }
-        }
-        if let results = dict["results"] as? [[String: Any]],
-           let first = results.first,
-           let alternatives = first["alternatives"] as? [[String: Any]],
-           let alt = alternatives.first,
-           let s = alt["transcript"] as? String { return Self.sanitize(s) }
-        return nil
+        return CloudParsing.extractSarvamTranscript(from: dict)
     }
 
-    public enum ScriptKind: String {
-        case gurmukhi
-        case devanagari
-        case other
-    }
+    /// Re-exported script kind to keep call-sites readable.
+    public typealias ScriptKind = CloudParsing.ScriptKind
 
     public nonisolated static func detectScript(_ text: String) -> ScriptKind {
-        var g = 0, d = 0
-        for scalar in text.unicodeScalars {
-            switch scalar.value {
-            case 0x0A00...0x0A7F: g += 1
-            case 0x0900...0x097F: d += 1
-            default: break
-            }
-        }
-        if g == 0 && d == 0 { return .other }
-        return g >= d ? .gurmukhi : .devanagari
+        return CloudParsing.detectScript(text)
     }
 
     /// Produce a fully-populated ``Partial`` from a raw Sarvam transcript.
@@ -321,7 +297,7 @@ public actor SarvamProvider: ASRProvider {
         isSpeaking: Bool,
         bufferEnergy: Float
     ) -> Partial {
-        let script = detectScript(raw)
+        let script = CloudParsing.detectScript(raw)
         let latin = Latin.from(raw)
         let gurmukhi: String
         switch script {
@@ -406,17 +382,4 @@ public actor SarvamProvider: ASRProvider {
         return extractTranscript(from: dict) ?? ""
     }
 
-    private nonisolated static func sanitize(_ s: String) -> String {
-        var out = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Drop common LLM/transcription prefixes that sometimes leak.
-        let dropPrefixes = ["Transcript:", "transcript:", "Text:"]
-        for p in dropPrefixes where out.hasPrefix(p) {
-            out = String(out.dropFirst(p.count)).trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        // Strip stray triple-backtick wrappers.
-        if out.hasPrefix("```") && out.hasSuffix("```") {
-            out = String(out.dropFirst(3).dropLast(3)).trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        return out
-    }
 }
