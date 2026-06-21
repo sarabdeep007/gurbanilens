@@ -43,37 +43,8 @@ import WhisperKit
 ///    below 0.1 AND text grew, suppress (mic-silence hallucination).
 public actor StreamingASR {
 
-    /// One incremental update from the streaming pipeline. **Single
-    /// `text` field** (Phase A.3 reset) — no confirmed / unconfirmed
-    /// split. WhisperKit's `currentText` is the authoritative live
-    /// transcript and we mirror it directly.
-    public struct Partial: Sendable {
-        /// `State.currentText` (Devanagari, trimmed, filtered).
-        public let text: String
-        /// `Latin.from(text)` — matcher input.
-        public let latin: String
-        /// `Gurmukhi.fromDevanagari(text)` — UI display.
-        public let gurmukhi: String
-        /// `State.isRecording`. False means VAD has stopped the stream OR
-        /// `stop()` was called.
-        public let isSpeaking: Bool
-        /// Last frame's energy (for VU bar). 0 if no buffer yet.
-        public let bufferEnergy: Float
-
-        public init(
-            text: String,
-            latin: String,
-            gurmukhi: String,
-            isSpeaking: Bool,
-            bufferEnergy: Float
-        ) {
-            self.text = text
-            self.latin = latin
-            self.gurmukhi = gurmukhi
-            self.isSpeaking = isSpeaking
-            self.bufferEnergy = bufferEnergy
-        }
-    }
+    // `Partial` moved to ASRProvider.swift as a top-level Sendable
+    // struct in Phase A.4a — pluggable providers share one type.
 
     public enum StreamingError: LocalizedError {
         case alreadyStreaming
