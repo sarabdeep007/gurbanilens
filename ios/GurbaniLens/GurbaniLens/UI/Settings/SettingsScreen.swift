@@ -69,10 +69,10 @@ enum TranslationChoice: String, CaseIterable, Identifiable {
 ///   2. Live silence sensitivity (loose / balanced / tight)
 ///   3. **Voice recognition** (Phase A.4a parent)
 ///       a. Local model (Whisper) — picker bound to settings.whisperModel
-///       b. (Phase A.4b will add Cloud sub-section here — DO NOT TOUCH)
+///       b. Cloud (Phase A.4b) — toggle + provider picker + free-trial counter
 ///   4. Default display script
 ///   5. Default translation
-///   6. About
+///   6. About (5-tap on Version unlocks Compare debug mode — Phase A.4b)
 struct SettingsScreen: View {
     let onBack: () -> Void
 
@@ -82,6 +82,18 @@ struct SettingsScreen: View {
     @AppStorage("settings.whisperModel") private var whisperModelRaw: String = WhisperModel.largeV3.rawValue
     @AppStorage("settings.script") private var scriptRaw: String = ScriptChoice.both.rawValue
     @AppStorage("settings.translation") private var translationRaw: String = TranslationChoice.manmohanSingh.rawValue
+
+    // Phase A.4b cloud + debug settings.
+    @AppStorage(CloudTrialPolicy.enabledKey) private var cloudEnabled: Bool = false
+    @AppStorage(CloudTrialPolicy.remainingKey) private var cloudFreeTrialRemaining: Int = CloudTrialPolicy.monthlyAllowance
+    @AppStorage(CloudTrialPolicy.lastResetMonthKey) private var lastTrialResetMonth: String = ""
+    @AppStorage("settings.debugCompareEnabled") private var debugCompareEnabled: Bool = false
+
+    // Local UI state for the version-tap unlock + trial-exhausted modal.
+    @State private var versionTapCount: Int = 0
+    @State private var versionTapLastTime: Date = .distantPast
+    @State private var showTrialExhaustedAlert: Bool = false
+    @State private var showDebugUnlockedAlert: Bool = false
 
     var body: some View {
         ScrollView(.vertical, showsIndicators: true) {
@@ -141,6 +153,30 @@ struct SettingsScreen: View {
                 }.accessibilityLabel("Back")
             }
         }
+        .onAppear {
+            // Roll the trial counter forward to the current month if we
+            // crossed a month boundary since last open.
+            CloudTrialPolicy.resetIfNewMonth(
+                lastResetMonth: $lastTrialResetMonth,
+                remaining: $cloudFreeTrialRemaining
+            )
+            // Normalise: if the user previously picked a cloud provider
+            // but cloudEnabled is off (e.g. fresh install / migration),
+            // snap asrProvider back to WhisperKit.
+            if !cloudEnabled && asrProviderRaw != ASRProviderId.whisperKit.rawValue {
+                asrProviderRaw = ASRProviderId.whisperKit.rawValue
+            }
+        }
+        .alert("Free trial used up", isPresented: $showTrialExhaustedAlert, actions: {
+            Button("OK") { showTrialExhaustedAlert = false }
+        }, message: {
+            Text("Your 50 free cloud searches this month are gone. Switch back to Local Whisper to keep searching offline — or purchase a subscription (coming soon).")
+        })
+        .alert("Compare mode unlocked", isPresented: $showDebugUnlockedAlert, actions: {
+            Button("OK") { showDebugUnlockedAlert = false }
+        }, message: {
+            Text("A Compare button is now visible in the Live Listening toolbar. Tap it to A/B test WhisperKit / Sarvam / Gemini on one recording.")
+        })
     }
 
     // MARK: - Voice recognition (Phase A.4a + A.4b shared parent)
@@ -163,9 +199,86 @@ struct SettingsScreen: View {
             // A.4a sub-section: Local model picker (Whisper).
             localModelSubsection
 
-            // Phase A.4b will append a "Cloud" sub-section here:
-            //   cloudRecognitionSubsection
+            // A.4b sub-section: Cloud provider toggle + picker + free-trial.
+            cloudRecognitionSubsection
         }
+    }
+
+    // A.4b-owned sub-section. Toggle defaults to OFF; flipping ON exposes
+    // a Sarvam / Gemini radio pair and binds the choice to
+    // settings.asrProvider. Flipping OFF snaps asrProvider back to
+    // WhisperKit so a stale cloud selection can't accidentally win when
+    // StreamingASR.init reads @AppStorage on the next live session.
+    private var cloudRecognitionSubsection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Cloud")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundColor(Theme.onSurfaceVariant)
+
+            Toggle(isOn: cloudEnabledBinding) {
+                Text("Cloud voice recognition")
+                    .font(.system(size: 16))
+                    .foregroundColor(Theme.onSurface)
+            }
+            .tint(Theme.primary)
+            .padding(.vertical, 4)
+
+            if cloudEnabled {
+                VStack(alignment: .leading, spacing: 4) {
+                    CloudProviderRow(
+                        title: ASRProviderId.sarvam.cloudDisplayName,
+                        subtitle: "Indian language SOTA, ₹30/hour",
+                        selected: asrProviderRaw == ASRProviderId.sarvam.rawValue,
+                        onTap: { asrProviderRaw = ASRProviderId.sarvam.rawValue }
+                    )
+                    CloudProviderRow(
+                        title: ASRProviderId.gemini.cloudDisplayName,
+                        subtitle: "Google multimodal, lower cost",
+                        selected: asrProviderRaw == ASRProviderId.gemini.rawValue,
+                        onTap: { asrProviderRaw = ASRProviderId.gemini.rawValue }
+                    )
+                }
+
+                HStack {
+                    Text("Free trial: \(cloudFreeTrialRemaining) of \(CloudTrialPolicy.monthlyAllowance) cloud searches this month")
+                        .font(.system(size: 12))
+                        .foregroundColor(cloudFreeTrialRemaining > 0
+                                         ? Theme.onSurfaceVariant
+                                         : .red)
+                    Spacer()
+                }
+                .padding(.top, 4)
+
+                Text("Cloud providers require internet. Your audio is sent to the provider — Sarvam (api.sarvam.ai) or Google (generativelanguage.googleapis.com) — and processed there. Local Whisper keeps audio fully on device.")
+                    .font(.system(size: 12))
+                    .foregroundColor(Theme.onSurfaceVariant)
+                    .padding(.top, 2)
+            } else {
+                Text("Off: voice search uses on-device Whisper only.")
+                    .font(.system(size: 12))
+                    .foregroundColor(Theme.onSurfaceVariant)
+                    .padding(.top, 2)
+            }
+        }
+    }
+
+    /// Bound toggle that snaps `asrProvider` back to `.whisperKit` on OFF
+    /// and (on first ON if nothing's selected) defaults to Sarvam.
+    private var cloudEnabledBinding: Binding<Bool> {
+        Binding(
+            get: { cloudEnabled },
+            set: { newValue in
+                cloudEnabled = newValue
+                if newValue {
+                    // Default cloud pick = Sarvam (better Punjabi).
+                    if asrProviderRaw == ASRProviderId.whisperKit.rawValue {
+                        asrProviderRaw = ASRProviderId.sarvam.rawValue
+                    }
+                } else {
+                    asrProviderRaw = ASRProviderId.whisperKit.rawValue
+                }
+            }
+        )
     }
 
     // A.4a-owned sub-section.
@@ -213,11 +326,92 @@ struct SettingsScreen: View {
             Text("ASR: WhisperKit (Whisper large-v3 default) · Matcher: rapidfuzz-equivalent Indel-LCS · SGGS data: shabados/database v4.8.7.")
                 .font(.system(size: 14))
                 .foregroundColor(Theme.onSurfaceVariant)
+            // Tapping the Version line 5 times within ~2 sec unlocks the
+            // Compare debug screen (multi-provider A/B test). Hidden so
+            // we don't expose it to end users; meant for Deep + future
+            // dataset-collection sevadaars.
+            Text(versionLine)
+                .font(.system(size: 12))
+                .foregroundColor(Theme.onSurfaceVariant.opacity(0.6))
+                .padding(.top, 4)
+                .contentShape(Rectangle())
+                .onTapGesture { handleVersionTap() }
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Theme.surface)
         .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var versionLine: String {
+        let v = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.0"
+        let b = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "1"
+        let debugSuffix = debugCompareEnabled ? " · debug" : ""
+        return "Version \(v) (\(b))\(debugSuffix)"
+    }
+
+    private func handleVersionTap() {
+        let now = Date()
+        if now.timeIntervalSince(versionTapLastTime) > 2.0 {
+            versionTapCount = 0
+        }
+        versionTapLastTime = now
+        versionTapCount += 1
+        if versionTapCount >= 5 {
+            versionTapCount = 0
+            if !debugCompareEnabled {
+                debugCompareEnabled = true
+                showDebugUnlockedAlert = true
+                NSLog("[DIAG] SettingsScreen debug Compare mode UNLOCKED (5-tap on version)")
+            } else {
+                debugCompareEnabled = false
+                NSLog("[DIAG] SettingsScreen debug Compare mode disabled (5-tap on version while enabled)")
+            }
+        }
+    }
+}
+
+// MARK: - Cloud provider row
+
+private struct CloudProviderRow: View {
+    let title: String
+    let subtitle: String
+    let selected: Bool
+    let onTap: () -> Void
+
+    var body: some View {
+        Button(action: onTap) {
+            HStack(alignment: .center, spacing: 12) {
+                Image(systemName: selected ? "largecircle.fill.circle" : "circle")
+                    .foregroundColor(selected ? Theme.primary : Theme.onSurfaceVariant)
+                    .font(.system(size: 20))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.system(size: 15, weight: selected ? .semibold : .regular))
+                        .foregroundColor(Theme.onSurface)
+                    Text(subtitle)
+                        .font(.system(size: 12))
+                        .foregroundColor(Theme.onSurfaceVariant)
+                }
+                Spacer()
+            }
+            .padding(.vertical, 6)
+            .padding(.horizontal, 4)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+// MARK: - Cloud provider display-name helper
+
+private extension ASRProviderId {
+    var cloudDisplayName: String {
+        switch self {
+        case .whisperKit: return "On-device Whisper"
+        case .sarvam:     return "Sarvam Saaras-v3"
+        case .gemini:     return "Gemini 2.5 Flash"
+        }
     }
 }
 
