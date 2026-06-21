@@ -80,13 +80,19 @@ public actor StreamingASR {
         switch providerId {
         case .whisperKit:
             self.provider = WhisperKitProvider(model: model, silenceThreshold: silenceThreshold)
-        case .sarvam, .gemini:
-            // Phase A.4b's parallel agent will instantiate the real
-            // cloud providers here. Until that merges, fall back to
-            // WhisperKit so the user still gets a working v2 session
-            // even if they flipped the provider in Settings.
-            NSLog("[DIAG] StreamingASR: provider \(providerId.rawValue) not yet implemented in A.4a — falling back to WhisperKit")
-            self.provider = WhisperKitProvider(model: model, silenceThreshold: silenceThreshold)
+        case .sarvam:
+            // Phase A.4b: real Sarvam Saaras-v3 streaming. API key
+            // injected at build time by scripts/inject_env_to_plist.sh
+            // (reads .env at repo root, writes SARVAM_API_KEY into the
+            // built Info.plist). If the key is missing, start() throws
+            // SarvamError.missingApiKey and the error propagates to
+            // session.setError — caller flips the Settings toggle off
+            // and the next session uses WhisperKit.
+            self.provider = SarvamProvider()
+        case .gemini:
+            // Phase A.4b: real Gemini 2.5 Flash chunked audio. Same
+            // .env injection contract + same missing-key error path.
+            self.provider = GeminiProvider()
         }
 
         NSLog("[DIAG] StreamingASR.init selectedProvider=\(providerId.rawValue) effectiveProvider=\(self.provider.providerId.rawValue) model=\(model.rawValue) silenceThreshold=\(silenceThreshold)")

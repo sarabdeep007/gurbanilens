@@ -385,6 +385,31 @@ final class AppContainer: ObservableObject {
         do {
             let asr = ensureStreamingAsr()
             let matcher = try ensureMatcher()
+            // Phase A.4b — spend a cloud trial credit BEFORE the commit
+            // network call if the active provider is cloud. By the time
+            // we reach commitLiveStream the cost has been incurred
+            // whether the matcher returns anything or not (Sarvam WS /
+            // Gemini chunked POSTs ran during the listening phase).
+            // Charging on commit keeps the counter honest. If the trial
+            // is already exhausted on entry, force the user back to
+            // Whisper + surface the message; don't run commit.
+            let activeProvider = asr.activeProviderId
+            if activeProvider != .whisperKit {
+                if let remaining = CloudTrialPolicy.tryConsume() {
+                    NSLog("[DIAG] AppContainer cloud trial consumed (provider=\(activeProvider.rawValue) remaining=\(remaining))")
+                    if remaining == 0 {
+                        CloudTrialPolicy.forceDisable()
+                        // Don't block this in-flight commit — the user
+                        // has already spoken; the result still lands.
+                        // Next session uses Whisper.
+                    }
+                } else {
+                    CloudTrialPolicy.forceDisable()
+                    clearStreamingAsr(reason: "cloudTrialExhausted")
+                    session.setError("Free cloud trial used up for this month. Switched back to Local Whisper — try again.")
+                    return
+                }
+            }
             let result = await session.commit(asr: asr, matcher: matcher)
             NSLog("[DIAG] AppContainer.commitLiveStream done matches=\(result.matches.count) preselected=\(preselected?.line.id ?? "nil")")
 
