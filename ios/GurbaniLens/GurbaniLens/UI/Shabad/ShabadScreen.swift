@@ -78,8 +78,8 @@ struct ShabadScreen: View {
         // Use Gurmukhi (Unicode if available, raw fallback) so the recipient
         // sees the actual Pangti. Translation isn't in our DB yet (see
         // STATUS.md — Anvaad-augmented build pending).
-        lines.map { $0.gurmukhiUnicode ?? $0.gurmukhi }.joined(separator: "\n") +
-            "\n\n— GurbaniLens"
+        lines.map { $0.gurmukhiUnicode ?? Gurmukhi.fromAnmolLipi($0.gurmukhi) }
+            .joined(separator: "\n") + "\n\n— GurbaniLens"
     }
 }
 
@@ -92,7 +92,7 @@ private struct LineRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             if script != .transliteration {
-                Text(line.gurmukhiUnicode ?? line.gurmukhi)
+                Text(line.gurmukhiUnicode ?? Gurmukhi.fromAnmolLipi(line.gurmukhi))
                     .font(.system(size: 22, weight: .medium))
                     .foregroundColor(Theme.onSurface)
             }

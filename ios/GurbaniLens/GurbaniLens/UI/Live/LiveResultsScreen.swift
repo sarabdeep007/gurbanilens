@@ -225,7 +225,12 @@ struct LiveResultsScreen: View {
         if let unicode = line.gurmukhiUnicode, !unicode.isEmpty {
             return unicode
         }
-        return line.gurmukhi
+        // line.gurmukhi is Anmol Lipi from the BaniDB-derived corpus —
+        // iOS's system font has no Anmol Lipi glyphs, so converting
+        // to proper Unicode Gurmukhi at display time is the price we
+        // pay until the corpus is pre-converted at build time.
+        // See GurbaniLensCore/AnmolLipi.swift (anvaad-js port).
+        return Gurmukhi.fromAnmolLipi(line.gurmukhi)
     }
 
     // MARK: - Empty state row

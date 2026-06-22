@@ -126,7 +126,7 @@ private struct MatchCard: View {
                             .clipShape(Capsule())
                     }
                 }
-                Text(match.line.transliterationEn ?? match.line.gurmukhi)
+                Text(match.line.transliterationEn ?? Gurmukhi.fromAnmolLipi(match.line.gurmukhi))
                     .font(.system(size: isTopMatch ? 22 : 17,
                                   weight: isTopMatch ? .medium : .regular))
                     .foregroundColor(Theme.onSurface)
