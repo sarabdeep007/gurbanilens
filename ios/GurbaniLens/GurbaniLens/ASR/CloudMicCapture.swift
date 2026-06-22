@@ -65,6 +65,13 @@ public final class CloudMicCapture {
     private var _isRunning: Bool = false
     private var notificationObservers: [NSObjectProtocol] = []
 
+    /// Diagnostic-only counter for `handleTapBuffer` invocations. Process-
+    /// wide static (across all CloudMicCapture instances within a run)
+    /// — fine because we recreate the object per session anyway. Used by
+    /// the [DIAG] logs to distinguish "tap fires once" vs "tap fires
+    /// repeatedly but yields stop" vs "converter starves" failure modes.
+    private static var tapCallCount: Int = 0
+
     /// Per-tap peak amplitude (0..1) for VU display.
     public var onPeak: ((Float) -> Void)?
 
@@ -226,6 +233,11 @@ public final class CloudMicCapture {
     }
 
     private func handleTapBuffer(_ buf: AVAudioPCMBuffer) {
+        Self.tapCallCount += 1
+        let tapNum = Self.tapCallCount
+        if tapNum <= 5 || tapNum % 50 == 0 {
+            NSLog("[DIAG] CloudMicCapture tap #\(tapNum) fired frames=\(buf.frameLength)")
+        }
         guard buf.format.commonFormat == .pcmFormatFloat32,
               let chanData = buf.floatChannelData,
               let nf = nativeFormat else {
@@ -299,12 +311,20 @@ public final class CloudMicCapture {
         }
         let status = converter.convert(to: outBuf, error: &error, withInputFrom: inputBlock)
         if status == .error || error != nil {
+            if tapNum <= 5 || tapNum % 50 == 0 {
+                NSLog("[DIAG] CloudMicCapture tap #\(tapNum) early-return: converter error=\(error?.localizedDescription ?? "nil") status=\(status.rawValue)")
+            }
             return
         }
 
         // Float32 → Int16 little-endian, in-place into a Data buffer.
         let outFrames = Int(outBuf.frameLength)
-        if outFrames == 0 { return }
+        if outFrames == 0 {
+            if tapNum <= 5 || tapNum % 50 == 0 {
+                NSLog("[DIAG] CloudMicCapture tap #\(tapNum) early-return: outFrames=0 (converter produced no output)")
+            }
+            return
+        }
         guard let chan = outBuf.floatChannelData?[0] else { return }
 
         var bytes = Data(count: outFrames * 2)
@@ -322,6 +342,9 @@ public final class CloudMicCapture {
         stateLock.lock()
         let cont = chunkContinuation
         stateLock.unlock()
+        if tapNum <= 5 || tapNum % 50 == 0 {
+            NSLog("[DIAG] CloudMicCapture tap #\(tapNum) yielding bytes=\(bytes.count) hasConsumer=\(cont != nil)")
+        }
         cont?.yield(bytes)
     }
 
