@@ -309,6 +309,12 @@ public final class CloudMicCapture {
             status.pointee = .haveData
             return inBuf
         }
+        // CRITICAL: reset converter state before each call. Without this,
+        // AVAudioConverter treats the `.endOfStream` from the previous
+        // tap's input block as a permanent terminal state and produces
+        // 0 output frames for every subsequent convert() — even with a
+        // fresh input buffer. See hotfix-6 diagnostic (commit 6bc62ae).
+        converter.reset()
         let status = converter.convert(to: outBuf, error: &error, withInputFrom: inputBlock)
         if status == .error || error != nil {
             if tapNum <= 5 || tapNum % 50 == 0 {
