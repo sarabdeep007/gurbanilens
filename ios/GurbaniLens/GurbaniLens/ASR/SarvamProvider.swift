@@ -70,7 +70,7 @@ public actor SarvamProvider: ASRProvider {
     // MARK: - Capture state
 
     private let capture: CloudMicCapture
-    private var bufferedPCM: Data = Data()
+    private let audioBuffer = SarvamAudioBuffer()
     private var audioConsumerTask: Task<Void, Never>?
 
     private var partialsContinuation: AsyncStream<Partial>.Continuation?
@@ -111,9 +111,10 @@ public actor SarvamProvider: ASRProvider {
         let (stream, cont) = AsyncStream.makeStream(of: Partial.self)
         self.partialsStream = stream
         self.partialsContinuation = cont
-        self.bufferedPCM = Data()
+        // Defensive reset in case a prior session left bytes around.
+        _ = audioBuffer.snapshotAndReset()
 
-        NSLog("[DIAG] SarvamProvider.start (batch mode) — buffering audio for REST batch on stop")
+        NSLog("[DIAG] SarvamProvider.start (batch mode) — buffering audio via SarvamAudioBuffer (lock-protected, off-actor)")
 
         do {
             let chunkStream = try capture.start()
@@ -126,11 +127,20 @@ public actor SarvamProvider: ASRProvider {
                 Task { await self.recordPeak(peak) }
             }
 
-            self.audioConsumerTask = Task { [weak self] in
-                guard let self else { return }
+            // Audio consumer runs OUTSIDE the actor (Task.detached) so the
+            // high-frequency chunk arrival is not gated on the actor's
+            // mailbox — see SarvamAudioBuffer comment + hotfix-5.
+            let buffer = self.audioBuffer
+            self.audioConsumerTask = Task.detached(priority: .userInitiated) {
+                var loopCount = 0
                 for await chunk in chunkStream {
-                    await self.appendAudio(chunk)
+                    buffer.append(chunk)
+                    loopCount += 1
+                    if loopCount <= 5 || loopCount % 50 == 0 {
+                        NSLog("[DIAG] SarvamProvider audioConsumer chunk #\(loopCount) size=\(chunk.count) bufferTotal=\(buffer.currentBytes)")
+                    }
                 }
+                NSLog("[DIAG] SarvamProvider audioConsumer loop EXITED totalChunks=\(loopCount) bufferTotal=\(buffer.currentBytes)")
             }
         } catch {
             NSLog("[DIAG] SarvamProvider capture.start FAILED: \(error.localizedDescription)")
@@ -145,14 +155,12 @@ public actor SarvamProvider: ASRProvider {
         capture.stop()
 
         // Drain the chunk consumer so the final tap-buffer makes it into
-        // bufferedPCM before we snapshot. capture.stop() finishes the
-        // AsyncStream's continuation; the for-await loop drains and
-        // exits. Awaiting the task value guarantees no chunks-in-flight.
+        // audioBuffer before we snapshot. capture.stop() finishes the
+        // AsyncStream's continuation; the for-await loop drains and exits.
         await audioConsumerTask?.value
         audioConsumerTask = nil
 
-        let pcm = bufferedPCM
-        bufferedPCM = Data()
+        let pcm = audioBuffer.snapshotAndReset()
 
         // Gate: 0.5 sec @ 16 kHz mono s16le = 16_000 bytes. Below that,
         // the user almost certainly tapped through by accident — skip
@@ -202,10 +210,6 @@ public actor SarvamProvider: ASRProvider {
     }
 
     // MARK: - Internals
-
-    private func appendAudio(_ chunk: Data) {
-        bufferedPCM.append(chunk)
-    }
 
     private func recordPeak(_ peak: Float) {
         let speaking = peak > 0.02
@@ -376,4 +380,37 @@ public actor SarvamProvider: ASRProvider {
         return extractTranscript(from: dict) ?? ""
     }
 
+}
+
+/// Lock-protected audio buffer that lives OUTSIDE SarvamProvider's actor
+/// isolation. The audio consumer Task can append chunks directly without
+/// hopping into the actor for every 100ms chunk — critical because the
+/// actor's mailbox is busy with recordPeak's high-frequency partial
+/// yields. See hotfix-5.
+private final class SarvamAudioBuffer: @unchecked Sendable {
+    private var data = Data()
+    private let lock = NSLock()
+    private(set) var chunkCount: Int = 0
+
+    func append(_ chunk: Data) {
+        lock.lock()
+        data.append(chunk)
+        chunkCount += 1
+        lock.unlock()
+    }
+
+    func snapshotAndReset() -> Data {
+        lock.lock()
+        let snapshot = data
+        data = Data()
+        chunkCount = 0
+        lock.unlock()
+        return snapshot
+    }
+
+    var currentBytes: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return data.count
+    }
 }
