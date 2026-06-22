@@ -145,6 +145,54 @@ final class MatchByFirstLettersTests: XCTestCase {
         XCTAssertGreaterThan(htQuery[0].score, htQuery[1].score)
     }
 
+    /// Sirlekh (section-header) lines must not appear in matcher results
+    /// even when their tiny first-letters trivially substring-match a
+    /// longer query. Deep's "ਹਮ ਰੁਲਤੇ ਫਿਰਤੇ" test returned 4× "Pauri ॥"
+    /// + 1× "Bhagat" — all Sirlekh, all scored 100.0, none useful. The
+    /// fix filters Sirlekh at Matcher init time. This test verifies via
+    /// `Matcher(prebuilt:)` which applies the same filter.
+    func testMatchByFirstLetters_sirlekhExcludedFromIndex() {
+        let sirlekh = Line(
+            id: "TEST_SIRLEKH",
+            shabadId: "TEST",
+            ang: 1, pangti: 1,
+            lineType: "Sirlekh",
+            gurmukhi: "pauri ||",
+            gurmukhiUnicode: nil,
+            transliterationEn: "Pauri |",
+            firstLetters: "p|",
+            orderId: 1
+        )
+        let content = Line(
+            id: "TEST_CONTENT",
+            shabadId: "TEST",
+            ang: 1, pangti: 2,
+            lineType: "Pankti",
+            gurmukhi: "test line",
+            gurmukhiUnicode: nil,
+            transliterationEn: "ham rulate phirate koee baat na puchata",
+            firstLetters: "hrpkbnp",
+            orderId: 2
+        )
+        let matcher = Matcher(prebuilt: [
+            (line: sirlekh, normalised: "pauri", tokens: ["pauri"]),
+            (line: content,
+             normalised: "ham rulate phirate koee baat na puchata",
+             tokens: ["ham","rulate","phirate","koee","baat","na","puchata"]),
+        ])
+
+        XCTAssertEqual(matcher.count, 1, "Sirlekh must be filtered out of the index")
+
+        // Long-query test — partial_ratio would have rated "p" 100.0
+        // against "hrpkbnp" pre-fix, putting Sirlekh on top.
+        let results = matcher.matchByFirstLetters(
+            "ham rulate phirate koee baat na puchata", topN: 5
+        )
+        XCTAssertEqual(results.count, 1, "only the content line remains after Sirlekh filter")
+        XCTAssertEqual(results.first?.line.id, "TEST_CONTENT")
+        XCTAssertNotEqual(results.first?.line.id, "TEST_SIRLEKH")
+    }
+
     /// Empty / whitespace-only / single-char queries must not crash and
     /// should return empty (or up to topN at zero score).
     func testMatchByFirstLetters_emptyOrTrivialQueries() {

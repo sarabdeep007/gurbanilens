@@ -67,8 +67,27 @@ public final class Matcher: @unchecked Sendable {
         var ts: [[String]] = []
         var fl: [String] = []
         var pfl: [String] = []
+        var skippedSirlekh = 0
+        var skippedNoTranslit = 0
         for line in try corpus.allLines() {
-            guard let translit = line.transliterationEn else { continue }
+            // Skip Sirlekh (section headers like "Pauri", "Salok",
+            // "Astpadi", "Ghar 2"). Their transliterations are 1–3
+            // letters so partial_ratio trivially returns 100 against
+            // any longer query — Deep's "ਹਮ ਰੁਲਤੇ ਫਿਰਤੇ" test (qFL
+            // ~7 chars) returned 4× "Pauri" + 1× "Bhagat" with all
+            // scores 100.0, zero actual pangti content in top-5.
+            // Voice search is always for content the user is
+            // reciting; section names are never a useful hit.
+            // Filtering at index time is the cleanest fix — keeps
+            // the scoring algorithm intact (port-parity preserved).
+            if Self.isSirlekh(line) {
+                skippedSirlekh += 1
+                continue
+            }
+            guard let translit = line.transliterationEn else {
+                skippedNoTranslit += 1
+                continue
+            }
             let normalized = normalize(translit)
             if normalized.isEmpty { continue }
             let toks = normalized.split(separator: " ").map { String($0) }
@@ -84,16 +103,28 @@ public final class Matcher: @unchecked Sendable {
         self.tokens = ts
         self.firstLetters = fl
         self.phoneticFirstLetters = pfl
+        NSLog("[DIAG] Matcher.init indexed=\(ls.count) skippedSirlekh=\(skippedSirlekh) skippedNoTranslit=\(skippedNoTranslit)")
     }
 
     /// Convenience init for tests / future use that bypasses Corpus.
+    /// Applies the same Sirlekh filter as ``init(corpus:)`` so test
+    /// behaviour matches production.
     public init(prebuilt: [(line: Line, normalised: String, tokens: [String])]) {
-        self.lines = prebuilt.map(\.line)
-        self.normalizedTexts = prebuilt.map(\.normalised)
-        self.tokens = prebuilt.map(\.tokens)
-        let fl = prebuilt.map { Self.firstLettersOf(tokens: $0.tokens) }
+        let filtered = prebuilt.filter { !Self.isSirlekh($0.line) }
+        self.lines = filtered.map(\.line)
+        self.normalizedTexts = filtered.map(\.normalised)
+        self.tokens = filtered.map(\.tokens)
+        let fl = filtered.map { Self.firstLettersOf(tokens: $0.tokens) }
         self.firstLetters = fl
         self.phoneticFirstLetters = fl.map { PhoneticEquivalence.canonicalize($0) }
+    }
+
+    /// Case-insensitive Sirlekh check — corpus may emit "Sirlekh",
+    /// "sirlekh", or the Anmol Lipi original "isrlyK"; only the
+    /// English label is normalised by `Corpus.allLines`, so a
+    /// lowercase compare on `lineType` covers it.
+    static func isSirlekh(_ line: Line) -> Bool {
+        return line.lineType?.lowercased() == "sirlekh"
     }
 
     public var count: Int { lines.count }
