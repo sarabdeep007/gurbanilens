@@ -98,6 +98,12 @@ public actor StreamingASR {
             // Phase A.4b: real Gemini 2.5 Flash chunked audio. Same
             // .env injection contract + same missing-key error path.
             self.provider = GeminiProvider()
+        case .dual:
+            // Phase A.4d: WhisperKit-small live + Sarvam refine. Single
+            // mic stream fans out via ChunkBroadcaster to both. Cloud
+            // half still needs SARVAM_API_KEY; on-device half loads the
+            // Whisper small model on first start (~150 MB).
+            self.provider = DualLiveProvider()
         }
 
         NSLog("[DIAG] StreamingASR.init selectedProvider=\(providerId.rawValue) effectiveProvider=\(self.provider.providerId.rawValue) model=\(model.rawValue) silenceThreshold=\(silenceThreshold)")

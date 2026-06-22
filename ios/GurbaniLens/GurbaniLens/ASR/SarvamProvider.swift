@@ -72,6 +72,11 @@ public actor SarvamProvider: ASRProvider {
     // MARK: - Streaming state
 
     private let capture: CloudMicCapture
+    /// When non-nil, ``start()`` skips `capture.start()` and uses this
+    /// pre-built stream as the audio source. Set by ``DualLiveProvider``
+    /// so a single ``CloudMicCapture`` feeds both Whisper + Sarvam via a
+    /// ``ChunkBroadcaster``. Cleared on stop().
+    private var externalAudioStream: AsyncStream<Data>?
     private var handler: SarvamStreamingHandler?
     private var audioConsumerTask: Task<Void, Never>?
 
@@ -103,6 +108,15 @@ public actor SarvamProvider: ASRProvider {
         } else {
             NSLog("[DIAG] SarvamProvider.init model=\(self.model) language=\(self.language) keyLen=\(self.apiKey.count)")
         }
+    }
+
+    /// **Dual-provider hook.** Inject an externally-managed audio stream
+    /// (typically from a ``ChunkBroadcaster`` consumer) before
+    /// ``start()`` is called. The provider will skip its own
+    /// `CloudMicCapture.start()` and consume the supplied stream
+    /// instead. Pass nil to clear and fall back to owning capture.
+    public func useExternalAudioStream(_ stream: AsyncStream<Data>?) {
+        self.externalAudioStream = stream
     }
 
     // MARK: - ASRProvider lifecycle
@@ -146,23 +160,41 @@ public actor SarvamProvider: ASRProvider {
             url: url,
             apiKey: apiKey,
             onPartial: { partial in
-                contRef.yield(partial)
+                // Re-wrap with .sarvam source so DualLiveProvider /
+                // VoiceSearchSession can tell who emitted which partial.
+                let tagged = Partial(
+                    text: partial.text,
+                    latin: partial.latin,
+                    gurmukhi: partial.gurmukhi,
+                    isSpeaking: partial.isSpeaking,
+                    bufferEnergy: partial.bufferEnergy,
+                    source: .sarvam
+                )
+                contRef.yield(tagged)
             }
         )
         self.handler = h
         h.connect()
 
         do {
-            let chunkStream = try capture.start()
-
-            // Per-tap VU peak → forward as a transcript-less Partial so
-            // the level meter animates. The Bug-B freeze-last-good guard
-            // in VoiceSearchSession.startStreaming (gurmukhi.count shrink
-            // check) prevents these empty-text partials from clobbering
-            // accumulated transcript text on the UI side.
-            capture.onPeak = { [weak self] peak in
-                guard let self else { return }
-                Task { await self.recordPeak(peak) }
+            // Two audio paths:
+            //   1. external (dual-provider mode) — broadcaster already
+            //      owns the CloudMicCapture; skip our own.
+            //   2. own capture (sarvam-only mode) — behaviour as before.
+            let chunkStream: AsyncStream<Data>
+            if let external = externalAudioStream {
+                NSLog("[DIAG] SarvamProvider using EXTERNAL audio stream (dual-provider mode)")
+                chunkStream = external
+            } else {
+                chunkStream = try capture.start()
+                // Per-tap VU peak → forward as a transcript-less Partial
+                // so the level meter animates. Bug-B freeze-last-good in
+                // VoiceSearchSession prevents these empty-text partials
+                // from clobbering accumulated transcript text.
+                capture.onPeak = { [weak self] peak in
+                    guard let self else { return }
+                    Task { await self.recordPeak(peak) }
+                }
             }
 
             // Audio consumer runs OUTSIDE the actor (Task.detached) so the
@@ -192,12 +224,17 @@ public actor SarvamProvider: ASRProvider {
     }
 
     public func stop() async {
-        NSLog("[DIAG] SarvamProvider.stop()")
-        capture.stop()
+        NSLog("[DIAG] SarvamProvider.stop() external=\(externalAudioStream != nil)")
+        // Only stop our own capture if we own it. In dual-provider mode
+        // the broadcaster's upstream is the one to stop — owned by
+        // DualLiveProvider, not us.
+        if externalAudioStream == nil {
+            capture.stop()
+        }
 
         // Drain audio consumer so any in-flight chunk is sent before we
-        // close the socket. capture.stop() finishes the AsyncStream
-        // continuation, the for-await loop exits, the Task completes.
+        // close the socket. In external mode the consumer exits when
+        // the broadcaster finishes the downstream.
         await audioConsumerTask?.value
         audioConsumerTask = nil
 
@@ -208,6 +245,7 @@ public actor SarvamProvider: ASRProvider {
 
         handler?.disconnect()
         handler = nil
+        externalAudioStream = nil
 
         partialsContinuation?.finish()
         partialsContinuation = nil

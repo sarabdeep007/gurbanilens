@@ -226,6 +226,12 @@ struct SettingsScreen: View {
             if cloudEnabled {
                 VStack(alignment: .leading, spacing: 4) {
                     CloudProviderRow(
+                        title: ASRProviderId.dual.cloudDisplayName,
+                        subtitle: "Live word-by-word as you speak, refined to Punjabi when Sarvam catches up",
+                        selected: asrProviderRaw == ASRProviderId.dual.rawValue,
+                        onTap: { asrProviderRaw = ASRProviderId.dual.rawValue }
+                    )
+                    CloudProviderRow(
                         title: ASRProviderId.sarvam.cloudDisplayName,
                         subtitle: "Indian language SOTA, ₹30/hour",
                         selected: asrProviderRaw == ASRProviderId.sarvam.rawValue,
@@ -270,9 +276,13 @@ struct SettingsScreen: View {
             set: { newValue in
                 cloudEnabled = newValue
                 if newValue {
-                    // Default cloud pick = Sarvam (better Punjabi).
+                    // Default cloud pick = Dual (Whisper live + Sarvam
+                    // refine) — best of both: instant text + Punjabi
+                    // quality at VAD boundaries. Sarvam-only and Gemini
+                    // remain selectable below for users who explicitly
+                    // want a single backend.
                     if asrProviderRaw == ASRProviderId.whisperKit.rawValue {
-                        asrProviderRaw = ASRProviderId.sarvam.rawValue
+                        asrProviderRaw = ASRProviderId.dual.rawValue
                     }
                 } else {
                     asrProviderRaw = ASRProviderId.whisperKit.rawValue
@@ -411,6 +421,7 @@ private extension ASRProviderId {
         case .whisperKit: return "On-device Whisper"
         case .sarvam:     return "Sarvam Saaras-v3"
         case .gemini:     return "Gemini 2.5 Flash"
+        case .dual:       return "Dual (Whisper live + Sarvam refine)"
         }
     }
 }

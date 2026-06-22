@@ -15,12 +15,20 @@ public enum ASRProviderId: String, Codable, CaseIterable, Sendable {
     case whisperKit
     case sarvam
     case gemini
+    /// **Dual mode** — runs WhisperKit-small on-device and Sarvam in
+    /// parallel against the same mic stream. Whisper's rolling
+    /// transcripts show first (sub-second cadence) so the user sees
+    /// text immediately; Sarvam's higher-quality Punjabi segments
+    /// replace them when each VAD chunk closes. Implemented by
+    /// ``DualLiveProvider`` over a ``ChunkBroadcaster``.
+    case dual
 
     public var displayName: String {
         switch self {
         case .whisperKit: return "On-device (Whisper)"
         case .sarvam:     return "Sarvam (cloud)"
         case .gemini:     return "Gemini (cloud)"
+        case .dual:       return "Dual (Whisper live + Sarvam refine)"
         }
     }
 }
@@ -38,6 +46,17 @@ public enum ASRProviderId: String, Codable, CaseIterable, Sendable {
 /// script-appropriate equivalent) so consumers don't need to know which
 /// backend produced a partial.
 public struct Partial: Sendable {
+    /// Where the partial came from. Used by ``DualLiveProvider`` to tag
+    /// each emit so the consumer (VoiceSearchSession) can bypass the
+    /// freeze-last-good shrink guard when authoritative Sarvam segments
+    /// arrive shorter than the rolling Whisper transcript. Defaults to
+    /// nil for backwards compatibility — single-provider modes don't
+    /// need to set it.
+    public enum Source: Sendable, Equatable {
+        case whisperLive
+        case sarvam
+    }
+
     /// Native-script transcript, post-filtering.
     public let text: String
     /// `Latin.from(text)` — matcher input.
@@ -49,19 +68,24 @@ public struct Partial: Sendable {
     public let isSpeaking: Bool
     /// Last frame's energy 0..1 (VU bar). 0 when no audio yet.
     public let bufferEnergy: Float
+    /// Optional source tag for dual-provider mode. nil for single-
+    /// provider flows; consumers ignore nil and use existing logic.
+    public let source: Source?
 
     public init(
         text: String,
         latin: String,
         gurmukhi: String,
         isSpeaking: Bool,
-        bufferEnergy: Float
+        bufferEnergy: Float,
+        source: Source? = nil
     ) {
         self.text = text
         self.latin = latin
         self.gurmukhi = gurmukhi
         self.isSpeaking = isSpeaking
         self.bufferEnergy = bufferEnergy
+        self.source = source
     }
 }
 

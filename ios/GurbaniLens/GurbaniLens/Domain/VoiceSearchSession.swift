@@ -227,18 +227,28 @@ public final class VoiceSearchSession: ObservableObject {
             // content drastically vs the previous AND the previous was
             // substantive, suppress the new partial — keep the prior text
             // + matches in state, only update bufferEnergy.
+            //
+            // Dual-provider exception: when a Sarvam-tagged partial
+            // arrives, it's the canonical Punjabi transcript and must
+            // displace the previous (likely Whisper-live) text even if
+            // shorter. Otherwise commit-time reads the rolling Whisper
+            // transcript and the matcher loses Sarvam's quality.
             let prev = listeningSnapshot
             let prevLen = prev?.text.count ?? 0
             let newLen = partial.gurmukhi.count
             let dramaticShrink = prevLen > 12 && newLen < (prevLen / 2)
-            if dramaticShrink {
-                NSLog("[DIAG] VoiceSearchSession.startStreaming Bug-B freeze-last-good (prev=\(prevLen) new=\(newLen)) — preserving previous transcript")
+            let sarvamCanonical = partial.source == .sarvam && !partial.gurmukhi.isEmpty
+            if dramaticShrink && !sarvamCanonical {
+                NSLog("[DIAG] VoiceSearchSession.startStreaming Bug-B freeze-last-good (prev=\(prevLen) new=\(newLen) source=\(String(describing: partial.source))) — preserving previous transcript")
                 setListening(
                     text: prev?.text ?? "",
                     liveMatches: prev?.matches ?? [],
                     bufferEnergy: partial.bufferEnergy
                 )
                 continue
+            }
+            if dramaticShrink && sarvamCanonical {
+                NSLog("[DIAG] VoiceSearchSession.startStreaming Bug-B BYPASSED for Sarvam-canonical partial (prev=\(prevLen) new=\(newLen))")
             }
 
             // Snappy text + energy update. Preserve whatever liveMatches
