@@ -1,25 +1,30 @@
 import Foundation
 import GurbaniLensCore
+import Starscream
 
 /// Sarvam Saaras-v3 ASR backend. Conforms to ``ASRProvider`` so it slots
 /// into ``StreamingASR``'s `@AppStorage("settings.asrProvider")` switch.
 ///
-/// **v1 path: REST batch (this file).** The Sarvam streaming WebSocket
-/// API works fine when driven from Linux (see
-/// `scripts/sarvam-investigation/WORKING_PROTOCOL.md`) but Apple's
-/// `URLSessionWebSocketTask` hits an unresolved `Socket is not connected`
-/// failure ~500-700 ms after the first audio frame on iOS. Rather than
-/// hold v1 on a platform debugging spike, this provider's
-/// `start/stop/partials` lifecycle buffers PCM during capture and submits
-/// a single WAV to the synchronous REST endpoint on stop. UX is
-/// record→stop→3-5s→transcript. The iOS streaming bug is tracked for a
-/// later v2 dispatch.
+/// **v1 live path: Starscream WebSocket streaming.** The Sarvam streaming
+/// WS API works on every platform we've tried *except* Apple's
+/// ``URLSessionWebSocketTask``, which fails with "Socket is not
+/// connected" ~500 ms after the first audio frame (4/4 attempts). The
+/// wire format itself is correct — same JSON-wrapped base64 chunks the
+/// Linux validation script uses successfully — but URLSessionWebSocketTask
+/// can't keep the socket alive on iOS. Starscream is built on
+/// `Network.framework` / NWConnection and is production-proven for iOS
+/// WebSockets (Lyft, Square, Trello). See
+/// `scripts/sarvam-investigation/WORKING_PROTOCOL.md` for the wire format.
+///
+/// **UX.** Live segment-by-segment transcripts: as Sarvam's server-side
+/// VAD closes each utterance, a ``Partial`` arrives with the accumulated
+/// transcript. ``VoiceSearchSession`` runs `matchByFirstLetters` on each
+/// growing partial, so search results refresh as the user speaks.
 ///
 /// **Why Saaras.** Phase 1 measured Whisper-medium at ~31% confident-match
 /// rate on sung Kirtan because Whisper's Indic-script training is shallow.
 /// Sarvam's Saaras family is purpose-built for Indian languages (native
-/// Punjabi without a `pa→hi` remap). The Compare-mode A/B test uses
-/// ``transcribeOneShot`` directly to evaluate Sarvam vs Whisper-large-v3.
+/// Punjabi without a `pa→hi` remap).
 ///
 /// **Long-term TODO.** Route through Taaj backend (api.taajsingh.com) so
 /// the Sarvam API key never ships to a user device.
@@ -55,9 +60,6 @@ public actor SarvamProvider: ASRProvider {
 
     // MARK: - Config
 
-    // `defaultEndpoint` is preserved as a data constant even though the
-    // batch path uses `batchEndpoint` instead — keeping it harmless avoids
-    // touching call sites outside this file.
     public static let defaultEndpoint = URL(string: "wss://api.sarvam.ai/speech-to-text/ws")!
     public static let defaultModel = "saaras:v3"
     public static let defaultLanguage = "pa-IN"
@@ -67,10 +69,10 @@ public actor SarvamProvider: ASRProvider {
     private let model: String
     private let language: String
 
-    // MARK: - Capture state
+    // MARK: - Streaming state
 
     private let capture: CloudMicCapture
-    private let audioBuffer = SarvamAudioBuffer()
+    private var handler: SarvamStreamingHandler?
     private var audioConsumerTask: Task<Void, Never>?
 
     private var partialsContinuation: AsyncStream<Partial>.Continuation?
@@ -111,17 +113,53 @@ public actor SarvamProvider: ASRProvider {
         let (stream, cont) = AsyncStream.makeStream(of: Partial.self)
         self.partialsStream = stream
         self.partialsContinuation = cont
-        // Defensive reset in case a prior session left bytes around.
-        _ = audioBuffer.snapshotAndReset()
 
-        NSLog("[DIAG] SarvamProvider.start (batch mode) — buffering audio via SarvamAudioBuffer (lock-protected, off-actor)")
+        NSLog("[DIAG] SarvamProvider.start (Starscream streaming mode)")
+
+        // Build WS URL with the exact query params validated against
+        // Sarvam's live endpoint from Linux. Note the inconsistent
+        // separator convention: `language-code` is hyphenated, the
+        // rest use underscores. That's Sarvam's API — don't normalise.
+        var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false)
+        components?.queryItems = [
+            URLQueryItem(name: "model", value: model),
+            URLQueryItem(name: "language-code", value: language),
+            URLQueryItem(name: "mode", value: "transcribe"),
+            URLQueryItem(name: "sample_rate", value: "16000"),
+            URLQueryItem(name: "input_audio_codec", value: "pcm_s16le"),
+            URLQueryItem(name: "high_vad_sensitivity", value: "true"),
+        ]
+        guard let url = components?.url else {
+            partialsContinuation?.finish()
+            partialsContinuation = nil
+            throw SarvamError.invalidEndpoint
+        }
+
+        let keyRedacted = url.absoluteString.replacingOccurrences(of: apiKey, with: "<KEY>")
+        NSLog("[DIAG] SarvamProvider WS connecting to \(keyRedacted)")
+
+        // Capture the continuation locally so the handler closures (which
+        // run on Starscream's callback queue, off-actor) can yield without
+        // crossing the actor boundary. AsyncStream.Continuation is Sendable.
+        let contRef = cont
+        let h = SarvamStreamingHandler(
+            url: url,
+            apiKey: apiKey,
+            onPartial: { partial in
+                contRef.yield(partial)
+            }
+        )
+        self.handler = h
+        h.connect()
 
         do {
             let chunkStream = try capture.start()
 
             // Per-tap VU peak → forward as a transcript-less Partial so
-            // the level meter animates while the user is recording.
-            // Hop into the actor from the non-isolated callback.
+            // the level meter animates. The Bug-B freeze-last-good guard
+            // in VoiceSearchSession.startStreaming (gurmukhi.count shrink
+            // check) prevents these empty-text partials from clobbering
+            // accumulated transcript text on the UI side.
             capture.onPeak = { [weak self] peak in
                 guard let self else { return }
                 Task { await self.recordPeak(peak) }
@@ -129,21 +167,24 @@ public actor SarvamProvider: ASRProvider {
 
             // Audio consumer runs OUTSIDE the actor (Task.detached) so the
             // high-frequency chunk arrival is not gated on the actor's
-            // mailbox — see SarvamAudioBuffer comment + hotfix-5.
-            let buffer = self.audioBuffer
+            // mailbox — see hotfix-5. The handler's sendAudio is itself
+            // lock-protected.
+            let handlerRef = h
             self.audioConsumerTask = Task.detached(priority: .userInitiated) {
                 var loopCount = 0
                 for await chunk in chunkStream {
-                    buffer.append(chunk)
+                    handlerRef.sendAudio(chunk)
                     loopCount += 1
                     if loopCount <= 5 || loopCount % 50 == 0 {
-                        NSLog("[DIAG] SarvamProvider audioConsumer chunk #\(loopCount) size=\(chunk.count) bufferTotal=\(buffer.currentBytes)")
+                        NSLog("[DIAG] SarvamProvider audioConsumer chunk #\(loopCount) size=\(chunk.count) connected=\(handlerRef.isConnected)")
                     }
                 }
-                NSLog("[DIAG] SarvamProvider audioConsumer loop EXITED totalChunks=\(loopCount) bufferTotal=\(buffer.currentBytes)")
+                NSLog("[DIAG] SarvamProvider audioConsumer loop EXITED totalChunks=\(loopCount)")
             }
         } catch {
             NSLog("[DIAG] SarvamProvider capture.start FAILED: \(error.localizedDescription)")
+            h.disconnect()
+            self.handler = nil
             partialsContinuation?.finish()
             partialsContinuation = nil
             throw SarvamError.captureFailed(underlying: error)
@@ -154,56 +195,19 @@ public actor SarvamProvider: ASRProvider {
         NSLog("[DIAG] SarvamProvider.stop()")
         capture.stop()
 
-        // Drain the chunk consumer so the final tap-buffer makes it into
-        // audioBuffer before we snapshot. capture.stop() finishes the
-        // AsyncStream's continuation; the for-await loop drains and exits.
+        // Drain audio consumer so any in-flight chunk is sent before we
+        // close the socket. capture.stop() finishes the AsyncStream
+        // continuation, the for-await loop exits, the Task completes.
         await audioConsumerTask?.value
         audioConsumerTask = nil
 
-        let pcm = audioBuffer.snapshotAndReset()
+        // Grace window for the server to flush the final VAD segment
+        // after the last audio frame. 300 ms tracks Sarvam's observed
+        // segment-emit cadence from Linux validation.
+        try? await Task.sleep(nanoseconds: 300_000_000)
 
-        // Gate: 0.5 sec @ 16 kHz mono s16le = 16_000 bytes. Below that,
-        // the user almost certainly tapped through by accident — skip
-        // the network round-trip and emit an empty final partial.
-        let minBytes = 16_000
-        guard pcm.count >= minBytes else {
-            NSLog("[DIAG] SarvamProvider.stop — pcmBytes=\(pcm.count) below 0.5s threshold, skipping API call")
-            partialsContinuation?.yield(
-                Partial(text: "", latin: "", gurmukhi: "", isSpeaking: false, bufferEnergy: 0)
-            )
-            partialsContinuation?.finish()
-            partialsContinuation = nil
-            return
-        }
-
-        let wav = Self.buildWav(fromS16LE: pcm, sampleRate: 16_000, channels: 1)
-        NSLog("[DIAG] SarvamProvider.stop — wavBytes=\(wav.count) pcmBytes=\(pcm.count), calling transcribeOneShot")
-
-        do {
-            let transcript = try await Self.transcribeOneShot(
-                wav: wav,
-                apiKey: apiKey,
-                model: model,
-                languageCode: language
-            )
-            let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.isEmpty {
-                NSLog("[DIAG] SarvamProvider.stop transcribeOneShot returned empty transcript")
-                partialsContinuation?.yield(
-                    Partial(text: "", latin: "", gurmukhi: "", isSpeaking: false, bufferEnergy: 0)
-                )
-            } else {
-                let partial = Self.makePartial(raw: trimmed, isSpeaking: false, bufferEnergy: 0)
-                let script = Self.detectScript(trimmed)
-                NSLog("[DIAG] SarvamProvider.stop final transcript.len=\(trimmed.count) script=\(script.rawValue) latin.head60=\"\(String(partial.latin.prefix(60)))\" gurmukhi.head60=\"\(String(partial.gurmukhi.prefix(60)))\"")
-                partialsContinuation?.yield(partial)
-            }
-        } catch {
-            NSLog("[DIAG] SarvamProvider.stop transcribeOneShot FAILED: \(error.localizedDescription)")
-            partialsContinuation?.yield(
-                Partial(text: "", latin: "", gurmukhi: "", isSpeaking: false, bufferEnergy: 0)
-            )
-        }
+        handler?.disconnect()
+        handler = nil
 
         partialsContinuation?.finish()
         partialsContinuation = nil
@@ -213,9 +217,6 @@ public actor SarvamProvider: ASRProvider {
 
     private func recordPeak(_ peak: Float) {
         let speaking = peak > 0.02
-        // Transcript-less partial: UI uses bufferEnergy for the VU bar
-        // and isSpeaking for the "listening" indicator while the
-        // recording is in flight. Transcript only arrives in stop().
         partialsContinuation?.yield(Partial(
             text: "",
             latin: "",
@@ -223,52 +224,6 @@ public actor SarvamProvider: ASRProvider {
             isSpeaking: speaking,
             bufferEnergy: peak
         ))
-    }
-
-    // MARK: - WAV builder (inline; no third-party)
-
-    /// Build a 44-byte RIFF/WAVE header + payload for s16le PCM. Inline
-    /// per the v1 dispatch — keeps SarvamProvider self-contained.
-    private nonisolated static func buildWav(
-        fromS16LE pcm: Data,
-        sampleRate: UInt32,
-        channels: UInt16
-    ) -> Data {
-        let bitsPerSample: UInt16 = 16
-        let bytesPerSample: UInt16 = bitsPerSample / 8
-        let blockAlign: UInt16 = channels * bytesPerSample
-        let byteRate: UInt32 = sampleRate * UInt32(blockAlign)
-        let pcmLen = UInt32(pcm.count)
-        let riffSize: UInt32 = 36 + pcmLen
-
-        var header = Data(capacity: 44)
-        func appendU32LE(_ v: UInt32) {
-            var le = v.littleEndian
-            withUnsafeBytes(of: &le) { header.append(contentsOf: $0) }
-        }
-        func appendU16LE(_ v: UInt16) {
-            var le = v.littleEndian
-            withUnsafeBytes(of: &le) { header.append(contentsOf: $0) }
-        }
-
-        header.append(contentsOf: Array("RIFF".utf8))
-        appendU32LE(riffSize)
-        header.append(contentsOf: Array("WAVE".utf8))
-        header.append(contentsOf: Array("fmt ".utf8))
-        appendU32LE(16)              // fmt chunk size (PCM)
-        appendU16LE(1)               // PCM format
-        appendU16LE(channels)
-        appendU32LE(sampleRate)
-        appendU32LE(byteRate)
-        appendU16LE(blockAlign)
-        appendU16LE(bitsPerSample)
-        header.append(contentsOf: Array("data".utf8))
-        appendU32LE(pcmLen)
-
-        var out = Data(capacity: 44 + pcm.count)
-        out.append(header)
-        out.append(pcm)
-        return out
     }
 
     // MARK: - Pure parsing helpers (thin wrappers over CloudParsing)
@@ -315,11 +270,11 @@ public actor SarvamProvider: ASRProvider {
         )
     }
 
-    // MARK: - Batch helper (used by CompareScreen AND by stop() above)
+    // MARK: - Batch helper (used by CompareScreen)
 
-    /// REST batch endpoint for one-shot Saaras transcription. Streaming
-    /// is the live-search path; Compare mode (record-once-then-compare)
-    /// needs a synchronous request/response per recording.
+    /// REST batch endpoint for one-shot Saaras transcription. Compare
+    /// mode (record-once-then-compare-three-engines) calls this directly
+    /// — the live streaming path above is for the search flow.
     ///
     /// Endpoint: POST https://api.sarvam.ai/speech-to-text
     ///   - multipart/form-data with `file` (WAV blob), `model`, `language_code`
@@ -342,7 +297,6 @@ public actor SarvamProvider: ASRProvider {
         if apiKey.isEmpty { throw SarvamError.missingApiKey }
         guard let url = URL(string: endpoint) else { throw SarvamError.invalidEndpoint }
 
-        // Build a tiny multipart/form-data body.
         let boundary = "Boundary-\(UUID().uuidString)"
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
@@ -382,35 +336,166 @@ public actor SarvamProvider: ASRProvider {
 
 }
 
-/// Lock-protected audio buffer that lives OUTSIDE SarvamProvider's actor
-/// isolation. The audio consumer Task can append chunks directly without
-/// hopping into the actor for every 100ms chunk — critical because the
-/// actor's mailbox is busy with recordPeak's high-frequency partial
-/// yields. See hotfix-5.
-private final class SarvamAudioBuffer: @unchecked Sendable {
-    private var data = Data()
+/// Starscream-backed Sarvam streaming session. Lives outside the actor
+/// so the WebSocket callback queue (Starscream's default DispatchQueue)
+/// can deliver `didReceive` events without crossing the actor boundary.
+/// All mutable state is NSLock-protected; the audio-send path is
+/// callable from any thread.
+private final class SarvamStreamingHandler: NSObject, WebSocketDelegate, @unchecked Sendable {
+
+    private let socket: WebSocket
+    private let onPartial: @Sendable (Partial) -> Void
+
     private let lock = NSLock()
-    private(set) var chunkCount: Int = 0
+    private var _isConnected: Bool = false
+    private var pendingAudio: [Data] = []
+    private var transcriptParts: [String] = []
 
-    func append(_ chunk: Data) {
-        lock.lock()
-        data.append(chunk)
-        chunkCount += 1
-        lock.unlock()
+    var isConnected: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return _isConnected
     }
 
-    func snapshotAndReset() -> Data {
-        lock.lock()
-        let snapshot = data
-        data = Data()
-        chunkCount = 0
-        lock.unlock()
-        return snapshot
+    init(
+        url: URL,
+        apiKey: String,
+        onPartial: @escaping @Sendable (Partial) -> Void
+    ) {
+        var req = URLRequest(url: url)
+        req.setValue(apiKey, forHTTPHeaderField: "api-subscription-key")
+        req.timeoutInterval = 10
+        self.socket = WebSocket(request: req)
+        self.onPartial = onPartial
+        super.init()
+        self.socket.delegate = self
     }
 
-    var currentBytes: Int {
+    func connect() {
+        socket.connect()
+    }
+
+    func disconnect() {
+        socket.disconnect()
+    }
+
+    /// Send a 100 ms s16le mono PCM chunk to the live Sarvam stream.
+    /// If the WebSocket hasn't finished its handshake yet (we get audio
+    /// from the mic before `.connected` fires), queue it and flush on
+    /// connect. Called off-actor from the detached audio consumer.
+    func sendAudio(_ chunk: Data) {
         lock.lock()
-        defer { lock.unlock() }
-        return data.count
+        if !_isConnected {
+            pendingAudio.append(chunk)
+            lock.unlock()
+            return
+        }
+        lock.unlock()
+        writeChunk(chunk)
+    }
+
+    private func writeChunk(_ chunk: Data) {
+        // Sarvam's wire format (validated from Linux):
+        //   {"audio": {"data": "<b64>", "sample_rate": "16000", "encoding": "audio/wav"}}
+        // sample_rate is a STRING, not a number. encoding is "audio/wav"
+        // even though we're sending raw PCM — Sarvam treats it as a
+        // content-type label, not a parser hint.
+        let b64 = chunk.base64EncodedString()
+        let payload: [String: Any] = [
+            "audio": [
+                "data": b64,
+                "sample_rate": "16000",
+                "encoding": "audio/wav"
+            ]
+        ]
+        guard let json = try? JSONSerialization.data(withJSONObject: payload),
+              let str = String(data: json, encoding: .utf8) else {
+            return
+        }
+        socket.write(string: str)
+    }
+
+    // MARK: - WebSocketDelegate
+
+    func didReceive(event: WebSocketEvent, client: any WebSocketClient) {
+        switch event {
+        case .connected:
+            lock.lock()
+            _isConnected = true
+            let queued = pendingAudio
+            pendingAudio = []
+            lock.unlock()
+            NSLog("[DIAG] SarvamProvider WS connected — flushing pending=\(queued.count) chunks")
+            for chunk in queued { writeChunk(chunk) }
+        case .text(let str):
+            handleText(str)
+        case .binary(let data):
+            if let s = String(data: data, encoding: .utf8) { handleText(s) }
+        case .disconnected(let reason, let code):
+            NSLog("[DIAG] SarvamProvider WS disconnected reason='\(reason)' code=\(code)")
+            lock.lock(); _isConnected = false; lock.unlock()
+        case .error(let err):
+            NSLog("[DIAG] SarvamProvider WS error: \(err?.localizedDescription ?? "nil")")
+            lock.lock(); _isConnected = false; lock.unlock()
+        case .cancelled:
+            NSLog("[DIAG] SarvamProvider WS cancelled")
+            lock.lock(); _isConnected = false; lock.unlock()
+        case .peerClosed:
+            NSLog("[DIAG] SarvamProvider WS peerClosed")
+            lock.lock(); _isConnected = false; lock.unlock()
+        default:
+            break
+        }
+    }
+
+    private func handleText(_ str: String) {
+        guard let data = str.data(using: .utf8),
+              let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return
+        }
+
+        // Sarvam envelope (validated): {"type": "data", "data": {"transcript": "..."}}.
+        // Type "config" / "events" arrive too — log and ignore.
+        if let type = parsed["type"] as? String {
+            switch type {
+            case "data":
+                if let inner = parsed["data"] as? [String: Any],
+                   let transcript = inner["transcript"] as? String, !transcript.isEmpty {
+                    appendSegmentAndEmit(transcript)
+                }
+                return
+            case "events":
+                return
+            case "config":
+                return
+            case "error":
+                let msg = (parsed["data"] as? [String: Any])?["message"] as? String ?? "unknown"
+                NSLog("[DIAG] SarvamProvider server error: \(msg)")
+                return
+            default:
+                break
+            }
+        }
+
+        // Fallback for non-enveloped shapes (flat {"transcript": "..."} etc).
+        if let transcript = SarvamProvider.extractTranscript(from: parsed), !transcript.isEmpty {
+            appendSegmentAndEmit(transcript)
+        }
+    }
+
+    private func appendSegmentAndEmit(_ segment: String) {
+        let trimmed = segment.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        lock.lock()
+        transcriptParts.append(trimmed)
+        let full = transcriptParts.joined(separator: " ")
+        lock.unlock()
+
+        let script = SarvamProvider.detectScript(trimmed)
+        NSLog("[DIAG] SarvamProvider segment received len=\(trimmed.count) script=\(script.rawValue) first40='\(String(trimmed.prefix(40)))'")
+        NSLog("[DIAG] SarvamProvider full transcript so far len=\(full.count)")
+
+        let partial = SarvamProvider.makePartial(raw: full, isSpeaking: false, bufferEnergy: 0)
+        onPartial(partial)
     }
 }

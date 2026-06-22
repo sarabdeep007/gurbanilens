@@ -37,6 +37,15 @@ packages:
   WhisperKit:
     url: https://github.com/argmaxinc/WhisperKit.git
     from: "1.0.0"
+  # Starscream — NWConnection-backed WebSocket client. Replaces
+  # URLSessionWebSocketTask for SarvamProvider streaming after the
+  # latter failed with "Socket is not connected" ~500 ms after the
+  # first audio frame, on 4/4 attempts. Same wire protocol (see
+  # scripts/sarvam-investigation/WORKING_PROTOCOL.md), different
+  # transport — production-proven in Lyft / Square / Trello.
+  Starscream:
+    url: https://github.com/daltoniam/Starscream.git
+    from: "4.0.0"
 
 targets:
   GurbaniLens:
@@ -84,6 +93,8 @@ targets:
         product: GurbaniLensCore
       - package: WhisperKit
         product: WhisperKit
+      - package: Starscream
+        product: Starscream
     # Inject SARVAM_API_KEY + GEMINI_API_KEY from repo-root .env into the
     # built Info.plist so SarvamProvider + GeminiProvider can read them
     # via Bundle.main.object(forInfoDictionaryKey:). Wired here as a
