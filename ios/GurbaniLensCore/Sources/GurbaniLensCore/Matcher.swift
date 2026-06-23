@@ -164,7 +164,15 @@ public final class Matcher: @unchecked Sendable {
     ///                       (`VoiceSearchSession.commit`) re-rank by the
     ///                       full ``match(_:topN:)`` before showing the
     ///                       final Results screen.
-    public func matchByFirstLetters(_ query: String, topN: Int = 5) -> [Match] {
+    /// `confidenceCutoff` (default 0.80, added 2026-06-23): post-filter
+    /// drops results whose `effective` score is below `cutoff * topScore`.
+    /// Pass 0 to disable the filter (tests / call sites that want the
+    /// raw ranked top-N regardless of confidence gap).
+    public func matchByFirstLetters(
+        _ query: String,
+        topN: Int = 5,
+        confidenceCutoff: Double = 0.80
+    ) -> [Match] {
         let totalStart = Date()
         let normalised = normalize(query)
         if normalised.isEmpty { return [] }
@@ -203,7 +211,22 @@ public final class Matcher: @unchecked Sendable {
         let topLineFL = top.first.map { phoneticFirstLetters[$0.index] } ?? ""
         NSLog("[DIAG] Matcher.matchByFirstLetters totalLines=\(phoneticFirstLetters.count) qFL=\"\(qFL)\" qFLp=\"\(qFLp)\" topEffective=\(topEff) topPR=\(topPR) topLF=\(topLF) topLineFL=\"\(topLineFL)\" totalMs=\(totalMs)")
 
-        return top.map { entry in
+        // Top-10 diagnostic log (added 2026-06-23). When a query
+        // mis-ranks (e.g. Deep's "ਹਮ ਰੁਲਤੇ ਫਿਰਤੇ" failing to surface
+        // Ang 167), the next debug step is "where in the ranked list
+        // does the actual line sit?" Log the breakdown of the top 10
+        // candidates with FL, partial_ratio, length-factor, effective
+        // score, and ang so we can tell at a glance whether the target
+        // is just below the topN cutoff or buried in the long tail.
+        let top10 = Array(scored.prefix(10))
+        let log10 = top10.enumerated().map { (idx, r) -> String in
+            let line = lines[r.index]
+            let flDisplay = phoneticFirstLetters[r.index]
+            return "[\(idx + 1)] FLp='\(flDisplay)' pr=\(String(format: "%.1f", r.partialRatio)) lf=\(String(format: "%.2f", r.lengthFactor)) eff=\(String(format: "%.1f", r.effective)) ang=\(line.ang)"
+        }.joined(separator: " | ")
+        NSLog("[DIAG] Matcher.matchByFirstLetters TOP10: \(log10)")
+
+        let allMatches = top.map { entry in
             Match(
                 line: lines[entry.index],
                 score: entry.effective,
@@ -211,6 +234,21 @@ public final class Matcher: @unchecked Sendable {
                 coverage: 1.0
             )
         }
+
+        // Confidence-based filtering (added 2026-06-23). When the top
+        // match scores high, weak follow-ups are noise — they crowd
+        // the UI without helping the user. Keep only results within
+        // `confidenceCutoff` × top score. If the top is low (no clear
+        // winner), most results pass the cutoff naturally so the user
+        // still gets multiple options. Empty / 1-result cases fall
+        // through unchanged. Pass 0 to opt out entirely.
+        guard confidenceCutoff > 0, let topMatch = allMatches.first else {
+            return allMatches
+        }
+        let cutoff = topMatch.score * confidenceCutoff
+        let filtered = allMatches.filter { $0.score >= cutoff }
+        NSLog("[DIAG] Matcher.matchByFirstLetters confidence filter — cutoffRatio=\(String(format: "%.2f", confidenceCutoff)) cutoff=\(String(format: "%.1f", cutoff)) kept=\(filtered.count)/\(allMatches.count)")
+        return filtered
     }
 
     public func match(_ query: String, topN: Int = 5) -> [Match] {

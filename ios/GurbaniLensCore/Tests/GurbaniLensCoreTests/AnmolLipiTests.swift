@@ -65,4 +65,36 @@ final class AnmolLipiTests: XCTestCase {
     func testIekIndependentI() {
         XCTAssertEqual(Gurmukhi.fromAnmolLipi("iek"), "ਇਕ")
     }
+
+    // MARK: - Padcheid punctuation strip (added 2026-06-23)
+
+    /// `.` and `;` are BaniDB Padcheid (word-break) markers, not
+    /// canonical Gurmukhi punctuation. They must be stripped during
+    /// pre-clean so they never surface in the UI. Deep's 2026-06-23
+    /// screenshot showed pollution like "ਅਉਖੀ ਘੜੀ. ਨ ਦੇਖਣ ਦੇਈ;" —
+    /// this test guards against regression.
+    func testPadcheidPunctuationStrip_periodsAndSemicolonsRemoved() {
+        let pollutedAukhi = "AuKI GVI . n dyKx dyeI ] Apnw ibrdu smwly ]"
+        let out = Gurmukhi.fromAnmolLipi(pollutedAukhi)
+        XCTAssertFalse(out.contains("."), "period must not survive Padcheid strip — got '\(out)'")
+        XCTAssertFalse(out.contains(";"), "semicolon must not survive Padcheid strip — got '\(out)'")
+        // Sanity: the actual Gurmukhi content is still there.
+        XCTAssertTrue(out.contains("ਦੇਖਣ"), "main content survives — got '\(out)'")
+        XCTAssertTrue(out.contains("॥"), "double-danda from `]` survives — got '\(out)'")
+    }
+
+    /// Tight stress test — input is nothing but Padcheid markers
+    /// interleaved with one valid token. Output must contain only the
+    /// converted token + spaces.
+    func testPadcheidPunctuationStrip_pureMarkerInterleave() {
+        let input = "hir ; hir ] hir."
+        let out = Gurmukhi.fromAnmolLipi(input)
+        XCTAssertFalse(out.contains("."))
+        XCTAssertFalse(out.contains(";"))
+        // Three "hir" → three "ਹਰਿ" + the danda from `]`.
+        XCTAssertEqual(
+            out.components(separatedBy: "ਹਰਿ").count - 1, 3,
+            "expected three 'ਹਰਿ' tokens, got '\(out)'"
+        )
+    }
 }

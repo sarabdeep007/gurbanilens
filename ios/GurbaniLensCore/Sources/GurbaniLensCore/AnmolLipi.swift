@@ -37,10 +37,20 @@ enum AnmolLipi {
 
         // Pre-clean: drop characters that are decorative-only or
         // composition markers without a Unicode equivalent.
+        //
+        // `.` and `;` are BaniDB Padcheid (word-break / pause) markers
+        // baked into the Anmol Lipi source for typesetting purposes.
+        // Canonical Gurmukhi rendering doesn't include them — without
+        // the strip they fall through `appendMapped` as raw ASCII and
+        // surface in the UI as e.g. "ਅਉਖੀ ਘੜੀ. ਨ ਦੇਖਣ ਦੇਈ; …", which
+        // is visibly wrong (Deep's 2026-06-23 screenshot). Strip during
+        // pre-clean so they never reach the display layer.
         var str = text
             .replacingOccurrences(of: ">", with: "")
             .replacingOccurrences(of: "Ø", with: "")
             .replacingOccurrences(of: "Æ", with: "")
+            .replacingOccurrences(of: ".", with: "")
+            .replacingOccurrences(of: ";", with: "")
 
         // ASCII corrections — Anmol Lipi sometimes orders the post-base
         // vowel mark before the consonant in the source. Replace each

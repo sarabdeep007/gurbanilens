@@ -92,8 +92,11 @@ final class MatchByFirstLettersTests: XCTestCase {
             ("m", "meena nm"),   // FL "mn", phonetic "mn" — distractor
         ])
 
-        let bQuery = matcher.matchByFirstLetters("babba mn", topN: 4)
-        let pQuery = matcher.matchByFirstLetters("papa mn",  topN: 4)
+        // Pass confidenceCutoff: 0 so the rank-equivalence assertions
+        // below see the full 4-result list (the new live-mode default
+        // 0.80 would drop the 50-score distractors).
+        let bQuery = matcher.matchByFirstLetters("babba mn", topN: 4, confidenceCutoff: 0)
+        let pQuery = matcher.matchByFirstLetters("papa mn",  topN: 4, confidenceCutoff: 0)
 
         // Both queries must return the same number of results.
         XCTAssertEqual(bQuery.count, 4)
@@ -120,8 +123,8 @@ final class MatchByFirstLettersTests: XCTestCase {
             ("g", "gana"),
             ("h", "hana"),
         ])
-        let gQuery = matcher.matchByFirstLetters("gana", topN: 3)
-        let kQuery = matcher.matchByFirstLetters("kana", topN: 3)
+        let gQuery = matcher.matchByFirstLetters("gana", topN: 3, confidenceCutoff: 0)
+        let kQuery = matcher.matchByFirstLetters("kana", topN: 3, confidenceCutoff: 0)
 
         XCTAssertEqual(gQuery.count, 3)
         XCTAssertEqual(kQuery.count, 3)
@@ -144,8 +147,8 @@ final class MatchByFirstLettersTests: XCTestCase {
             ("hn", "har naam"),
             ("ht", "har taam"),
         ])
-        let hnQuery = matcher.matchByFirstLetters("har naam", topN: 2)
-        let htQuery = matcher.matchByFirstLetters("har taam", topN: 2)
+        let hnQuery = matcher.matchByFirstLetters("har naam", topN: 2, confidenceCutoff: 0)
+        let htQuery = matcher.matchByFirstLetters("har taam", topN: 2, confidenceCutoff: 0)
 
         // hn query: top must be the "hn" line, not the "ht" line.
         XCTAssertEqual(hnQuery[0].line.id, "hn")
@@ -226,9 +229,14 @@ final class MatchByFirstLettersTests: XCTestCase {
         ])
 
         // Query mirrors Sarvam's output: "f" where BaniDB writes "ph"
-        // for ਫ. qFL = "hrfkbnp".
+        // for ਫ. qFL = "hrfkbnp". Pass confidenceCutoff: 0 so we can
+        // inspect every candidate's rank even if the default 0.80
+        // would have filtered the short distractors out before we see
+        // them.
         let results = matcher.matchByFirstLetters(
-            "ham rulate fhirate koee baat na puchata", topN: 5
+            "ham rulate fhirate koee baat na puchata",
+            topN: 5,
+            confidenceCutoff: 0
         )
 
         XCTAssertFalse(results.isEmpty)
@@ -254,7 +262,7 @@ final class MatchByFirstLettersTests: XCTestCase {
         // "short" line's "bz" is NOT substring-in "abgdeze" actually
         // (g, d, e are between), so let me make this honest:
         let results = matcher.matchByFirstLetters(
-            "alpha beta gamma delta epsilon zeta eta", topN: 2
+            "alpha beta gamma delta epsilon zeta eta", topN: 2, confidenceCutoff: 0
         )
         XCTAssertEqual(results.first?.line.id, "long")
         XCTAssertGreaterThan(
@@ -262,6 +270,58 @@ final class MatchByFirstLettersTests: XCTestCase {
             results.last?.score ?? 0,
             "length-matched candidate must outrank the short distractor"
         )
+    }
+
+    /// Confidence filter — clear winner case. With a high-scoring top
+    /// match and only weak (near-zero) follow-ups, only the top result
+    /// should survive the default 0.80 cutoff so the UI doesn't show
+    /// noise rows under an obvious match.
+    func testMatchByFirstLetters_confidenceFilterClearWinner() {
+        // 7-char target + 3 noise lines with no overlapping FL chars.
+        let matcher = makeMatcher([
+            ("target", "alpha beta gamma delta epsilon zeta eta"),  // FL "abgdeze"
+            ("noise1", "xena yara"),                                // FL "xy" — no overlap
+            ("noise2", "wax wax"),                                  // FL "ww"
+            ("noise3", "mu nu"),                                    // FL "mn"
+        ])
+        // Default confidenceCutoff = 0.80.
+        let results = matcher.matchByFirstLetters(
+            "alpha beta gamma delta epsilon zeta eta", topN: 5
+        )
+        XCTAssertEqual(results.count, 1, "clear winner → only top result kept")
+        XCTAssertEqual(results.first?.line.id, "target")
+    }
+
+    /// Confidence filter — close-cluster case. When several candidates
+    /// score within 80% of the top, all of them should survive so the
+    /// user gets multiple options to choose from.
+    func testMatchByFirstLetters_confidenceFilterClosePack() {
+        // 4 identical-FL lines all score 100 → all pass any cutoff.
+        let matcher = makeMatcher([
+            ("a", "alpha bravo"),  // FL "ab"
+            ("b", "ant box"),      // FL "ab"
+            ("c", "apple bat"),    // FL "ab"
+            ("d", "axe ball"),     // FL "ab"
+        ])
+        let results = matcher.matchByFirstLetters("alpha bravo", topN: 5)
+        XCTAssertEqual(results.count, 4, "tied top scores → all survive cutoff")
+    }
+
+    /// Confidence filter — opt-out. `confidenceCutoff: 0` returns the
+    /// raw ranked top-N regardless of score gap.
+    func testMatchByFirstLetters_confidenceFilterOptOut() {
+        let matcher = makeMatcher([
+            ("target", "alpha beta gamma delta epsilon zeta eta"),
+            ("noise",  "xena yara"),
+        ])
+        let withDefault = matcher.matchByFirstLetters(
+            "alpha beta gamma delta epsilon zeta eta", topN: 5
+        )
+        let withOptOut = matcher.matchByFirstLetters(
+            "alpha beta gamma delta epsilon zeta eta", topN: 5, confidenceCutoff: 0
+        )
+        XCTAssertEqual(withDefault.count, 1)
+        XCTAssertEqual(withOptOut.count, 2)
     }
 
     /// Empty / whitespace-only / single-char queries must not crash and
@@ -272,11 +332,11 @@ final class MatchByFirstLettersTests: XCTestCase {
             ("k", "kana"),
         ])
 
-        XCTAssertEqual(matcher.matchByFirstLetters("",       topN: 5).count, 0)
-        XCTAssertEqual(matcher.matchByFirstLetters("   ",    topN: 5).count, 0)
+        XCTAssertEqual(matcher.matchByFirstLetters("",       topN: 5, confidenceCutoff: 0).count, 0)
+        XCTAssertEqual(matcher.matchByFirstLetters("   ",    topN: 5, confidenceCutoff: 0).count, 0)
         // Single-char query is allowed (qFL = "p") — should return all
         // corpus lines ranked.
-        let single = matcher.matchByFirstLetters("p", topN: 5)
+        let single = matcher.matchByFirstLetters("p", topN: 5, confidenceCutoff: 0)
         XCTAssertEqual(single.count, 2)
     }
 }
