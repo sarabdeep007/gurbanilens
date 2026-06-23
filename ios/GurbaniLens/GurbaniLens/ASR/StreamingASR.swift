@@ -63,9 +63,12 @@ public actor StreamingASR {
     }
 
     public nonisolated static func currentWhisperModel() -> WhisperModel {
+        // Default flipped from .largeV3 → .small 2026-06-23 — see
+        // WhisperKitProvider kdoc. New installs without an explicit
+        // pick get the ~250 MB model rather than the 1.5 GB one.
         let raw = UserDefaults.standard.string(forKey: "settings.whisperModel")
-            ?? WhisperModel.largeV3.rawValue
-        return WhisperModel(rawValue: raw) ?? .largeV3
+            ?? WhisperModel.small.rawValue
+        return WhisperModel(rawValue: raw) ?? .small
     }
 
     public nonisolated static func currentSilenceThreshold() -> Float {

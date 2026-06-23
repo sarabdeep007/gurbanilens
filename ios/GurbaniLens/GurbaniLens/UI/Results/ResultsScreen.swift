@@ -126,7 +126,7 @@ private struct MatchCard: View {
                             .clipShape(Capsule())
                     }
                 }
-                Text(match.line.transliterationEn ?? Gurmukhi.fromAnmolLipi(match.line.gurmukhi))
+                Text(Self.rowGurmukhi(match.line))
                     .font(.system(size: isTopMatch ? 22 : 17,
                                   weight: isTopMatch ? .medium : .regular))
                     .foregroundColor(Theme.onSurface)
@@ -138,5 +138,18 @@ private struct MatchCard: View {
             .clipShape(RoundedRectangle(cornerRadius: 12))
         }
         .buttonStyle(.plain)
+    }
+
+    /// Prefer Unicode Gurmukhi, fall back to anvaad-converted Anmol
+    /// Lipi. `transliterationEn` is NEVER displayed in result rows —
+    /// Sangat want Gurmukhi, not Latin (Deep's 2026-06-23 screenshots
+    /// showed rows rendering as "ham rulate firate. koee baat na
+    /// poochhataa;" because the previous order preferred
+    /// transliterationEn). Mirrors `LiveResultsScreen.rowGurmukhi`.
+    private static func rowGurmukhi(_ line: Line) -> String {
+        if let unicode = line.gurmukhiUnicode, !unicode.isEmpty {
+            return unicode
+        }
+        return Gurmukhi.fromAnmolLipi(line.gurmukhi)
     }
 }

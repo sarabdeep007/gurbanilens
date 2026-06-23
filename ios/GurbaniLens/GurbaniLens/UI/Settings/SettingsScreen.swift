@@ -79,7 +79,11 @@ struct SettingsScreen: View {
     @AppStorage("settings.searchMode") private var searchModeRaw: String = SearchModeChoice.live.rawValue
     @AppStorage("settings.silenceThreshold") private var silenceThresholdRaw: String = SilenceThresholdChoice.balanced.rawValue
     @AppStorage("settings.asrProvider") private var asrProviderRaw: String = ASRProviderId.whisperKit.rawValue
-    @AppStorage("settings.whisperModel") private var whisperModelRaw: String = WhisperModel.largeV3.rawValue
+    // Default flipped from .largeV3 → .small 2026-06-23: 1.5 GB
+    // download was unacceptable as the v1 baseline (Deep stuck at 0 %
+    // on first launch). small is fine in Dual mode (Sarvam handles
+    // Punjabi quality); users can still pick largeV3 explicitly.
+    @AppStorage("settings.whisperModel") private var whisperModelRaw: String = WhisperModel.small.rawValue
     @AppStorage("settings.script") private var scriptRaw: String = ScriptChoice.both.rawValue
     @AppStorage("settings.translation") private var translationRaw: String = TranslationChoice.manmohanSingh.rawValue
 

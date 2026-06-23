@@ -11,11 +11,14 @@ import WhisperKit
 /// Phase A.3; Phase A.4a moved it here so the StreamingASR facade can
 /// pick a provider per `@AppStorage("settings.asrProvider")`.
 ///
-/// **Model selection (Phase A.4a default = large-v3).** Caller passes
-/// a ``WhisperModel`` enum case. Whisper-large-v3 jumps significantly
-/// on Punjabi vs small (Phase 1 finding: large-v3 scored 96.6 on Japji
-/// recitation, small drifted to Telugu). First-time load downloads
-/// ~1.5 GB from `huggingface.co/argmaxinc/whisperkit-coreml`.
+/// **Model selection.** Caller passes a ``WhisperModel`` enum case;
+/// default is `.small` (~250 MB download). small drifts to Telugu on
+/// ambiguous Punjabi audio in Whisper-only mode (Phase 1 finding), but
+/// in Dual mode the Sarvam refinement covers that gap and the smaller
+/// download is the right v1 default — Deep's 2026-06-23 test showed
+/// the previous large-v3 default stuck at 0 % of a 1.5 GB pull. Users
+/// who want maximum on-device accuracy can explicitly select
+/// `.largeV3` from Settings → Voice recognition → Local model.
 public actor WhisperKitProvider: ASRProvider {
 
     // MARK: - ASRProvider identity (nonisolated)
@@ -78,7 +81,7 @@ public actor WhisperKitProvider: ASRProvider {
     // MARK: - Init
 
     public init(
-        model: WhisperModel = .largeV3,
+        model: WhisperModel = .small,
         language: String = "pa",
         silenceThreshold: Float = 0.6
     ) {
