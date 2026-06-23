@@ -31,6 +31,23 @@ final class AppContainer: ObservableObject {
     private var streamingAsr: StreamingASR?
     private var streamingTask: Task<Void, Never>?
 
+    /// Auto-open-shabad task scheduled by ``handleStateChange`` when
+    /// the matcher returns a single high-confidence match. Cancelled on
+    /// any subsequent state change so the user remains in control: if
+    /// the user keeps speaking and a different match wins, the prior
+    /// auto-open never fires. 1 s visual delay so the user sees what
+    /// matched before the navigation happens.
+    private var autoOpenTask: Task<Void, Never>?
+    /// The line.id the currently-scheduled auto-open is targeting. Used
+    /// to detect "same target, keep the task" vs "different target,
+    /// reschedule". Without this, every fresh `.listening` partial
+    /// would cancel + reschedule the 1-second delay and the auto-open
+    /// would never actually fire while the user keeps speaking.
+    private var scheduledAutoOpenLineId: String?
+    private static let autoOpenScoreThreshold: Double = 90.0
+    private static let autoOpenDelaySec: Double = 1.0
+    private static let autoOpenSettingKey = "settings.autoOpenExactMatches"
+
     // Bug I single-fire flag. `commitLiveStream` is async, so the
     // `guard case .listening = session.state` at its top doesn't gate
     // concurrent calls — multiple Stop taps (or a Stop tap + a
@@ -210,10 +227,49 @@ final class AppContainer: ObservableObject {
 
     func handleStateChange() {
         switch session.state {
+        case .listening(_, let liveMatches, _):
+            // Eligibility check. We schedule (or keep) an auto-open
+            // when all of the following hold:
+            //   1. Setting enabled (default ON).
+            //   2. Exactly one match in the confidence-filtered list.
+            //   3. That match's score is ≥ autoOpenScoreThreshold.
+            let autoOpenEnabled = (UserDefaults.standard.object(forKey: Self.autoOpenSettingKey) as? Bool) ?? true
+            guard autoOpenEnabled,
+                  liveMatches.count == 1,
+                  let top = liveMatches.first,
+                  top.score >= Self.autoOpenScoreThreshold else {
+                if autoOpenTask != nil {
+                    NSLog("[DIAG] AppContainer auto-open cancelled (eligibility lost)")
+                }
+                autoOpenTask?.cancel()
+                autoOpenTask = nil
+                scheduledAutoOpenLineId = nil
+                return
+            }
+            // Same target already scheduled? Leave the in-flight task
+            // alone — otherwise every fresh partial would reset the 1 s
+            // delay and auto-open would never fire while the Raagi is
+            // singing the very pangti we want to open.
+            if scheduledAutoOpenLineId == top.line.id, autoOpenTask != nil {
+                return
+            }
+            autoOpenTask?.cancel()
+            scheduledAutoOpenLineId = top.line.id
+            NSLog("[DIAG] AppContainer auto-open scheduled topScore=\(String(format: "%.1f", top.score)) ang=\(top.line.ang) pankti=\(top.line.pangti ?? -1) lineId=\(top.line.id) — firing in \(Self.autoOpenDelaySec)s unless cancelled")
+            autoOpenTask = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: UInt64(Self.autoOpenDelaySec * 1_000_000_000))
+                if Task.isCancelled { return }
+                guard let self else { return }
+                NSLog("[DIAG] AppContainer auto-open firing — navigatingTo ang=\(top.line.ang) pankti=\(top.line.pangti ?? -1)")
+                self.commitLive(match: top)
+            }
         case .done:
             // Auto-advance once: replace the recording / liveRecording
             // screen with results (so swipe-back from Results goes Home,
             // not back into recording).
+            autoOpenTask?.cancel()
+            autoOpenTask = nil
+            scheduledAutoOpenLineId = nil
             let lastIsRecordingMode: Bool = {
                 guard let last = path.last else { return false }
                 if case .recording = last { return true }
@@ -229,9 +285,14 @@ final class AppContainer: ObservableObject {
                 path.append(.results)
             }
         case .error:
+            autoOpenTask?.cancel()
+            autoOpenTask = nil
+            scheduledAutoOpenLineId = nil
             showErrorAlert = true
         default:
-            break
+            autoOpenTask?.cancel()
+            autoOpenTask = nil
+            scheduledAutoOpenLineId = nil
         }
     }
 
@@ -424,17 +485,14 @@ final class AppContainer: ObservableObject {
             // already stopped its mic via session.commit → asr.stop().
             clearStreamingAsr(reason: "commitDone")
 
-            // If the user tapped a row, open that Shabad directly instead
-            // of routing through Results. handleStateChange() already moved
-            // us to Results when .done fired; pop it back off + push Shabad.
+            // If the user tapped a row (or auto-open fired), open that
+            // Shabad directly. handleStateChange() already pushed
+            // .results when .done fired — KEEP it in the back stack so
+            // swipe-back from .shabad returns to the results list
+            // instead of dropping the user to Home. Path winds up as
+            // [.results, .shabad].
             if let preselected = preselected {
-                // Wait one runloop turn for handleStateChange to push
-                // .results, then replace with the shabad route. Cleaner
-                // than racing handleStateChange.
                 await MainActor.run {
-                    if case .results = self.path.last {
-                        self.path.removeLast()
-                    }
                     self.openShabad(for: preselected)
                 }
             }

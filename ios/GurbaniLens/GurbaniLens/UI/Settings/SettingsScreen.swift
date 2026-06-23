@@ -89,6 +89,11 @@ struct SettingsScreen: View {
     @AppStorage(CloudTrialPolicy.lastResetMonthKey) private var lastTrialResetMonth: String = ""
     @AppStorage("settings.debugCompareEnabled") private var debugCompareEnabled: Bool = false
 
+    // Phase A.4d UX flow: auto-open the matched Shabad when the live
+    // matcher returns a single high-confidence (≥90) result. Default
+    // ON. Off for users who prefer always seeing the result list.
+    @AppStorage("settings.autoOpenExactMatches") private var autoOpenExactMatches: Bool = true
+
     // Local UI state for the version-tap unlock + trial-exhausted modal.
     @State private var versionTapCount: Int = 0
     @State private var versionTapLastTime: Date = .distantPast
@@ -111,6 +116,21 @@ struct SettingsScreen: View {
                             silenceThresholdRaw = opt.rawValue
                         }
                     }
+                }
+
+                section("Auto-open exact matches") {
+                    Toggle(isOn: $autoOpenExactMatches) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Open Shabad automatically")
+                                .font(.system(size: 16))
+                                .foregroundColor(Theme.onSurface)
+                            Text("When the matcher is highly confident (single exact-match), open the Shabad after a 1-second confirmation pause. Turn off if you prefer to always see the result list.")
+                                .font(.system(size: 12))
+                                .foregroundColor(Theme.onSurfaceVariant)
+                        }
+                    }
+                    .tint(Theme.primary)
+                    .padding(.vertical, 4)
                 }
 
                 // Voice recognition parent section.

@@ -222,7 +222,45 @@ public final class VoiceSearchSession: ObservableObject {
         var pendingMatchTask: Task<Void, Never>? = nil
         var lastMatchedQuery = ""
 
+        // Silence auto-stop (added 2026-06-23). Track time of last
+        // above-threshold audio energy across partials; when 2.5 s of
+        // continuous silence has passed since the last speech sample
+        // AND the user actually spoke at some point, break the loop.
+        // The caller (AppContainer.startLiveStreamAndAwait) sees a
+        // natural return and runs commit → asr.stop() teardown.
+        // Below-threshold partials before the first speech sample are
+        // ignored so a quiet startup doesn't auto-stop the session.
+        var lastSpeechTime = Date()
+        var hasHeardSpeech = false
+        let silenceTimeoutSec: TimeInterval = 2.5
+        let speechEnergyThreshold: Float = 0.02
+
+        // Self-correcting transcript (added 2026-06-23). When the live
+        // matcher returns a high-confidence top match (score ≥ 90),
+        // override the raw ASR text with the matched line's canonical
+        // Gurmukhi. Reverts to raw text when the matcher's next pass
+        // drops below threshold. Captured here so both the snappy
+        // setListening path below AND the post-match Task can read /
+        // write it without an actor hop.
+        var lastConfidentDisplayText: String? = nil
+        let selfCorrectScoreThreshold: Double = 90.0
+
         for await partial in stream {
+            // Silence tracking — always run, regardless of partial
+            // content. Energy is per-tap; even transcript-less partials
+            // (Sarvam/dual energy-only Partials) carry it.
+            let now = Date()
+            if partial.bufferEnergy > speechEnergyThreshold {
+                hasHeardSpeech = true
+                lastSpeechTime = now
+            } else if hasHeardSpeech {
+                let silentFor = now.timeIntervalSince(lastSpeechTime)
+                if silentFor > silenceTimeoutSec {
+                    NSLog("[DIAG] VoiceSearchSession silence auto-stop fired after \(String(format: "%.2f", silentFor))s idle")
+                    break
+                }
+            }
+
             // Bug B freeze-last-good guard. If the new partial drops total
             // content drastically vs the previous AND the previous was
             // substantive, suppress the new partial — keep the prior text
@@ -253,9 +291,15 @@ public final class VoiceSearchSession: ObservableObject {
 
             // Snappy text + energy update. Preserve whatever liveMatches
             // are currently in state — the debounce task refreshes them.
+            // If the matcher has previously locked onto a high-confidence
+            // top, show its canonical Gurmukhi rather than the raw ASR
+            // text — the override survives until matcher confidence
+            // drops in a later pass (which sets lastConfidentDisplayText
+            // back to nil).
             let currentLiveMatches = prev?.matches ?? []
+            let snappyText = lastConfidentDisplayText ?? partial.gurmukhi
             setListening(
-                text: partial.gurmukhi,
+                text: snappyText,
                 liveMatches: currentLiveMatches,
                 bufferEnergy: partial.bufferEnergy
             )
@@ -285,12 +329,27 @@ public final class VoiceSearchSession: ObservableObject {
                 // Bug R: the enclosing Task inherits this @MainActor
                 // session's isolation under Swift 5.10+, so we're already
                 // on MainActor here — direct property access is safe.
-                // The previous explicit `await MainActor.run { … }` hop
-                // is what tripped the unsafeForcedSync runtime check
-                // (sync MainActor.run from a context already on MainActor).
                 guard let self = self else { return }
+
+                // Self-correcting transcript: when the top match crosses
+                // selfCorrectScoreThreshold, latch the canonical
+                // Gurmukhi as the display text until the next pass
+                // either re-confirms or drops below threshold.
+                if let top = liveMatches.first, top.score >= selfCorrectScoreThreshold {
+                    let matched = top.line.gurmukhiUnicode
+                        ?? Gurmukhi.fromAnmolLipi(top.line.gurmukhi)
+                    lastConfidentDisplayText = matched
+                    NSLog("[DIAG] VoiceSearchSession transcript self-correct applied topScore=\(String(format: "%.1f", top.score)) matched.head40=\"\(String(matched.prefix(40)))\"")
+                } else {
+                    if lastConfidentDisplayText != nil {
+                        NSLog("[DIAG] VoiceSearchSession transcript self-correct cleared (top dropped below threshold)")
+                    }
+                    lastConfidentDisplayText = nil
+                }
+
                 if case .listening(let t, _, let e) = self.state {
-                    self.setListening(text: t, liveMatches: liveMatches, bufferEnergy: e)
+                    let displayText = lastConfidentDisplayText ?? t
+                    self.setListening(text: displayText, liveMatches: liveMatches, bufferEnergy: e)
                 }
             }
             lastMatchedQuery = query
