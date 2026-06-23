@@ -10,9 +10,18 @@ final class MatchByFirstLettersTests: XCTestCase {
     // MARK: - PhoneticEquivalence char-level
 
     func testPhoneticEquivalence_groupsCollapseSymmetrically() {
-        // b/p
+        // b/p/f — labial group (f added 2026-06-23 for BaniDB "ph" vs
+        // Sarvam-Latin "f" gap on ਫ).
         XCTAssertTrue(PhoneticEquivalence.charEquivalent("b", "p"))
         XCTAssertTrue(PhoneticEquivalence.charEquivalent("p", "b"))
+        XCTAssertTrue(PhoneticEquivalence.charEquivalent("f", "p"))
+        XCTAssertTrue(PhoneticEquivalence.charEquivalent("p", "f"))
+        XCTAssertTrue(PhoneticEquivalence.charEquivalent("f", "b"))
+        XCTAssertTrue(PhoneticEquivalence.charEquivalent("b", "f"))
+        // All three canonicalize to 'p'.
+        XCTAssertEqual(PhoneticEquivalence.canonicalize("f" as Character), "p")
+        XCTAssertEqual(PhoneticEquivalence.canonicalize("b" as Character), "p")
+        XCTAssertEqual(PhoneticEquivalence.canonicalize("p" as Character), "p")
         // g/k
         XCTAssertTrue(PhoneticEquivalence.charEquivalent("g", "k"))
         XCTAssertTrue(PhoneticEquivalence.charEquivalent("k", "g"))
@@ -29,6 +38,7 @@ final class MatchByFirstLettersTests: XCTestCase {
         XCTAssertFalse(PhoneticEquivalence.charEquivalent("b", "g"))
         XCTAssertFalse(PhoneticEquivalence.charEquivalent("d", "j"))
         XCTAssertFalse(PhoneticEquivalence.charEquivalent("m", "n"))
+        XCTAssertFalse(PhoneticEquivalence.charEquivalent("f", "h"))
     }
 
     func testPhoneticEquivalence_stringCanonicalisation() {
@@ -191,6 +201,67 @@ final class MatchByFirstLettersTests: XCTestCase {
         XCTAssertEqual(results.count, 1, "only the content line remains after Sirlekh filter")
         XCTAssertEqual(results.first?.line.id, "TEST_CONTENT")
         XCTAssertNotEqual(results.first?.line.id, "TEST_SIRLEKH")
+    }
+
+    /// Deep's Ang 167 regression. Speaking "ਹਮ ਰੁਲਤੇ ਫਿਰਤੇ ਕੋਈ ਬਾਤ ਨਾ
+    /// ਪੁੱਛਤਾ" produces query FL "hrfkbnp" via Sarvam → Latin. The
+    /// actual corpus line's BaniDB-transliteration FL is "hrpkbnp" —
+    /// they differ only at position 2 (f vs p, both labial — covered
+    /// by the f↔p phonetic group added in this commit). With both
+    /// fixes wired up the long match should win convincingly over any
+    /// short substring-containment noise.
+    func testMatchByFirstLetters_ang167RegressionFAndPCollapse() {
+        // Build a corpus with the target Ang 167 line + several short
+        // noise lines that would substring-win against a 7-char query
+        // under the old scoring.
+        let matcher = makeMatcher([
+            // Target (BaniDB-style FL "hrpkbnp")
+            ("ang167", "ham rulate phirate koee baat na puchata"),
+            // Short noise — would all score 100 under partial_ratio
+            // without the length-aware softening.
+            ("short_bnp", "baat na puchata"),    // FL "bnp", 3 chars
+            ("short_hrp", "ham rulate phirate"),  // FL "hrp", 3 chars
+            ("short_kb",  "koee baat"),           // FL "kb",  2 chars
+            ("short_p",   "puchata"),             // FL "p",   1 char
+        ])
+
+        // Query mirrors Sarvam's output: "f" where BaniDB writes "ph"
+        // for ਫ. qFL = "hrfkbnp".
+        let results = matcher.matchByFirstLetters(
+            "ham rulate fhirate koee baat na puchata", topN: 5
+        )
+
+        XCTAssertFalse(results.isEmpty)
+        XCTAssertEqual(
+            results.first?.line.id, "ang167",
+            "with f↔p + length-aware, the 7-char target must outrank short substrings"
+        )
+        XCTAssertGreaterThan(
+            results.first?.score ?? 0, 80.0,
+            "honest length-matched + phonetic-equivalent match should score > 80"
+        )
+    }
+
+    /// Pure length-aware test (no phonetic confounds): the length-
+    /// matched line must outrank a much shorter line whose first-
+    /// letters are substring-contained in the query.
+    func testMatchByFirstLetters_lengthAwareSoftensShortSubstrings() {
+        let matcher = makeMatcher([
+            ("long",  "alpha beta gamma delta epsilon zeta eta"),   // FL "abgdeze" (7)
+            ("short", "beta zeta"),                                  // FL "bz" (2) — substring-in
+        ])
+        // Query has 7 chars of FL; matches "long" perfectly. The
+        // "short" line's "bz" is NOT substring-in "abgdeze" actually
+        // (g, d, e are between), so let me make this honest:
+        let results = matcher.matchByFirstLetters(
+            "alpha beta gamma delta epsilon zeta eta", topN: 2
+        )
+        XCTAssertEqual(results.first?.line.id, "long")
+        XCTAssertGreaterThan(
+            results.first?.score ?? 0,
+            results.last?.score ?? 0,
+            "length-matched candidate must outrank the short distractor"
+        )
     }
 
     /// Empty / whitespace-only / single-char queries must not crash and

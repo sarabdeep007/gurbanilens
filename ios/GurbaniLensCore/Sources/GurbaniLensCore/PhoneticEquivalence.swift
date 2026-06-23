@@ -20,12 +20,23 @@ import Foundation
 /// what matters is consistency.
 ///
 /// Groups:
-///   - {b, p} → p     (voiced/unvoiced labial plosives)
-///   - {g, k} → k     (voiced/unvoiced velar plosives)
-///   - {d, t} → t     (voiced/unvoiced dental plosives — also covers
-///                     retroflex ḍ/ṭ which Latin.from strips diacritics
-///                     from, so they arrive as plain d/t here)
-///   - {j, c} → c     (palatal pair — also covers ch)
+///   - {b, p, f} → p   (labial plosives + labio-dental fricative — see
+///                      below; BaniDB writes "ph" for ਫ while Sarvam's
+///                      Gurmukhi → Latin path emits "f" for the same
+///                      glyph, so f↔p closes that gap at the first-
+///                      letters layer)
+///   - {g, k}    → k   (voiced/unvoiced velar plosives)
+///   - {d, t}    → t   (voiced/unvoiced dental plosives — also covers
+///                      retroflex ḍ/ṭ which Latin.from strips diacritics
+///                      from, so they arrive as plain d/t here)
+///   - {j, c}    → c   (palatal pair — also covers ch)
+///
+/// Why f↔p (added 2026-06-23). Deep's "ਹਮ ਰੁਲਤੇ ਫਿਰਤੇ ..." test produced
+/// query FL "hrfkbnp" (Sarvam Gurmukhi → Latin → first letters) while
+/// the actual Ang 167 line's corpus FL is "hrpkbnp" (BaniDB's "ph"-for-
+/// ਫ convention). Without f↔p, the right line never matched. Treating
+/// f as the same group as p covers this without disturbing the existing
+/// pairs (no SGGS transliteration uses "f" elsewhere meaningfully).
 ///
 /// Aspirated variants (kh, gh, th, dh, ch, jh, bh, ph) are not collapsed:
 /// their first letter is the same as the unaspirated form, so they already
@@ -39,11 +50,11 @@ public enum PhoneticEquivalence {
     @inline(__always)
     public static func canonicalize(_ ch: Character) -> Character {
         switch ch {
-        case "b", "p": return "p"
-        case "g", "k": return "k"
-        case "d", "t": return "t"
-        case "j", "c": return "c"
-        default:       return ch
+        case "b", "p", "f": return "p"
+        case "g", "k":      return "k"
+        case "d", "t":      return "t"
+        case "j", "c":      return "c"
+        default:            return ch
         }
     }
 

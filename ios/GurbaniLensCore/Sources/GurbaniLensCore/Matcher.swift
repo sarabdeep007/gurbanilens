@@ -172,25 +172,42 @@ public final class Matcher: @unchecked Sendable {
         let qFL = Self.firstLettersOf(tokens: qTokens)
         if qFL.isEmpty { return [] }
         let qFLp = PhoneticEquivalence.canonicalize(qFL)
+        let qLen = qFLp.count
 
-        var scored: [(score: Double, index: Int)] = []
+        // Length-aware scoring (added 2026-06-23). partial_ratio alone
+        // returns 100 when a short line FL is substring-contained in a
+        // longer query FL — e.g. a 2-char content line trivially wins
+        // against a 7-char user query like "hrfkbnp", drowning out the
+        // honest 7-char target line. Soften by multiplying through
+        // sqrt(lengthFactor) so short lines still score but lose to
+        // length-matched candidates. Sqrt instead of linear because we
+        // want the penalty to be gentle (a 5-vs-7 character pair shouldn't
+        // be punished much) while a 2-vs-7 pair should drop noticeably.
+        var scored: [(effective: Double, partialRatio: Double, lengthFactor: Double, index: Int)] = []
         scored.reserveCapacity(phoneticFirstLetters.count)
         for (i, lineFLp) in phoneticFirstLetters.enumerated() {
             if lineFLp.isEmpty { continue }
-            let s = StringMetrics.partialRatio(qFLp, lineFLp)
-            scored.append((s, i))
+            let pr = StringMetrics.partialRatio(qFLp, lineFLp)
+            let lLen = lineFLp.count
+            let lf = Double(min(qLen, lLen)) / Double(max(qLen, lLen))
+            let effective = pr * sqrt(lf)
+            scored.append((effective, pr, lf, i))
         }
-        scored.sort { $0.score > $1.score }
+        scored.sort { $0.effective > $1.effective }
         let top = Array(scored.prefix(topN))
         let totalMs = Int(Date().timeIntervalSince(totalStart) * 1000)
 
-        NSLog("[DIAG] Matcher.matchByFirstLetters totalLines=\(phoneticFirstLetters.count) qFL=\"\(qFL)\" qFLp=\"\(qFLp)\" topScore=\(top.first.map { String(format: "%.1f", $0.score) } ?? "n/a") totalMs=\(totalMs)")
+        let topEff = top.first.map { String(format: "%.1f", $0.effective) } ?? "n/a"
+        let topPR = top.first.map { String(format: "%.1f", $0.partialRatio) } ?? "n/a"
+        let topLF = top.first.map { String(format: "%.2f", $0.lengthFactor) } ?? "n/a"
+        let topLineFL = top.first.map { phoneticFirstLetters[$0.index] } ?? ""
+        NSLog("[DIAG] Matcher.matchByFirstLetters totalLines=\(phoneticFirstLetters.count) qFL=\"\(qFL)\" qFLp=\"\(qFLp)\" topEffective=\(topEff) topPR=\(topPR) topLF=\(topLF) topLineFL=\"\(topLineFL)\" totalMs=\(totalMs)")
 
         return top.map { entry in
             Match(
                 line: lines[entry.index],
-                score: entry.score,
-                partialRatio: entry.score,
+                score: entry.effective,
+                partialRatio: entry.partialRatio,
                 coverage: 1.0
             )
         }
@@ -213,12 +230,24 @@ public final class Matcher: @unchecked Sendable {
         let candidateIndices: [Int]
         let usedPrefilter: Bool
         if qFL.count >= Self.prefilterMinQueryFL {
+            // Length-aware softening (added 2026-06-23) — same rationale
+            // as matchByFirstLetters: a short Pankti FL substring-
+            // matching a long query FL trivially scores 100, which can
+            // crowd out honest length-matched candidates from the top
+            // prefilterPoolCap. Sqrt(lf) penalty keeps the recall
+            // property strong (target line stays in top 1500) while
+            // making the prefilter behave more like the Python
+            // canonical's no-prefilter full-scan baseline.
+            let qFLLen = qFL.count
             var scored: [(score: Double, index: Int)] = []
             scored.reserveCapacity(firstLetters.count)
             for (i, lineFL) in firstLetters.enumerated() {
                 if lineFL.isEmpty { continue }
-                let s = StringMetrics.partialRatio(qFL, lineFL)
-                scored.append((s, i))
+                let pr = StringMetrics.partialRatio(qFL, lineFL)
+                let lLen = lineFL.count
+                let lf = Double(min(qFLLen, lLen)) / Double(max(qFLLen, lLen))
+                let effective = pr * sqrt(lf)
+                scored.append((effective, i))
             }
             // Partial sort by score desc; keep top prefilterPoolCap.
             scored.sort { $0.score > $1.score }
