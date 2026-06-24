@@ -115,10 +115,24 @@ public actor WhisperKitProvider: ASRProvider {
         self.currentStream = stream
         self.currentContinuation = cont
 
-        // Build / reuse the WhisperKit pipe.
+        // Build / reuse the WhisperKit pipe. Lookup order:
+        //   1. Already-loaded pipe on this provider instance (same
+        //      provider doing start → stop → start in one session).
+        //   2. Process-wide WhisperKitPipeCache (different provider
+        //      instance for the same model — AppContainer recreates
+        //      StreamingASR + WhisperKitProvider between mic taps,
+        //      so without this cache every tap re-validated and
+        //      sometimes re-downloaded the ~770 MB medium model.
+        //      Deep's 2026-06-24 bug report.)
+        //   3. Fresh WhisperKit(config) load.
         let pipe: WhisperKit
         if let existing = self.pipe {
             pipe = existing
+        } else if let cached = WhisperKitPipeCache.shared.cached(for: model.rawValue) {
+            NSLog("[DIAG] WhisperKitProvider cache hit — reusing instance for model=\(model.rawValue)")
+            pipe = cached
+            self.pipe = cached
+            downloadProgressContinuation?.yield(1.0)
         } else {
             downloadProgressContinuation?.yield(0.0)
             let compute = ModelComputeOptions(
@@ -166,6 +180,7 @@ public actor WhisperKitProvider: ASRProvider {
                 }
                 throw error
             }
+            WhisperKitPipeCache.shared.store(pipe, for: model.rawValue)
             self.pipe = pipe
             downloadProgressContinuation?.yield(1.0)
             NSLog("[DIAG] WhisperKitProvider.start pipe loaded")
@@ -353,5 +368,31 @@ public actor WhisperKitProvider: ASRProvider {
     private func finishStream() {
         currentContinuation?.finish()
         currentContinuation = nil
+    }
+}
+
+/// Process-wide cache of loaded WhisperKit pipes keyed by model name.
+/// Lives outside ``WhisperKitProvider`` so the pipe survives across
+/// provider lifecycle — AppContainer clears `streamingAsr` after each
+/// commit / returnHome / cancel, which would otherwise drop the pipe
+/// and force WhisperKit to re-validate (and sometimes re-download)
+/// the ~770 MB medium model on every mic tap (Deep's 2026-06-24
+/// bug report). The cache holds at most one pipe per distinct model
+/// rawValue; switching models in Settings doesn't evict the previous
+/// one (rare action, not worth the eviction logic for v1).
+private final class WhisperKitPipeCache: @unchecked Sendable {
+    static let shared = WhisperKitPipeCache()
+
+    private let lock = NSLock()
+    private var pipes: [String: WhisperKit] = [:]
+
+    func cached(for modelName: String) -> WhisperKit? {
+        lock.lock(); defer { lock.unlock() }
+        return pipes[modelName]
+    }
+
+    func store(_ pipe: WhisperKit, for modelName: String) {
+        lock.lock(); defer { lock.unlock() }
+        pipes[modelName] = pipe
     }
 }

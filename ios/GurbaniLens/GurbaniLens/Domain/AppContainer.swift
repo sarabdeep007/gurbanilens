@@ -90,7 +90,7 @@ final class AppContainer: ObservableObject {
             return
         }
         switch session.state {
-        case .listening, .committing:
+        case .listening, .searching:
             NSLog("[DIAG] AppContainer.startRecording REFUSED — session in live state \(String(describing: session.state)) (Bug F guard)")
             return
         default:
@@ -429,7 +429,7 @@ final class AppContainer: ObservableObject {
         // firing simultaneously, etc.) are guaranteed to no-op except
         // for the first one. The state guard below is necessary but not
         // sufficient — by the time we await ensureStreamingAsr the second
-        // caller might still see state == .listening because setCommitting
+        // caller might still see state == .listening because setSearching
         // hasn't run yet on the first caller.
         if commitInFlight {
             NSLog("[DIAG] AppContainer.commitLiveStream re-entry blocked (commitInFlight=true)")
@@ -441,8 +441,8 @@ final class AppContainer: ObservableObject {
         // Guard: only commit while we're actually listening / committing.
         // If the session is already .done (e.g. duplicate Stop tap), no-op.
         guard case .listening = session.state else {
-            if case .committing = session.state {
-                NSLog("[DIAG] AppContainer.commitLiveStream already .committing — skipping")
+            if case .searching = session.state {
+                NSLog("[DIAG] AppContainer.commitLiveStream already .searching — skipping")
             } else {
                 NSLog("[DIAG] AppContainer.commitLiveStream skipping (state=\(String(describing: session.state)))")
             }

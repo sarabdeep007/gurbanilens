@@ -46,6 +46,42 @@ struct LiveResultsScreen: View {
     @State private var showCompareSheet: Bool = false
 
     var body: some View {
+        Group {
+            if case .searching(let text) = session.state {
+                searchingView(text: text)
+            } else {
+                listeningView
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .themed()
+        .navigationTitle(navTitle)
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .navigationBarLeading) {
+                Button(action: onCancel) {
+                    Image(systemName: "xmark").foregroundColor(Theme.onBackground)
+                }.accessibilityLabel("Cancel")
+            }
+            if debugCompareEnabled {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button(action: { showCompareSheet = true }) {
+                        Image(systemName: "rectangle.split.3x1")
+                            .foregroundColor(Theme.onBackground)
+                    }.accessibilityLabel("Compare providers (debug)")
+                }
+            }
+        }
+        .sheet(isPresented: $showCompareSheet) {
+            NavigationStack {
+                CompareScreen(onDismiss: { showCompareSheet = false })
+            }
+        }
+    }
+
+    // MARK: - Body branches
+
+    private var listeningView: some View {
         VStack(spacing: 0) {
             // Bounded transcript header.
             transcriptHeader
@@ -74,30 +110,37 @@ struct LiveResultsScreen: View {
                 .padding(.horizontal, 16)
                 .padding(.vertical, 12)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .themed()
-        .navigationTitle("Listening…")
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItem(placement: .navigationBarLeading) {
-                Button(action: onCancel) {
-                    Image(systemName: "xmark").foregroundColor(Theme.onBackground)
-                }.accessibilityLabel("Cancel")
+    }
+
+    /// Center-screen "searching" UI shown while ``Matcher.match`` is
+    /// running on the accumulated transcript. The bottom Stop pill is
+    /// intentionally absent here — capture is already stopped; there's
+    /// nothing to interrupt. The Cancel toolbar button still works if
+    /// the user wants to bail before the matcher finishes.
+    private func searchingView(text: String) -> some View {
+        VStack(spacing: 16) {
+            Spacer()
+            ProgressView()
+                .controlSize(.large)
+                .tint(Theme.primary)
+            Text("ਖੋਜ ਰਹੇ ਹਾਂ…")
+                .font(.headline)
+                .foregroundColor(Theme.onSurface)
+            if !text.isEmpty {
+                Text(text)
+                    .font(.body)
+                    .foregroundColor(Theme.onSurfaceVariant)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 24)
             }
-            if debugCompareEnabled {
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Button(action: { showCompareSheet = true }) {
-                        Image(systemName: "rectangle.split.3x1")
-                            .foregroundColor(Theme.onBackground)
-                    }.accessibilityLabel("Compare providers (debug)")
-                }
-            }
+            Spacer()
         }
-        .sheet(isPresented: $showCompareSheet) {
-            NavigationStack {
-                CompareScreen(onDismiss: { showCompareSheet = false })
-            }
-        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private var navTitle: String {
+        if case .searching = session.state { return "Searching…" }
+        return "Listening…"
     }
 
     // MARK: - Header
@@ -272,8 +315,8 @@ struct LiveResultsScreen: View {
         switch session.state {
         case .listening(let t, _, _):
             return t
-        case .committing(let q):
-            return q
+        case .searching(let t):
+            return t
         default:
             return ""
         }
@@ -291,9 +334,9 @@ struct LiveResultsScreen: View {
 
     private var stopLabel: String {
         switch session.state {
-        case .committing: return "Searching…"
-        case .done:       return "Done"
-        default:          return "Stop"
+        case .searching: return "Searching…"
+        case .done:      return "Done"
+        default:         return "Stop"
         }
     }
 }

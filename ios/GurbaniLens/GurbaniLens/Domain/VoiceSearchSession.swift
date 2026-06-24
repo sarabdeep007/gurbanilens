@@ -41,7 +41,15 @@ public final class VoiceSearchSession: ObservableObject {
             liveMatches: [Match],
             bufferEnergy: Float
         )
-        case committing(query: String)
+        /// **v2 only.** Audio capture has stopped; the full
+        /// ``Matcher.match`` is running on the accumulated transcript.
+        /// `text` is the Gurmukhi snapshot the matcher is processing
+        /// — displayed under the "ਖੋਜ ਰਹੇ ਹਾਂ…" spinner in
+        /// LiveResultsScreen so the user has visible feedback that
+        /// the system is working (renamed from `.committing` on
+        /// 2026-06-24 so the UI state machine matches what the user
+        /// actually sees on screen).
+        case searching(text: String)
         // shared terminal cases
         case done(SearchResult)
         case error(String)
@@ -57,7 +65,7 @@ public final class VoiceSearchSession: ObservableObject {
                 return at == bt
                     && am.map(\.line.id) == bm.map(\.line.id)
                     && ae == be_
-            case (.committing(let a), .committing(let b)):
+            case (.searching(let a), .searching(let b)):
                 return a == b
             case (.done(let a), .done(let b)):
                 return a.transcript == b.transcript
@@ -108,9 +116,9 @@ public final class VoiceSearchSession: ObservableObject {
         state = .listening(text: text, liveMatches: liveMatches, bufferEnergy: bufferEnergy)
     }
 
-    public func setCommitting(query: String) {
-        NSLog("[DIAG] VoiceSearchSession state → committing (query.len=\(query.count))")
-        state = .committing(query: query)
+    public func setSearching(text: String, reason: String = "manual") {
+        NSLog("[DIAG] VoiceSearchSession state → searching (reason=\(reason) text.len=\(text.count) text.head40=\"\(String(text.prefix(40)))\")")
+        state = .searching(text: text)
     }
 
     // MARK: - Terminal setters
@@ -291,13 +299,32 @@ public final class VoiceSearchSession: ObservableObject {
 
             // Snappy text + energy update. Preserve whatever liveMatches
             // are currently in state — the debounce task refreshes them.
-            // If the matcher has previously locked onto a high-confidence
-            // top, show its canonical Gurmukhi rather than the raw ASR
-            // text — the override survives until matcher confidence
-            // drops in a later pass (which sets lastConfidentDisplayText
-            // back to nil).
+            //
+            // Display-text priority:
+            //   1. lastConfidentDisplayText if the matcher has locked
+            //      a high-confidence top — that survives until matcher
+            //      confidence drops in a later pass.
+            //   2. partial.gurmukhi if the partial actually carries
+            //      transcript text (Whisper-live partial, Sarvam
+            //      segment).
+            //   3. prev.text — energy-only partials (Sarvam's
+            //      recordPeak yields empty text/gurmukhi at ~10/sec
+            //      to drive the VU meter) MUST NOT wipe the
+            //      accumulated transcript or the placeholder
+            //      "ਸੁਣ ਰਿਹਾ ਹਾਂ…" flashes over every word the user
+            //      speaks (Deep's 2026-06-24 bug report). The Bug-B
+            //      freeze-last-good guard only fires for prevLen > 12,
+            //      so short transcripts were also being wiped — this
+            //      catches every length.
             let currentLiveMatches = prev?.matches ?? []
-            let snappyText = lastConfidentDisplayText ?? partial.gurmukhi
+            let snappyText: String
+            if let confident = lastConfidentDisplayText {
+                snappyText = confident
+            } else if !partial.gurmukhi.isEmpty {
+                snappyText = partial.gurmukhi
+            } else {
+                snappyText = prev?.text ?? ""
+            }
             setListening(
                 text: snappyText,
                 liveMatches: currentLiveMatches,
@@ -360,7 +387,7 @@ public final class VoiceSearchSession: ObservableObject {
     }
 
     /// Stop the stream and run the full ``Matcher/match(_:topN:)`` on the
-    /// accumulated transcript. Transitions through `.committing` →
+    /// accumulated transcript. Transitions through `.searching` →
     /// `.done(result)`.
     @discardableResult
     public func commit(
@@ -385,7 +412,7 @@ public final class VoiceSearchSession: ObservableObject {
         NSLog("[DIAG] VoiceSearchSession.commit source.len=\(gurmukhiSource.count) queryLatin.len=\(queryLatin.count) queryLatin.head60=\"\(String(queryLatin.prefix(60)))\"")
 
         await asr.stop()
-        setCommitting(query: gurmukhiSource)
+        setSearching(text: gurmukhiSource, reason: "commit")
 
         let matches: [Match]
         if queryLatin.isEmpty {
