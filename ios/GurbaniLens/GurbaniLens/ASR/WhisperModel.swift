@@ -52,4 +52,20 @@ public enum WhisperModel: String, Codable, CaseIterable, Identifiable, Sendable 
         case .tiny:    return "≈ 75 MB"
         }
     }
+
+    /// Machine-readable size in bytes — used by ``WhisperKitProvider``'s
+    /// download-progress polling task to compute fraction-of-total from
+    /// the on-disk model directory size. Numbers mirror
+    /// ``approximateSize`` (slightly rounded down to be defensive — if
+    /// the actual download is a bit smaller, we cap at 0.95 anyway and
+    /// then jump to 1.0 when WhisperKit init returns).
+    public var approximateBytes: Int64 {
+        switch self {
+        case .largeV3: return 1_550_000_000
+        case .medium:  return   770_000_000
+        case .small:   return   245_000_000
+        case .base:    return   145_000_000
+        case .tiny:    return    75_000_000
+        }
+    }
 }

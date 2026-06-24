@@ -135,11 +135,31 @@ public actor WhisperKitProvider: ASRProvider {
             downloadProgressContinuation?.yield(1.0)
         } else {
             downloadProgressContinuation?.yield(0.0)
-            let compute = ModelComputeOptions(
-                melCompute: .cpuAndGPU,
-                audioEncoderCompute: .cpuAndNeuralEngine,
-                textDecoderCompute: .cpuAndNeuralEngine
-            )
+            // Compute-unit selection — model-conditional. Deep's
+            // 2026-06-24 iPhone test: large-v3's TextDecoder /
+            // AudioEncoder MIL programs exceed Apple Neural Engine
+            // capacity on consumer iPhones — the load fails with
+            // "Program load failure (0x20004)" / "ANE model load has
+            // failed" / "ANECF error" for ~6 minutes of retries before
+            // giving up. Medium loaded fine on the same device, same
+            // session. Fall back to CPU+GPU for large-v3 only — slower
+            // per-inference but it actually loads. Smaller models keep
+            // the ANE path because that's where they fit best.
+            let compute: ModelComputeOptions
+            if model == .largeV3 {
+                NSLog("[DIAG] WhisperKitProvider.start large-v3 → using CPU+GPU compute (ANE incompatible at this model size on consumer iPhones)")
+                compute = ModelComputeOptions(
+                    melCompute: .cpuAndGPU,
+                    audioEncoderCompute: .cpuAndGPU,
+                    textDecoderCompute: .cpuAndGPU
+                )
+            } else {
+                compute = ModelComputeOptions(
+                    melCompute: .cpuAndGPU,
+                    audioEncoderCompute: .cpuAndNeuralEngine,
+                    textDecoderCompute: .cpuAndNeuralEngine
+                )
+            }
             let config = WhisperKitConfig(
                 model: model.rawValue,
                 modelFolder: nil,
@@ -150,10 +170,34 @@ public actor WhisperKitProvider: ASRProvider {
                 load: true,
                 download: true
             )
+
+            // File-size polling so the user sees a moving progress bar
+            // instead of "0 %" for 10 minutes on a large-v3 cellular
+            // download. The polling task runs detached, snapshots the
+            // model directory's on-disk size every 500 ms, divides by
+            // approximateBytes, caps at 0.95, and yields into the same
+            // downloadProgressContinuation the UI subscribes to. Cap is
+            // 0.95 so the bar doesn't sit at 100 % for a beat while
+            // WhisperKit's CoreML compile + ANE-validation finishes;
+            // the final 1.0 yield fires after `try await WhisperKit`
+            // returns. Cancelled in both success and failure paths.
+            let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            let modelDir = docs.appendingPathComponent("huggingface/models/argmaxinc/whisperkit-coreml/\(model.rawValue)")
+            let totalBytes = model.approximateBytes
+            let pollingTask = Task.detached(priority: .background) { [weak self] in
+                while !Task.isCancelled {
+                    let size = WhisperKitProvider.directorySize(at: modelDir)
+                    let progress = min(Float(0.95), Float(Double(size) / Double(totalBytes)))
+                    await self?.yieldDownloadProgress(progress)
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                }
+            }
+
             NSLog("[DIAG] WhisperKitProvider.start loading \(model.rawValue) (this may download ~\(model.approximateSize) on first launch)")
             do {
                 pipe = try await WhisperKit(config)
             } catch {
+                pollingTask.cancel()
                 // Corrupted-download detection. A partial / interrupted
                 // model pull leaves CoreML files that fail to load with
                 // messages like "Failed to parse ML Program", "Error in
@@ -165,9 +209,18 @@ public actor WhisperKitProvider: ASRProvider {
                 let looksCorrupted = msg.contains("Failed to parse ML Program")
                     || msg.contains("Error in reading the MIL network")
                     || msg.contains("cannot be read")
+                // ANE-load failure detection (added 2026-06-24). Files
+                // ARE valid on disk — the model is just too big or
+                // shaped wrong for this device's Neural Engine. Don't
+                // purge; surface a distinct error so the UI can suggest
+                // a smaller model. With Fix 1 above large-v3 already
+                // avoids the ANE path, but this catch covers
+                // future-models-on-older-iPhones too.
+                let aneLoadFailure = msg.contains("Program load failure")
+                    || msg.contains("ANE model load has failed")
+                    || msg.contains("ANECF error")
+                    || msg.contains("0x20004")
                 if looksCorrupted {
-                    let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-                    let modelDir = docs.appendingPathComponent("huggingface/models/argmaxinc/whisperkit-coreml/\(model.rawValue)")
                     let removed: Bool
                     do {
                         try FileManager.default.removeItem(at: modelDir)
@@ -177,9 +230,13 @@ public actor WhisperKitProvider: ASRProvider {
                     }
                     NSLog("[DIAG] WhisperKitProvider corrupted model detected — purged=\(removed) path=\(modelDir.path), will redownload on next start")
                     throw WhisperKitProviderError.corruptedModelPurged
+                } else if aneLoadFailure {
+                    NSLog("[DIAG] WhisperKitProvider ANE load failure — model files valid on disk but Apple Neural Engine refused to load (likely too large for this device). err=\(msg.prefix(200))")
+                    throw WhisperKitProviderError.aneIncompatible
                 }
                 throw error
             }
+            pollingTask.cancel()
             WhisperKitPipeCache.shared.store(pipe, for: model.rawValue)
             self.pipe = pipe
             downloadProgressContinuation?.yield(1.0)
@@ -272,12 +329,20 @@ public actor WhisperKitProvider: ASRProvider {
         /// on disk and purged the cache directory. The next `start()`
         /// call will pull the model fresh from huggingface.co.
         case corruptedModelPurged
+        /// Raised when the model files are valid on disk but the Apple
+        /// Neural Engine refuses to load them (typically because the
+        /// model is too large for this device's ANE). Files are NOT
+        /// purged — they're fine on a different compute path. UI
+        /// should suggest picking a smaller model size.
+        case aneIncompatible
         public var errorDescription: String? {
             switch self {
             case .missingTokenizer:
                 return "WhisperKit pipe has no tokenizer loaded — model download / load may have failed."
             case .corruptedModelPurged:
                 return "Voice model download was incomplete — cleared and ready to retry. Please tap Listen again."
+            case .aneIncompatible:
+                return "Voice model isn't compatible with this iPhone's Neural Engine. Tap Reset Whisper Models in Settings and try a smaller model size (Medium recommended)."
             }
         }
     }
@@ -385,6 +450,38 @@ public actor WhisperKitProvider: ASRProvider {
     private func finishStream() {
         currentContinuation?.finish()
         currentContinuation = nil
+    }
+
+    /// Actor-isolated yield onto the download-progress stream — called
+    /// from the file-size polling Task during model fetch. The Task
+    /// hops back into the actor via `await self?.yieldDownloadProgress`
+    /// so writes to the continuation happen serialised against other
+    /// actor work.
+    fileprivate func yieldDownloadProgress(_ p: Float) {
+        downloadProgressContinuation?.yield(p)
+    }
+
+    /// Recursive on-disk byte count under `url`. Off-actor (`nonisolated
+    /// static`) so the polling Task can call it without a hop. Returns 0
+    /// when the directory doesn't exist yet or any error is hit — the
+    /// caller treats 0 as 0% progress, which is correct for "download
+    /// hasn't started writing files yet".
+    public nonisolated static func directorySize(at url: URL) -> Int64 {
+        let fm = FileManager.default
+        guard let enumerator = fm.enumerator(
+            at: url,
+            includingPropertiesForKeys: [.fileSizeKey],
+            options: []
+        ) else {
+            return 0
+        }
+        var total: Int64 = 0
+        for case let fileURL as URL in enumerator {
+            if let size = try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize {
+                total += Int64(size)
+            }
+        }
+        return total
     }
 }
 
