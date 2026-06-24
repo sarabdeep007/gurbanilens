@@ -79,6 +79,12 @@ public actor WhisperLiveTranscriber {
     /// is loaded (first call may take seconds for model download +
     /// CoreML compile). Subsequent calls reuse the loaded pipe.
     public func start(audioStream: AsyncStream<Data>) async throws {
+        // Instance + model trace so concurrent / duplicate-construction
+        // scenarios can be spotted in the logs. If two of these IDs
+        // show up in one session, something's instantiating multiple
+        // live transcribers behind our back (which would explain CPU
+        // starvation + the 14 000 ms transcribeMs Deep saw).
+        NSLog("[DIAG] WhisperLiveTranscriber.start instance=\(ObjectIdentifier(self).hashValue) modelName=\(Self.modelName)")
         let (stream, cont) = AsyncStream.makeStream(of: Partial.self)
         self.partialsStream = stream
         self.partialsContinuation = cont
@@ -191,6 +197,16 @@ public actor WhisperLiveTranscriber {
             let gurmukhi = Gurmukhi.fromDevanagari(combined)
 
             NSLog("[DIAG] WhisperLiveTranscriber chunk #\(loopCount) bufferSec=\(String(format: "%.2f", Double(samples.count)/16_000)) transcribeMs=\(transcribeMs) partialLen=\(combined.count) gurmukhi.head40=\"\(String(gurmukhi.prefix(40)))\"")
+            if transcribeMs > 3000 {
+                // 3 s for a 1–5 s small-model transcribe is at least
+                // an order of magnitude past expected. Most likely
+                // culprits: (a) another WhisperKit pipe instance is
+                // active and the CPU/ANE is contended, (b) a partial
+                // CoreML model load is mid-recovery, or (c) thermal
+                // throttling. The instance log at start time pairs
+                // with this one to identify (a).
+                NSLog("[DIAG] WhisperLiveTranscriber SLOW PATH transcribeMs=\(transcribeMs) — possible CPU starvation or model conflict")
+            }
 
             let partial = Partial(
                 text: combined,

@@ -63,12 +63,14 @@ public actor StreamingASR {
     }
 
     public nonisolated static func currentWhisperModel() -> WhisperModel {
-        // Default flipped from .largeV3 → .small 2026-06-23 — see
-        // WhisperKitProvider kdoc. New installs without an explicit
-        // pick get the ~250 MB model rather than the 1.5 GB one.
+        // Default: .medium (~770 MB). small drifts to Telugu on
+        // Punjabi audio (Phase 1) — unacceptable for Whisper-only
+        // mode. large-v3 (1.5 GB) is too heavy as the install
+        // baseline; medium is the right balance. Users can still
+        // pick either explicitly in Settings.
         let raw = UserDefaults.standard.string(forKey: "settings.whisperModel")
-            ?? WhisperModel.small.rawValue
-        return WhisperModel(rawValue: raw) ?? .small
+            ?? WhisperModel.medium.rawValue
+        return WhisperModel(rawValue: raw) ?? .medium
     }
 
     public nonisolated static func currentSilenceThreshold() -> Float {

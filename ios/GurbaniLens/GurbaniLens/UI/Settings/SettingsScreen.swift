@@ -79,11 +79,13 @@ struct SettingsScreen: View {
     @AppStorage("settings.searchMode") private var searchModeRaw: String = SearchModeChoice.live.rawValue
     @AppStorage("settings.silenceThreshold") private var silenceThresholdRaw: String = SilenceThresholdChoice.balanced.rawValue
     @AppStorage("settings.asrProvider") private var asrProviderRaw: String = ASRProviderId.whisperKit.rawValue
-    // Default flipped from .largeV3 → .small 2026-06-23: 1.5 GB
-    // download was unacceptable as the v1 baseline (Deep stuck at 0 %
-    // on first launch). small is fine in Dual mode (Sarvam handles
-    // Punjabi quality); users can still pick largeV3 explicitly.
-    @AppStorage("settings.whisperModel") private var whisperModelRaw: String = WhisperModel.small.rawValue
+    // Default = .medium (~770 MB). small drifts to Telugu on Punjabi
+    // (Phase 1) — unacceptable for Whisper-only mode where there's no
+    // cloud fallback. large-v3 (1.5 GB) is too heavy as the install
+    // baseline. medium is Punjabi-competent without the prohibitive
+    // download. Users wanting maximum accuracy can pick .largeV3 from
+    // the model picker below.
+    @AppStorage("settings.whisperModel") private var whisperModelRaw: String = WhisperModel.medium.rawValue
     @AppStorage("settings.script") private var scriptRaw: String = ScriptChoice.both.rawValue
     @AppStorage("settings.translation") private var translationRaw: String = TranslationChoice.manmohanSingh.rawValue
 

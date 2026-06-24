@@ -12,13 +12,17 @@ import WhisperKit
 /// pick a provider per `@AppStorage("settings.asrProvider")`.
 ///
 /// **Model selection.** Caller passes a ``WhisperModel`` enum case;
-/// default is `.small` (~250 MB download). small drifts to Telugu on
-/// ambiguous Punjabi audio in Whisper-only mode (Phase 1 finding), but
-/// in Dual mode the Sarvam refinement covers that gap and the smaller
-/// download is the right v1 default — Deep's 2026-06-23 test showed
-/// the previous large-v3 default stuck at 0 % of a 1.5 GB pull. Users
-/// who want maximum on-device accuracy can explicitly select
-/// `.largeV3` from Settings → Voice recognition → Local model.
+/// default is `.medium` (~770 MB download). Phase 1 finding
+/// established small drifts to Telugu on ambiguous Punjabi audio —
+/// unacceptable for Whisper-only mode where there's no cloud
+/// fallback. large-v3 scored 96.6 on Japji recitation but the 1.5 GB
+/// initial pull is too heavy as a v1 default. medium is the right
+/// balance: Punjabi-competent without the prohibitive download. Users
+/// wanting maximum accuracy can select `.largeV3` from Settings →
+/// Voice recognition → Local model. ``WhisperLiveTranscriber`` (used
+/// by ``DualLiveProvider`` for word-by-word partials) stays hardcoded
+/// at small — quality there is irrelevant because Sarvam refines at
+/// VAD boundaries.
 public actor WhisperKitProvider: ASRProvider {
 
     // MARK: - ASRProvider identity (nonisolated)
@@ -81,7 +85,7 @@ public actor WhisperKitProvider: ASRProvider {
     // MARK: - Init
 
     public init(
-        model: WhisperModel = .small,
+        model: WhisperModel = .medium,
         language: String = "pa",
         silenceThreshold: Float = 0.6
     ) {
@@ -133,7 +137,35 @@ public actor WhisperKitProvider: ASRProvider {
                 download: true
             )
             NSLog("[DIAG] WhisperKitProvider.start loading \(model.rawValue) (this may download ~\(model.approximateSize) on first launch)")
-            pipe = try await WhisperKit(config)
+            do {
+                pipe = try await WhisperKit(config)
+            } catch {
+                // Corrupted-download detection. A partial / interrupted
+                // model pull leaves CoreML files that fail to load with
+                // messages like "Failed to parse ML Program", "Error in
+                // reading the MIL network", or "...cannot be read". The
+                // file is on disk so WhisperKit's auto-download skip
+                // path then refuses to re-fetch. Purge the cached model
+                // directory so the next start() pulls fresh.
+                let msg = error.localizedDescription
+                let looksCorrupted = msg.contains("Failed to parse ML Program")
+                    || msg.contains("Error in reading the MIL network")
+                    || msg.contains("cannot be read")
+                if looksCorrupted {
+                    let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                    let modelDir = docs.appendingPathComponent("huggingface/models/argmaxinc/whisperkit-coreml/\(model.rawValue)")
+                    let removed: Bool
+                    do {
+                        try FileManager.default.removeItem(at: modelDir)
+                        removed = true
+                    } catch {
+                        removed = false
+                    }
+                    NSLog("[DIAG] WhisperKitProvider corrupted model detected — purged=\(removed) path=\(modelDir.path), will redownload on next start")
+                    throw WhisperKitProviderError.corruptedModelPurged
+                }
+                throw error
+            }
             self.pipe = pipe
             downloadProgressContinuation?.yield(1.0)
             NSLog("[DIAG] WhisperKitProvider.start pipe loaded")
@@ -221,10 +253,16 @@ public actor WhisperKitProvider: ASRProvider {
 
     public enum WhisperKitProviderError: LocalizedError {
         case missingTokenizer
+        /// Raised after we've detected a partial / unparseable model
+        /// on disk and purged the cache directory. The next `start()`
+        /// call will pull the model fresh from huggingface.co.
+        case corruptedModelPurged
         public var errorDescription: String? {
             switch self {
             case .missingTokenizer:
                 return "WhisperKit pipe has no tokenizer loaded — model download / load may have failed."
+            case .corruptedModelPurged:
+                return "Voice model download was incomplete — cleared and ready to retry. Please tap Listen again."
             }
         }
     }
