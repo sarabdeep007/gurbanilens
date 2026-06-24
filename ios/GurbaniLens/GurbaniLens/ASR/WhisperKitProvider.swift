@@ -64,6 +64,17 @@ public actor WhisperKitProvider: ASRProvider {
     private var downloadProgressContinuation: AsyncStream<Float>.Continuation?
     private let downloadProgressStream: AsyncStream<Float>
     public nonisolated let downloadProgress: AsyncStream<Float>
+    /// Latches true once the WhisperKit pipe has loaded in the current
+    /// session and 1.0 has been yielded; latches false at the top of
+    /// every fresh `start()`. Gates ``yieldDownloadProgress`` so that
+    /// stale polling-task hops already queued on the actor mailbox
+    /// can't overwrite the final 1.0 with a 0.95 after the UI has
+    /// already moved on (Deep's 2026-06-24 bug: progress bar stuck at
+    /// 95 % even though pipe had loaded and Whisper was streaming).
+    /// `pollingTask.cancel()` alone is insufficient — it sets the
+    /// cancellation flag but doesn't unqueue actor messages already
+    /// in flight from the polling task's `await self?.yield…` calls.
+    private var loadComplete: Bool = false
 
     // MARK: - Filters & guards (Phase A.3 carry-over)
 
@@ -114,6 +125,9 @@ public actor WhisperKitProvider: ASRProvider {
         let (stream, cont) = AsyncStream.makeStream(of: Partial.self)
         self.currentStream = stream
         self.currentContinuation = cont
+        // Reset the load-complete gate so this session's polling
+        // task can emit until pipe loads.
+        loadComplete = false
 
         // Build / reuse the WhisperKit pipe. Lookup order:
         //   1. Already-loaded pipe on this provider instance (same
@@ -237,6 +251,11 @@ public actor WhisperKitProvider: ASRProvider {
                 throw error
             }
             pollingTask.cancel()
+            // Latch BEFORE yielding 1.0. Any polling-task
+            // `await self.yieldDownloadProgress(…)` already queued on
+            // the actor mailbox will see loadComplete=true when it
+            // finally runs and no-op, so the 1.0 stays sticky.
+            loadComplete = true
             WhisperKitPipeCache.shared.store(pipe, for: model.rawValue)
             self.pipe = pipe
             downloadProgressContinuation?.yield(1.0)
@@ -456,8 +475,13 @@ public actor WhisperKitProvider: ASRProvider {
     /// from the file-size polling Task during model fetch. The Task
     /// hops back into the actor via `await self?.yieldDownloadProgress`
     /// so writes to the continuation happen serialised against other
-    /// actor work.
+    /// actor work. The `loadComplete` gate drops late-arriving stale
+    /// polling yields after the pipe has loaded and 1.0 has been
+    /// emitted — without it, a 0.95 already queued on the actor
+    /// mailbox at the moment of cancellation would overwrite the
+    /// final 1.0, leaving the UI stuck at 95 %.
     fileprivate func yieldDownloadProgress(_ p: Float) {
+        if loadComplete { return }
         downloadProgressContinuation?.yield(p)
     }
 
