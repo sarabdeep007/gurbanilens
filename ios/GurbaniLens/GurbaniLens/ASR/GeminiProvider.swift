@@ -261,9 +261,23 @@ public actor GeminiProvider: ASRProvider {
                     ]]
                 ]
             ]],
+            // CRITICAL — thinkingConfig.thinkingBudget=0 disables Gemini 2.5
+            // Flash's reasoning mode. Without this, EACH /transcribe call
+            // burns 5K-30K internal reasoning tokens (all billed as output
+            // tokens) even for trivial visible outputs like "ੴ" or
+            // "ਸਤਿਨਾਮੁ ਸ੍ਰੀ ਵਾਹਿਗੁਰੂ". Deep's 2026-06-24 bill: ~150 audio
+            // chunks during testing burned 3.43M output tokens = ₹824
+            // (90% of the entire Gemini API bill).
+            // Reference: https://ai.google.dev/gemini-api/docs/thinking
+            // Even though Gemini is hidden from the user picker (a05f144),
+            // the code path still exists — Compare debug + future re-enable
+            // would resume the leak without this guard. KEEP THIS LINE.
             "generationConfig": [
                 "temperature": 0,
-                "candidateCount": 1
+                "candidateCount": 1,
+                "thinkingConfig": [
+                    "thinkingBudget": 0
+                ]
             ]
         ]
         guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else { return }
@@ -376,7 +390,14 @@ public actor GeminiProvider: ASRProvider {
                     ]]
                 ]
             ]],
-            "generationConfig": ["temperature": 0, "candidateCount": 1]
+            // thinkingConfig.thinkingBudget=0 — see the long comment on
+            // the streaming generationConfig above. This is the
+            // Compare-mode (one-shot) sibling; same leak applies.
+            "generationConfig": [
+                "temperature": 0,
+                "candidateCount": 1,
+                "thinkingConfig": ["thinkingBudget": 0]
+            ]
         ]
         guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else {
             throw GeminiError.requestFailed(underlying: NSError(domain: "GeminiProvider", code: 1))
