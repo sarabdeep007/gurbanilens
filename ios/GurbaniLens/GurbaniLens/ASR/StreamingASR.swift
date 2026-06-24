@@ -87,19 +87,34 @@ public actor StreamingASR {
         let model = Self.currentWhisperModel()
         let silenceThreshold = Self.currentSilenceThreshold()
 
-        // "Disable on-device Whisper" — testing toggle that forces
-        // cloud-only mode regardless of the user's regular pick. When
-        // ON, both `.whisperKit` and `.dual` get substituted with
-        // `.sarvam` so we can validate Sarvam (or Gemini if the user
-        // picks it explicitly) in isolation. Cloud A/B comparison
-        // needs Whisper out of the path entirely.
+        // ── Substitution chain (precedence: cloud-off > disableWhisper) ──
+        //
+        // Cloud master gate. `CloudTrialPolicy.enabledKey` is the
+        // user-visible "Cloud voice recognition" toggle in Settings.
+        // When OFF, ANY cloud-using provider (sarvam, gemini, dual)
+        // must fall back to on-device Whisper — otherwise we'd be
+        // calling cloud APIs the user explicitly disabled. Previous
+        // builds only enforced this in the Settings binding's
+        // onChange; if the binding never ran (cold launch with
+        // stale UserDefaults), the cloud call sneaked through.
+        // Deep's 2026-06-24 Gemini-hallucination test surfaced this.
+        let cloudEnabled = UserDefaults.standard.bool(forKey: "settings.cloudEnabled")
         let disableWhisper = UserDefaults.standard.bool(forKey: "settings.disableWhisper")
-        let providerId: ASRProviderId
-        if disableWhisper, configuredProviderId == .whisperKit || configuredProviderId == .dual {
-            NSLog("[DIAG] StreamingASR.init disableWhisper=true — substituting \(configuredProviderId.rawValue) → sarvam")
+
+        var providerId = configuredProviderId
+        if !cloudEnabled, providerId == .sarvam || providerId == .gemini || providerId == .dual {
+            NSLog("[DIAG] StreamingASR.init cloud disabled — substituting \(providerId.rawValue) → whisperKit")
+            providerId = .whisperKit
+        }
+        // disableWhisper is a developer A/B toggle — only meaningful
+        // when cloud is enabled. After the Gemini hide (2026-06-24),
+        // sarvam is the only cloud option visible to end users, so
+        // the substitution target is hardcoded to sarvam. If Gemini
+        // is ever brought back as a production option, this needs
+        // to remember the user's last cloud pick.
+        if disableWhisper, providerId == .whisperKit || providerId == .dual, cloudEnabled {
+            NSLog("[DIAG] StreamingASR.init disableWhisper=true — substituting \(providerId.rawValue) → sarvam (only cloud option after Gemini hide)")
             providerId = .sarvam
-        } else {
-            providerId = configuredProviderId
         }
 
         switch providerId {
@@ -126,7 +141,7 @@ public actor StreamingASR {
             self.provider = DualLiveProvider()
         }
 
-        NSLog("[DIAG] StreamingASR.init selectedProvider=\(providerId.rawValue) effectiveProvider=\(self.provider.providerId.rawValue) model=\(model.rawValue) silenceThreshold=\(silenceThreshold)")
+        NSLog("[DIAG] StreamingASR.init configuredProvider=\(configuredProviderId.rawValue) effectiveProvider=\(self.provider.providerId.rawValue) model=\(model.rawValue) cloudEnabled=\(cloudEnabled) disableWhisper=\(disableWhisper) silenceThreshold=\(silenceThreshold) label='\(self.provider.displayName)'")
     }
 
     /// Custom-provider init for tests / Phase A.4b cross-wiring.

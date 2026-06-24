@@ -169,17 +169,36 @@ struct LiveResultsScreen: View {
         }
     }
 
-    /// Human-readable name of the provider that will actually run when
-    /// `Listen` is tapped. Mirrors the substitution `StreamingASR.init`
-    /// applies when "Disable on-device Whisper" is on (whisperKit / dual
-    /// → sarvam).
+    /// Human-readable name of the actually-running provider. When a
+    /// session is live, reads the truth from `session.providerLabel`
+    /// (set in VoiceSearchSession.startStreaming from the running
+    /// StreamingASR's displayName). When idle / pre-session, falls
+    /// back to a hint computed from @AppStorage so the user has
+    /// something to look at before tapping Listen.
+    ///
+    /// Reads runtime first to fix Deep's 2026-06-24 bug where the
+    /// caption flipped to "Sarvam" mid-session while Gemini was still
+    /// the cached StreamingASR's actual backend.
     private var activeProviderLabel: String {
+        if !session.providerLabel.isEmpty {
+            return session.providerLabel
+        }
+        return previewProviderLabel
+    }
+
+    /// Pre-session hint — applies the same substitution chain
+    /// `StreamingASR.init` will apply (cloud-off → whisperKit;
+    /// disableWhisper → sarvam) so the caption doesn't lie before
+    /// the user even taps Listen.
+    private var previewProviderLabel: String {
+        let cloudEnabled = UserDefaults.standard.bool(forKey: "settings.cloudEnabled")
         let raw = ASRProviderId(rawValue: asrProviderRaw) ?? .whisperKit
-        let effective: ASRProviderId
-        if disableWhisper && (raw == .whisperKit || raw == .dual) {
+        var effective = raw
+        if !cloudEnabled, effective == .sarvam || effective == .gemini || effective == .dual {
+            effective = .whisperKit
+        }
+        if disableWhisper, effective == .whisperKit || effective == .dual, cloudEnabled {
             effective = .sarvam
-        } else {
-            effective = raw
         }
         switch effective {
         case .whisperKit:
@@ -190,9 +209,6 @@ struct LiveResultsScreen: View {
         case .gemini:
             return "Gemini 2.5 Flash"
         case .dual:
-            // WhisperLiveTranscriber is hardcoded to small in dual mode
-            // regardless of settings.whisperModel — show the truth, not
-            // the user's pref.
             return "Whisper-small + Sarvam (Dual)"
         }
     }

@@ -205,6 +205,31 @@ final class AppContainer: ObservableObject {
             commitLive()
             return
         }
+        forceTeardownLive(reason: "cancelLive")
+    }
+
+    /// Stop-button handler that ALWAYS terminates the session,
+    /// regardless of current state. Listening-with-text routes
+    /// through commit (preserves partial → results screen);
+    /// every other state hard-tears-down to .idle and returns home.
+    /// Critical: a stuck `.searching` state (matcher errored silently)
+    /// or any other terminal/error path no longer leaves the user
+    /// trapped — Stop is a guaranteed escape (Deep's 2026-06-24
+    /// "Stop doesn't change anything" bug).
+    func stopLive() {
+        NSLog("[DIAG] AppContainer.stopLive tapped — current state=\(String(describing: session.state))")
+        if case .listening(let text, _, _) = session.state, !text.isEmpty {
+            commitLive()
+            return
+        }
+        forceTeardownLive(reason: "stopLive")
+    }
+
+    /// Hard teardown shared by cancelLive (empty session) and
+    /// stopLive (any non-listening-with-text state). Cancels the
+    /// streaming task, releases the StreamingASR, resets session
+    /// state to .idle, and returns to Home.
+    private func forceTeardownLive(reason: String) {
         streamingTask?.cancel()
         let asrToStop = streamingAsr
         // Bug J: nil out the streaming ASR BEFORE the async stop so a
@@ -212,9 +237,9 @@ final class AppContainer: ObservableObject {
         // by the Phase A.1 Bug F guard that checks `streamingAsr != nil`.
         // The instance is held in `asrToStop` so the async stop still
         // runs cleanly against the original actor.
-        clearStreamingAsr(reason: "cancelLive")
+        clearStreamingAsr(reason: reason)
         Task { await asrToStop?.stop() }
-        session.reset(reason: "cancelLive")
+        session.reset(reason: reason)
         returnHome()
     }
 

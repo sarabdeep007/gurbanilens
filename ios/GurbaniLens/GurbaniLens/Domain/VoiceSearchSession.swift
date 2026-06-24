@@ -80,6 +80,17 @@ public final class VoiceSearchSession: ObservableObject {
 
     @Published public private(set) var state: State = .idle
 
+    /// Human-readable name of the StreamingASR provider currently
+    /// running this session. Set in `startStreaming` from the
+    /// already-instantiated provider's `displayName` so the
+    /// LiveResultsScreen caption reflects RUNTIME truth, not the
+    /// possibly-stale @AppStorage picker value. Empty string when no
+    /// session is active. (Deep's 2026-06-24 bug: caption flipped to
+    /// "Sarvam" mid-session while Gemini was still the real backend,
+    /// because the caption was computed straight from @AppStorage
+    /// instead of the live provider.)
+    @Published public private(set) var providerLabel: String = ""
+
     public init() {}
 
     // MARK: - v1 setters
@@ -138,6 +149,7 @@ public final class VoiceSearchSession: ObservableObject {
             NSLog("[DIAG] VoiceSearchSession state → idle (reason=\(reason) previousState=\(String(describing: state)))")
         }
         state = .idle
+        providerLabel = ""
     }
 
     // MARK: - Convenience accessors
@@ -225,6 +237,15 @@ public final class VoiceSearchSession: ObservableObject {
     ) async throws {
         // AppContainer.startLiveStreamAndAwait already established
         // .listening on @MainActor before this await — see Bug A.
+        // Snapshot the provider label first so the LiveResultsScreen
+        // caption reflects the actually-running backend (runtime
+        // truth) the moment the stream opens — see Deep's 2026-06-24
+        // bug where the caption read from @AppStorage drifted away
+        // from the cached StreamingASR instance.
+        let label = asr.activeProviderDisplayName
+        providerLabel = label
+        NSLog("[DIAG] VoiceSearchSession provider attached label='\(label)'")
+
         let stream = try await asr.partials()
 
         var pendingMatchTask: Task<Void, Never>? = nil

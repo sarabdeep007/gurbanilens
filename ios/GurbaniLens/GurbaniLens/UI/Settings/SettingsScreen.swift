@@ -258,6 +258,19 @@ struct SettingsScreen: View {
             .padding(.vertical, 4)
 
             if cloudEnabled {
+                // Provider picker — Gemini hidden 2026-06-24. Deep's
+                // on-device test of Gemini Live for Gurbani Punjabi
+                // showed the model hallucinates plausible-looking
+                // sacred text (Mool Mantar fragments, famous shabad
+                // openings, "ੴ ਸਤਿਨਾਮੁ ਸ੍ਰੀ ਵਾਹਿਗੁਰੂ") REGARDLESS of
+                // what the user actually said. Gemini behaves as a
+                // generative model with strong Sikh-text priors, not
+                // a transcription model for this domain. Unusable for
+                // STT. The ASRProviderId.gemini enum case + the
+                // GeminiProvider implementation are kept in code
+                // (Compare-mode debug screen still needs them) but
+                // never exposed to end users. If you're about to
+                // re-add the row, re-read this comment first.
                 VStack(alignment: .leading, spacing: 4) {
                     CloudProviderRow(
                         title: ASRProviderId.dual.cloudDisplayName,
@@ -270,12 +283,6 @@ struct SettingsScreen: View {
                         subtitle: "Indian language SOTA, ₹30/hour",
                         selected: asrProviderRaw == ASRProviderId.sarvam.rawValue,
                         onTap: { asrProviderRaw = ASRProviderId.sarvam.rawValue }
-                    )
-                    CloudProviderRow(
-                        title: ASRProviderId.gemini.cloudDisplayName,
-                        subtitle: "Google multimodal, lower cost",
-                        selected: asrProviderRaw == ASRProviderId.gemini.rawValue,
-                        onTap: { asrProviderRaw = ASRProviderId.gemini.rawValue }
                     )
                 }
 
@@ -332,7 +339,15 @@ struct SettingsScreen: View {
                 .font(.system(size: 14, weight: .semibold))
                 .foregroundColor(Theme.onSurfaceVariant)
             VStack(alignment: .leading, spacing: 4) {
-                ForEach(WhisperModel.allCases) { opt in
+                // Production picker exposes only medium + large-v3.
+                // .small drifts to Telugu on clean Punjabi (Phase 1
+                // finding); .base / .tiny are even weaker. The enum
+                // cases stay in code — WhisperLiveTranscriber uses
+                // "openai_whisper-small" internally for the live half
+                // of Dual mode (Sarvam refines, so the small-quality
+                // gap is invisible there). 2026-06-24 hide.
+                let userFacingModels: [WhisperModel] = [.medium, .largeV3]
+                ForEach(userFacingModels) { opt in
                     WhisperModelRow(
                         model: opt,
                         selected: opt.rawValue == whisperModelRaw,

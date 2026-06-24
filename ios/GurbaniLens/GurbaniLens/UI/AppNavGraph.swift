@@ -53,7 +53,17 @@ struct AppNavGraph: View {
                     LiveResultsScreen(
                         session: session,
                         downloadProgress: container.modelDownloadProgress,
-                        onStop: { container.commitLive() },
+                        // Stop always force-terminates the session,
+                        // regardless of state — stopLive() handles
+                        // listening-with-text (commit), empty,
+                        // stuck-.searching, .done, .error, .idle
+                        // uniformly. Previously this was
+                        // `container.commitLive()` which silently
+                        // no-op'd outside `.listening`, leaving the
+                        // user trapped on the Listening screen with
+                        // an unresponsive Stop button (Deep's
+                        // 2026-06-24 bug report).
+                        onStop: { container.stopLive() },
                         onCancel: { container.cancelLiveRecording() },
                         onCommit: { match in container.commitLive(match: match) }
                     )
