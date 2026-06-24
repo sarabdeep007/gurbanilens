@@ -192,6 +192,19 @@ final class AppContainer: ObservableObject {
     }
 
     func cancelLiveRecording() {
+        // Preserve any accumulated partial transcript. If the user taps
+        // the X / Cancel button mid-listening, the intent is more often
+        // "I'm done speaking, search what I have" than "discard
+        // everything" — silently dropping a 4-word transcript is the
+        // worst UX (Deep's 2026-06-24 diag log showed exactly this:
+        // "state → idle (reason=cancelLive previousState=listening(
+        // text: ..., ...))"). Empty-session cancel (no audio captured
+        // yet) still tears down cleanly.
+        if case .listening(let text, _, _) = session.state, !text.isEmpty {
+            NSLog("[DIAG] AppContainer.cancelLiveRecording preserving partial.len=\(text.count) head40=\"\(String(text.prefix(40)))\" — routing to commit")
+            commitLive()
+            return
+        }
         streamingTask?.cancel()
         let asrToStop = streamingAsr
         // Bug J: nil out the streaming ASR BEFORE the async stop so a

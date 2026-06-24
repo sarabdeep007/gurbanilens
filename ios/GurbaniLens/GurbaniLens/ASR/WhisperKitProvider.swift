@@ -282,6 +282,23 @@ public actor WhisperKitProvider: ASRProvider {
         }
     }
 
+    /// User-triggered reset (Settings → "Reset Whisper models"). Wipes
+    /// the on-disk huggingface model cache AND the in-memory pipe
+    /// cache, so the next `start()` reloads from scratch. Best-effort:
+    /// directory-delete failures are logged but non-fatal — the
+    /// in-memory cache clear always succeeds.
+    public nonisolated static func resetAllModels() {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let root = docs.appendingPathComponent("huggingface/models/argmaxinc/whisperkit-coreml")
+        do {
+            try FileManager.default.removeItem(at: root)
+            NSLog("[DIAG] WhisperKitProvider.resetAllModels purged on-disk cache at \(root.path)")
+        } catch {
+            NSLog("[DIAG] WhisperKitProvider.resetAllModels on-disk purge failed at \(root.path): \(error.localizedDescription)")
+        }
+        WhisperKitPipeCache.shared.clear()
+    }
+
     /// Static helper exposed for unit tests + reuse downstream.
     public nonisolated static func hasDevanagari(_ s: String) -> Bool {
         s.unicodeScalars.contains { scalar in
@@ -380,7 +397,7 @@ public actor WhisperKitProvider: ASRProvider {
 /// bug report). The cache holds at most one pipe per distinct model
 /// rawValue; switching models in Settings doesn't evict the previous
 /// one (rare action, not worth the eviction logic for v1).
-private final class WhisperKitPipeCache: @unchecked Sendable {
+final class WhisperKitPipeCache: @unchecked Sendable {
     static let shared = WhisperKitPipeCache()
 
     private let lock = NSLock()
@@ -394,5 +411,15 @@ private final class WhisperKitPipeCache: @unchecked Sendable {
     func store(_ pipe: WhisperKit, for modelName: String) {
         lock.lock(); defer { lock.unlock() }
         pipes[modelName] = pipe
+    }
+
+    /// Drop every cached pipe. Pairs with on-disk model purge so the
+    /// next start() loads fresh from disk (or re-downloads).
+    func clear() {
+        lock.lock()
+        let count = pipes.count
+        pipes.removeAll()
+        lock.unlock()
+        NSLog("[DIAG] WhisperKitPipeCache cleared (purged \(count) cached pipes)")
     }
 }

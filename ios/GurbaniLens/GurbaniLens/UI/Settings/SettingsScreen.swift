@@ -100,6 +100,14 @@ struct SettingsScreen: View {
     // ON. Off for users who prefer always seeing the result list.
     @AppStorage("settings.autoOpenExactMatches") private var autoOpenExactMatches: Bool = true
 
+    // 2026-06-24 testing toggle: force the StreamingASR factory to
+    // substitute `.whisperKit` / `.dual` with `.sarvam` so cloud
+    // providers can be validated in isolation. Default OFF — the
+    // on-device path is the long-term default. See StreamingASR.init.
+    @AppStorage("settings.disableWhisper") private var disableWhisper: Bool = false
+
+    @State private var showResetWhisperToast: Bool = false
+
     // Local UI state for the version-tap unlock + trial-exhausted modal.
     @State private var versionTapCount: Int = 0
     @State private var versionTapLastTime: Date = .distantPast
@@ -328,14 +336,55 @@ struct SettingsScreen: View {
                     WhisperModelRow(
                         model: opt,
                         selected: opt.rawValue == whisperModelRaw,
+                        recommended: opt == .medium,
                         onTap: { whisperModelRaw = opt.rawValue }
                     )
                 }
             }
-            Text("Whisper runs entirely on device. No internet needed after the model has been downloaded.")
+            Text("Whisper runs entirely on device. No internet needed after the model has been downloaded. Larger models give better Punjabi recognition but require a one-time download.")
                 .font(.system(size: 12))
                 .foregroundColor(Theme.onSurfaceVariant)
                 .padding(.top, 4)
+
+            // Cloud-only test toggle. Lives in the local-model section
+            // so users see it adjacent to the Whisper picker — its
+            // effect is to force the StreamingASR factory to bypass
+            // whichever Whisper model is selected here.
+            VStack(alignment: .leading, spacing: 6) {
+                Toggle(isOn: $disableWhisper) {
+                    Text("Disable on-device Whisper")
+                        .font(.system(size: 15))
+                        .foregroundColor(Theme.onSurface)
+                }
+                .tint(Theme.primary)
+                Text("Testing only. Forces cloud providers (Sarvam, Gemini) and bypasses Whisper. Use to isolate cloud quality.")
+                    .font(.system(size: 11))
+                    .foregroundColor(Theme.onSurfaceVariant)
+            }
+            .padding(.top, 8)
+
+            // Reset Whisper models — manual escape hatch for the silent
+            // download-stuck case the auto-corruption catch can't see.
+            // Wipes both the on-disk huggingface cache and the in-memory
+            // WhisperKitPipeCache; next mic tap starts fresh.
+            Button(role: .destructive) {
+                WhisperKitProvider.resetAllModels()
+                showResetWhisperToast = true
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "trash")
+                    Text("Reset Whisper models")
+                        .font(.system(size: 15, weight: .medium))
+                }
+                .foregroundColor(.red)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 6)
+            }
+            .alert("Whisper models reset", isPresented: $showResetWhisperToast, actions: {
+                Button("OK") { showResetWhisperToast = false }
+            }, message: {
+                Text("Cached model files cleared. The next Listen tap will download fresh.")
+            })
         }
     }
 
@@ -457,24 +506,36 @@ private extension ASRProviderId {
 private struct WhisperModelRow: View {
     let model: WhisperModel
     let selected: Bool
+    let recommended: Bool
     let onTap: () -> Void
 
     var body: some View {
         Button(action: onTap) {
-            HStack(alignment: .center, spacing: 12) {
+            HStack(alignment: .top, spacing: 12) {
                 Image(systemName: selected ? "largecircle.fill.circle" : "circle")
                     .foregroundColor(selected ? Theme.primary : Theme.onSurfaceVariant)
                     .font(.system(size: 20))
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(model.displayName)
-                        .font(.system(size: 15, weight: selected ? .semibold : .regular))
-                        .foregroundColor(Theme.onSurface)
-                        .multilineTextAlignment(.leading)
+                    HStack(spacing: 6) {
+                        Text(model.displayName)
+                            .font(.system(size: 15, weight: selected ? .semibold : .regular))
+                            .foregroundColor(Theme.onSurface)
+                            .multilineTextAlignment(.leading)
+                        if recommended {
+                            Text("Recommended")
+                                .font(.system(size: 10, weight: .semibold))
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Theme.primary.opacity(0.18))
+                                .foregroundColor(Theme.primary)
+                                .clipShape(Capsule())
+                        }
+                    }
                     Text("\(model.shortDisplayName)  ·  \(model.approximateSize)")
                         .font(.system(size: 12))
                         .foregroundColor(Theme.onSurfaceVariant)
                 }
-                Spacer()
+                Spacer(minLength: 0)
             }
             .padding(.vertical, 6)
             .padding(.horizontal, 4)

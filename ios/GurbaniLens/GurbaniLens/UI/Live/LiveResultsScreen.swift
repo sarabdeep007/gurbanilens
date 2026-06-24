@@ -45,6 +45,13 @@ struct LiveResultsScreen: View {
     @AppStorage("settings.debugCompareEnabled") private var debugCompareEnabled: Bool = false
     @State private var showCompareSheet: Bool = false
 
+    // Reactive provider-label inputs. The caption updates whenever the
+    // user changes any of these in Settings (rare while listening, but
+    // harmless to wire up reactively).
+    @AppStorage("settings.asrProvider") private var asrProviderRaw: String = ASRProviderId.whisperKit.rawValue
+    @AppStorage("settings.whisperModel") private var whisperModelRaw: String = WhisperModel.medium.rawValue
+    @AppStorage("settings.disableWhisper") private var disableWhisper: Bool = false
+
     var body: some View {
         Group {
             if case .searching(let text) = session.state {
@@ -83,6 +90,13 @@ struct LiveResultsScreen: View {
 
     private var listeningView: some View {
         VStack(spacing: 0) {
+            // Active-provider caption — tiny strip at the very top so
+            // the user always knows which ASR backend is running.
+            // Especially important once Settings exposes the
+            // "disable Whisper" toggle for cloud-only testing.
+            providerCaption
+                .padding(.top, 6)
+
             // Bounded transcript header.
             transcriptHeader
                 .frame(maxWidth: .infinity)
@@ -118,24 +132,69 @@ struct LiveResultsScreen: View {
     /// nothing to interrupt. The Cancel toolbar button still works if
     /// the user wants to bail before the matcher finishes.
     private func searchingView(text: String) -> some View {
-        VStack(spacing: 16) {
-            Spacer()
-            ProgressView()
-                .controlSize(.large)
-                .tint(Theme.primary)
-            Text("ਖੋਜ ਰਹੇ ਹਾਂ…")
-                .font(.headline)
-                .foregroundColor(Theme.onSurface)
-            if !text.isEmpty {
-                Text(text)
-                    .font(.body)
-                    .foregroundColor(Theme.onSurfaceVariant)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal, 24)
+        VStack(spacing: 0) {
+            providerCaption
+                .padding(.top, 6)
+            VStack(spacing: 16) {
+                Spacer()
+                ProgressView()
+                    .controlSize(.large)
+                    .tint(Theme.primary)
+                Text("ਖੋਜ ਰਹੇ ਹਾਂ…")
+                    .font(.headline)
+                    .foregroundColor(Theme.onSurface)
+                if !text.isEmpty {
+                    Text(text)
+                        .font(.body)
+                        .foregroundColor(Theme.onSurfaceVariant)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 24)
+                }
+                Spacer()
             }
+            .frame(maxWidth: .infinity)
+        }
+    }
+
+    /// Caption strip identifying the active ASR backend. Recomputes
+    /// reactively via @AppStorage so toggling settings reflects
+    /// without having to leave + re-enter the screen.
+    private var providerCaption: some View {
+        HStack {
+            Spacer()
+            Text("Using: \(activeProviderLabel)")
+                .font(.system(size: 11))
+                .foregroundColor(Theme.onSurfaceVariant.opacity(0.85))
             Spacer()
         }
-        .frame(maxWidth: .infinity)
+    }
+
+    /// Human-readable name of the provider that will actually run when
+    /// `Listen` is tapped. Mirrors the substitution `StreamingASR.init`
+    /// applies when "Disable on-device Whisper" is on (whisperKit / dual
+    /// → sarvam).
+    private var activeProviderLabel: String {
+        let raw = ASRProviderId(rawValue: asrProviderRaw) ?? .whisperKit
+        let effective: ASRProviderId
+        if disableWhisper && (raw == .whisperKit || raw == .dual) {
+            effective = .sarvam
+        } else {
+            effective = raw
+        }
+        switch effective {
+        case .whisperKit:
+            let m = WhisperModel(rawValue: whisperModelRaw) ?? .medium
+            return "Whisper-\(m.shortDisplayName)"
+        case .sarvam:
+            return disableWhisper ? "Sarvam (Whisper disabled)" : "Sarvam Saaras-v3"
+        case .gemini:
+            return "Gemini 2.5 Flash"
+        case .dual:
+            // WhisperLiveTranscriber is hardcoded to small in dual mode
+            // regardless of settings.whisperModel — show the truth, not
+            // the user's pref.
+            return "Whisper-small + Sarvam (Dual)"
+        }
     }
 
     private var navTitle: String {

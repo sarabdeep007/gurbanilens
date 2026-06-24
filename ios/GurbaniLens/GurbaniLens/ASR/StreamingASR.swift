@@ -83,9 +83,24 @@ public actor StreamingASR {
     /// Default-init reads Settings and builds the appropriate provider.
     /// Callers in AppContainer.ensureStreamingAsr use this initialiser.
     public init() {
-        let providerId = Self.currentProviderId()
+        let configuredProviderId = Self.currentProviderId()
         let model = Self.currentWhisperModel()
         let silenceThreshold = Self.currentSilenceThreshold()
+
+        // "Disable on-device Whisper" — testing toggle that forces
+        // cloud-only mode regardless of the user's regular pick. When
+        // ON, both `.whisperKit` and `.dual` get substituted with
+        // `.sarvam` so we can validate Sarvam (or Gemini if the user
+        // picks it explicitly) in isolation. Cloud A/B comparison
+        // needs Whisper out of the path entirely.
+        let disableWhisper = UserDefaults.standard.bool(forKey: "settings.disableWhisper")
+        let providerId: ASRProviderId
+        if disableWhisper, configuredProviderId == .whisperKit || configuredProviderId == .dual {
+            NSLog("[DIAG] StreamingASR.init disableWhisper=true — substituting \(configuredProviderId.rawValue) → sarvam")
+            providerId = .sarvam
+        } else {
+            providerId = configuredProviderId
+        }
 
         switch providerId {
         case .whisperKit:
