@@ -339,14 +339,32 @@ struct SettingsScreen: View {
                 .font(.system(size: 14, weight: .semibold))
                 .foregroundColor(Theme.onSurfaceVariant)
             VStack(alignment: .leading, spacing: 4) {
-                // Production picker exposes only medium + large-v3.
-                // .small drifts to Telugu on clean Punjabi (Phase 1
-                // finding); .base / .tiny are even weaker. The enum
-                // cases stay in code — WhisperLiveTranscriber uses
-                // "openai_whisper-small" internally for the live half
-                // of Dual mode (Sarvam refines, so the small-quality
-                // gap is invisible there). 2026-06-24 hide.
-                let userFacingModels: [WhisperModel] = [.medium, .largeV3]
+                // Production picker: medium only.
+                //
+                // Whisper-large-v3 was hidden 2026-06-24 after Deep's
+                // on-device test crashed the app with iOS memory
+                // pressure (Xcode "too much memory" pop-up, immediate
+                // re-crash on relaunch). Large-v3 in CPU+GPU mode (the
+                // only mode that loads — ANE refuses with Program load
+                // failure 0x20004) keeps 2–3 GB tensors in working
+                // RAM per inference. iOS jetsam kills apps exceeding
+                // ~3–4 GB on iPhone hardware. Verdict: large-v3 is
+                // unusable on consumer iPhones. If we ship to iPad Pro
+                // M-series or Mac Catalyst in future, revisit and
+                // expose large-v3 conditionally on high-RAM targets.
+                //
+                // Whisper-small was hidden earlier (drifts to Telugu
+                // on clean Punjabi — Phase 1 finding). Tiny / base
+                // never tested; same family, no reason to expect
+                // better Punjabi behaviour than small.
+                //
+                // WhisperModel.largeV3 / .small / .base / .tiny stay
+                // in the enum — WhisperLiveTranscriber hardcodes
+                // "openai_whisper-small" for Dual-mode live half
+                // (Sarvam refines so small's quality gap is invisible
+                // there), and Compare-mode debug + future device tiers
+                // may still reference them.
+                let userFacingModels: [WhisperModel] = [.medium]
                 ForEach(userFacingModels) { opt in
                     WhisperModelRow(
                         model: opt,
@@ -356,7 +374,7 @@ struct SettingsScreen: View {
                     )
                 }
             }
-            Text("Whisper runs entirely on device. No internet needed after the model has been downloaded. Larger models give better Punjabi recognition but require a one-time download.")
+            Text("Whisper-medium runs entirely on device. No internet needed after the first download. For higher accuracy when online, enable cloud and choose Sarvam.")
                 .font(.system(size: 12))
                 .foregroundColor(Theme.onSurfaceVariant)
                 .padding(.top, 4)
