@@ -149,6 +149,21 @@ final class AppContainer: ObservableObject {
         returnHome()
     }
 
+    /// "Try again" from Results screen — clears the prior session AND
+    /// kicks straight back into the live-listening flow, skipping the
+    /// home screen as an intermediate step. UX: results.swipe-back goes
+    /// home (returnHome), retry button starts a new listen
+    /// immediately. Added 2026-06-25 per Deep's feedback that the
+    /// existing returnHome → tap-mic flow added an unnecessary step
+    /// when the user's intent was "search the next pangti".
+    func tryAgainLive() {
+        NSLog("[DIAG] AppContainer.tryAgainLive — clearing prior session, returning to live listening")
+        clearStreamingAsr(reason: "tryAgainLive")
+        session.reset(reason: "tryAgainLive")
+        path = []
+        startLiveRecording()
+    }
+
     func returnHome() {
         // Bug J: returnHome is reached from the Results screen's "Back" /
         // "Try again" callbacks. Either path is a terminal state — release

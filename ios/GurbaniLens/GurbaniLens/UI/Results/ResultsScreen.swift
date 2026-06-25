@@ -13,25 +13,53 @@ struct ResultsScreen: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            transcriptStrip
-                .padding(.top, 8)
             confidencePill
                 .padding(.top, 16)
             Spacer().frame(height: 16)
 
-            if result.topConfidence.isNoMatch {
-                // < 50 — matcher gave up. Surface transcript prominently;
-                // don't auto-pick a top result. If we have any matches
-                // at all (40-49 ish), show them as a "did you mean" list.
-                noClearMatchState
-            } else if let top = result.top {
-                MatchCard(match: top, isTopMatch: true) { onOpenShabad(top) }
-                if !result.alternates.isEmpty {
-                    Spacer().frame(height: 24)
-                    alternatesSection
+            switch result.topConfidence {
+            case .found:
+                // Maximum confidence — answer only, no transcript noise.
+                if let top = result.top {
+                    MatchCard(match: top, isTopMatch: true) { onOpenShabad(top) }
+                    if !result.alternates.isEmpty {
+                        Spacer().frame(height: 24)
+                        alternatesSection
+                    }
+                } else {
+                    emptyState
                 }
-            } else {
-                emptyState
+            case .bestMatch, .likelyMatch:
+                if let top = result.top {
+                    MatchCard(match: top, isTopMatch: true) { onOpenShabad(top) }
+                    Spacer().frame(height: 12)
+                    heardLine(prominent: false)
+                    if !result.alternates.isEmpty {
+                        Spacer().frame(height: 16)
+                        alternatesSection
+                    }
+                } else {
+                    emptyState
+                }
+            case .didYouMean:
+                // No single auto-pick. Transcript prominent above the
+                // "Did you mean" list so the user can judge whether ASR
+                // or lookup was the problem.
+                heardLine(prominent: true)
+                Spacer().frame(height: 16)
+                Text("Did you mean…")
+                    .font(.system(size: 17, weight: .medium))
+                    .foregroundColor(Theme.onSurfaceVariant)
+                Spacer().frame(height: 8)
+                ScrollView {
+                    LazyVStack(spacing: 8) {
+                        ForEach(Array(result.matches.prefix(3)), id: \.line.id) { m in
+                            MatchCard(match: m, isTopMatch: false) { onOpenShabad(m) }
+                        }
+                    }
+                }
+            case .noClearMatch:
+                noClearMatchState
             }
             Spacer(minLength: 0)
         }
@@ -54,19 +82,39 @@ struct ResultsScreen: View {
         }
     }
 
-    private var transcriptStrip: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("You said:")
-                .font(.system(size: 14))
-                .foregroundColor(Theme.onSurfaceVariant)
-            Text(result.transcript.isEmpty ? "(no transcript)" : result.transcript)
-                .font(.system(size: 17, design: .monospaced))
-                .foregroundColor(Theme.onSurface)
+    /// Transcript-display helper. `prominent` toggles between a small
+    /// dim "Heard:" line (mid-confidence cases — secondary info) and a
+    /// boxed strip with larger text (low-confidence cases — user needs
+    /// to inspect what we heard).
+    @ViewBuilder
+    private func heardLine(prominent: Bool) -> some View {
+        if result.transcript.isEmpty {
+            EmptyView()
+        } else if prominent {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Heard:")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(Theme.onSurfaceVariant)
+                Text(result.transcript)
+                    .font(.notoSerifGurmukhi(17))
+                    .foregroundColor(Theme.onSurface)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Theme.surface)
+            .clipShape(RoundedRectangle(cornerRadius: 10))
+        } else {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text("Heard:")
+                    .font(.system(size: 12))
+                    .foregroundColor(Theme.onSurfaceVariant.opacity(0.7))
+                Text(result.transcript)
+                    .font(.notoSerifGurmukhi(13))
+                    .foregroundColor(Theme.onSurfaceVariant)
+                    .lineLimit(2)
+            }
         }
-        .padding(12)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Theme.surface)
-        .clipShape(RoundedRectangle(cornerRadius: 12))
     }
 
     private var confidencePill: some View {
@@ -143,18 +191,19 @@ struct ResultsScreen: View {
     /// tell whether ASR or matching was the failure.
     private var noClearMatchState: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Couldn't find a clear match for what we heard.")
+            Text("Couldn't find a clear match.")
                 .font(.system(size: 17, weight: .medium))
                 .foregroundColor(Theme.onSurface)
-            Text("Tap the retry button (top-right) to try again. The transcript above shows what we heard — if it's wrong, the ASR was the problem; if it looks close to your Pangti, the matcher couldn't find it in the corpus.")
-                .font(.system(size: 14))
+            heardLine(prominent: true)
+            Text("If the line above doesn't look like what you said, ASR was the problem — tap retry (top-right). If it's close to your Pangti but no match showed up, the corpus didn't have a hit.")
+                .font(.system(size: 13))
                 .foregroundColor(Theme.onSurfaceVariant)
                 .fixedSize(horizontal: false, vertical: true)
             if !result.matches.isEmpty {
                 Text("Closest guesses:")
                     .font(.system(size: 14, weight: .medium))
                     .foregroundColor(Theme.onSurfaceVariant)
-                    .padding(.top, 8)
+                    .padding(.top, 4)
                 ScrollView {
                     LazyVStack(spacing: 8) {
                         ForEach(Array(result.matches.prefix(3)), id: \.line.id) { alt in

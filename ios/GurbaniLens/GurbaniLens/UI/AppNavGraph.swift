@@ -71,7 +71,12 @@ struct AppNavGraph: View {
                     ResultsScreen(
                         result: session.doneResult ?? .empty,
                         onBack: { container.returnHome() },
-                        onTryAgain: { container.returnHome() },
+                        // Try-again now skips the home screen and goes
+                        // straight to a fresh live listening session
+                        // (Deep's 2026-06-25 feedback: home + tap-mic
+                        // was an extra step nobody wanted after seeing
+                        // a wrong/uncertain match).
+                        onTryAgain: { container.tryAgainLive() },
                         onOpenShabad: { match in container.openShabad(for: match) }
                     )
                 case .shabad(let payload):
