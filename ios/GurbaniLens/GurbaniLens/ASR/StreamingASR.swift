@@ -57,9 +57,14 @@ public actor StreamingASR {
     /// is safe to access from any thread; we intentionally avoid pulling
     /// in SwiftUI's `@AppStorage` wrapper since this actor isn't a View.
     public nonisolated static func currentProviderId() -> ASRProviderId {
+        // Default flipped from .whisperKit → .gurbanilensCloud on
+        // 2026-06-25 — v1 production default. The cloud-master gate
+        // upstream converts this back to .whisperKit when cloud is
+        // disabled, so fresh installs without cloud still get the
+        // offline path.
         let raw = UserDefaults.standard.string(forKey: "settings.asrProvider")
-            ?? ASRProviderId.whisperKit.rawValue
-        return ASRProviderId(rawValue: raw) ?? .whisperKit
+            ?? ASRProviderId.gurbanilensCloud.rawValue
+        return ASRProviderId(rawValue: raw) ?? .gurbanilensCloud
     }
 
     public nonisolated static func currentWhisperModel() -> WhisperModel {
@@ -98,23 +103,33 @@ public actor StreamingASR {
         // onChange; if the binding never ran (cold launch with
         // stale UserDefaults), the cloud call sneaked through.
         // Deep's 2026-06-24 Gemini-hallucination test surfaced this.
-        let cloudEnabled = UserDefaults.standard.bool(forKey: "settings.cloudEnabled")
+        // Read with explicit fallback so fresh installs (no key
+        // present yet) get true — matches SettingsScreen's
+        // @AppStorage default flipped on 2026-06-25.
+        let cloudEnabled = (UserDefaults.standard.object(forKey: "settings.cloudEnabled") as? Bool) ?? true
         let disableWhisper = UserDefaults.standard.bool(forKey: "settings.disableWhisper")
 
         var providerId = configuredProviderId
-        if !cloudEnabled, providerId == .sarvam || providerId == .gemini || providerId == .dual {
+        // Cloud master gate now also covers gurbanilensCloud — the
+        // self-hosted endpoint is free for end users but still
+        // requires internet, and the user's cloud toggle is the
+        // single switch they reach for when they want offline-only.
+        if !cloudEnabled,
+           providerId == .sarvam
+            || providerId == .gemini
+            || providerId == .dual
+            || providerId == .gurbanilensCloud {
             NSLog("[DIAG] StreamingASR.init cloud disabled — substituting \(providerId.rawValue) → whisperKit")
             providerId = .whisperKit
         }
         // disableWhisper is a developer A/B toggle — only meaningful
-        // when cloud is enabled. After the Gemini hide (2026-06-24),
-        // sarvam is the only cloud option visible to end users, so
-        // the substitution target is hardcoded to sarvam. If Gemini
-        // is ever brought back as a production option, this needs
-        // to remember the user's last cloud pick.
+        // when cloud is enabled. After Gemini was hidden (a05f144)
+        // and Sarvam was hidden in favour of the self-hosted endpoint
+        // (2026-06-25), the substitution target is now
+        // .gurbanilensCloud (the only visible cloud option).
         if disableWhisper, providerId == .whisperKit || providerId == .dual, cloudEnabled {
-            NSLog("[DIAG] StreamingASR.init disableWhisper=true — substituting \(providerId.rawValue) → sarvam (only cloud option after Gemini hide)")
-            providerId = .sarvam
+            NSLog("[DIAG] StreamingASR.init disableWhisper=true — substituting \(providerId.rawValue) → gurbanilensCloud (default cloud option)")
+            providerId = .gurbanilensCloud
         }
 
         switch providerId {
@@ -139,6 +154,12 @@ public actor StreamingASR {
             // half still needs SARVAM_API_KEY; on-device half loads the
             // Whisper small model on first start (~150 MB).
             self.provider = DualLiveProvider()
+        case .gurbanilensCloud:
+            // 2026-06-25 v1 production default. Self-hosted
+            // IndicConformer Punjabi at asr.gurbanilens.com. Bearer
+            // token injected at build time by inject_env_to_plist.sh
+            // from GURBANILENS_ASR_TOKEN in .env.
+            self.provider = GurbaniLensCloudProvider()
         }
 
         NSLog("[DIAG] StreamingASR.init configuredProvider=\(configuredProviderId.rawValue) effectiveProvider=\(self.provider.providerId.rawValue) model=\(model.rawValue) cloudEnabled=\(cloudEnabled) disableWhisper=\(disableWhisper) silenceThreshold=\(silenceThreshold) label='\(self.provider.displayName)'")

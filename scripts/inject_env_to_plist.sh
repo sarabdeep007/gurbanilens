@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 #
-# inject_env_to_plist.sh — read SARVAM_API_KEY + GEMINI_API_KEY from the
-# repo-root .env file and write them as string entries into the built
-# app's Info.plist so SarvamProvider + GeminiProvider can read them via
+# inject_env_to_plist.sh — read SARVAM_API_KEY + GEMINI_API_KEY +
+# GURBANILENS_ASR_URL + GURBANILENS_ASR_TOKEN from the repo-root .env
+# file and write them as string entries into the built app's
+# Info.plist so SarvamProvider / GeminiProvider /
+# GurbaniLensCloudProvider can read them via
 # `Bundle.main.object(forInfoDictionaryKey:)` at runtime.
 #
 # Wired as a postBuildScript in ios/GurbaniLens/project.yml. Runs after
@@ -42,7 +44,7 @@ if [ ! -f "$INFO_PLIST" ]; then
 fi
 
 if [ ! -f "$ENV_FILE" ]; then
-    echo "warning: inject_env_to_plist.sh: $ENV_FILE not found — copy .env.example to .env and populate SARVAM_API_KEY / GEMINI_API_KEY to enable cloud providers."
+    echo "warning: inject_env_to_plist.sh: $ENV_FILE not found — copy .env.example to .env and populate GURBANILENS_ASR_TOKEN (required for v1 default GurbaniLens Cloud) plus optional SARVAM_API_KEY / GEMINI_API_KEY for debug providers."
     exit 0
 fi
 
@@ -51,6 +53,8 @@ fi
 # embedded newlines or unescaped = chars are not supported.
 SARVAM_API_KEY=""
 GEMINI_API_KEY=""
+GURBANILENS_ASR_URL=""
+GURBANILENS_ASR_TOKEN=""
 while IFS= read -r line || [ -n "$line" ]; do
     # Strip CRLF
     line="${line%$'\r'}"
@@ -70,8 +74,10 @@ while IFS= read -r line || [ -n "$line" ]; do
         \'*\') value="${value#\'}"; value="${value%\'}" ;;
     esac
     case "$key" in
-        SARVAM_API_KEY) SARVAM_API_KEY="$value" ;;
-        GEMINI_API_KEY) GEMINI_API_KEY="$value" ;;
+        SARVAM_API_KEY)         SARVAM_API_KEY="$value" ;;
+        GEMINI_API_KEY)         GEMINI_API_KEY="$value" ;;
+        GURBANILENS_ASR_URL)    GURBANILENS_ASR_URL="$value" ;;
+        GURBANILENS_ASR_TOKEN)  GURBANILENS_ASR_TOKEN="$value" ;;
     esac
 done < "$ENV_FILE"
 
@@ -90,7 +96,9 @@ inject_key() {
     fi
 }
 
-inject_key "SARVAM_API_KEY" "$SARVAM_API_KEY"
-inject_key "GEMINI_API_KEY" "$GEMINI_API_KEY"
+inject_key "SARVAM_API_KEY"     "$SARVAM_API_KEY"
+inject_key "GEMINI_API_KEY"     "$GEMINI_API_KEY"
+inject_key "GurbaniLensASRURL"   "$GURBANILENS_ASR_URL"
+inject_key "GurbaniLensASRToken" "$GURBANILENS_ASR_TOKEN"
 
 echo "note: inject_env_to_plist.sh complete (plist=$INFO_PLIST)"

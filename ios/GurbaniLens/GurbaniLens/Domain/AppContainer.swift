@@ -498,7 +498,15 @@ final class AppContainer: ObservableObject {
             // is already exhausted on entry, force the user back to
             // Whisper + surface the message; don't run commit.
             let activeProvider = asr.activeProviderId
-            if activeProvider != .whisperKit {
+            // Trial-credit consumption applies only to the PAID cloud
+            // providers (Sarvam / Gemini / Dual which embeds Sarvam).
+            // `.gurbanilensCloud` is the self-hosted Seva endpoint —
+            // free for end users, so it bypasses the trial counter.
+            // `.whisperKit` is on-device — always free.
+            let consumesTrial =
+                activeProvider != .whisperKit
+                && activeProvider != .gurbanilensCloud
+            if consumesTrial {
                 if let remaining = CloudTrialPolicy.tryConsume() {
                     NSLog("[DIAG] AppContainer cloud trial consumed (provider=\(activeProvider.rawValue) remaining=\(remaining))")
                     if remaining == 0 {

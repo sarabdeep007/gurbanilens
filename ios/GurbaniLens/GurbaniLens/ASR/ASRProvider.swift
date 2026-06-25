@@ -22,13 +22,21 @@ public enum ASRProviderId: String, Codable, CaseIterable, Sendable {
     /// replace them when each VAD chunk closes. Implemented by
     /// ``DualLiveProvider`` over a ``ChunkBroadcaster``.
     case dual
+    /// **GurbaniLens Cloud** — self-hosted IndicConformer Punjabi ASR
+    /// (asr.gurbanilens.com). Free for end users; bearer-token
+    /// authenticated server-side; ~420 ms round-trip per ~2 s WAV
+    /// chunk (Deep's 2026-06-25 prod test). v1 production default —
+    /// gives Punjabi-quality transcription without Sarvam's per-search
+    /// cost. Implemented by ``GurbaniLensCloudProvider``.
+    case gurbanilensCloud
 
     public var displayName: String {
         switch self {
-        case .whisperKit: return "On-device (Whisper)"
-        case .sarvam:     return "Sarvam (cloud)"
-        case .gemini:     return "Gemini (cloud)"
-        case .dual:       return "Dual (Whisper live + Sarvam refine)"
+        case .whisperKit:       return "On-device (Whisper)"
+        case .sarvam:           return "Sarvam (cloud)"
+        case .gemini:           return "Gemini (cloud)"
+        case .dual:             return "Dual (Whisper live + Sarvam refine)"
+        case .gurbanilensCloud: return "GurbaniLens Cloud (recommended)"
         }
     }
 }

@@ -191,14 +191,19 @@ struct LiveResultsScreen: View {
     /// disableWhisper → sarvam) so the caption doesn't lie before
     /// the user even taps Listen.
     private var previewProviderLabel: String {
-        let cloudEnabled = UserDefaults.standard.bool(forKey: "settings.cloudEnabled")
-        let raw = ASRProviderId(rawValue: asrProviderRaw) ?? .whisperKit
+        // Default true to match StreamingASR.init + SettingsScreen
+        // @AppStorage default flipped 2026-06-25.
+        let cloudEnabled = (UserDefaults.standard.object(forKey: "settings.cloudEnabled") as? Bool) ?? true
+        let raw = ASRProviderId(rawValue: asrProviderRaw) ?? .gurbanilensCloud
         var effective = raw
-        if !cloudEnabled, effective == .sarvam || effective == .gemini || effective == .dual {
+        if !cloudEnabled, effective == .sarvam || effective == .gemini || effective == .dual || effective == .gurbanilensCloud {
             effective = .whisperKit
         }
+        // Mirror StreamingASR.init's disableWhisper substitution
+        // target (now .gurbanilensCloud after the 2026-06-25 cloud
+        // refresh).
         if disableWhisper, effective == .whisperKit || effective == .dual, cloudEnabled {
-            effective = .sarvam
+            effective = .gurbanilensCloud
         }
         switch effective {
         case .whisperKit:
@@ -210,6 +215,8 @@ struct LiveResultsScreen: View {
             return "Gemini 2.5 Flash"
         case .dual:
             return "Whisper-small + Sarvam (Dual)"
+        case .gurbanilensCloud:
+            return "GurbaniLens Cloud"
         }
     }
 

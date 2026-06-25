@@ -78,7 +78,12 @@ struct SettingsScreen: View {
 
     @AppStorage("settings.searchMode") private var searchModeRaw: String = SearchModeChoice.live.rawValue
     @AppStorage("settings.silenceThreshold") private var silenceThresholdRaw: String = SilenceThresholdChoice.balanced.rawValue
-    @AppStorage("settings.asrProvider") private var asrProviderRaw: String = ASRProviderId.whisperKit.rawValue
+    // 2026-06-25: default flipped from .whisperKit → .gurbanilensCloud
+    // (v1 production default — self-hosted IndicConformer Punjabi at
+    // asr.gurbanilens.com, free for end users). The cloud-master gate
+    // in StreamingASR.init still converts this back to .whisperKit
+    // when cloud is disabled, so offline-only users still get Whisper.
+    @AppStorage("settings.asrProvider") private var asrProviderRaw: String = ASRProviderId.gurbanilensCloud.rawValue
     // Default = .medium (~770 MB). small drifts to Telugu on Punjabi
     // (Phase 1) — unacceptable for Whisper-only mode where there's no
     // cloud fallback. large-v3 (1.5 GB) is too heavy as the install
@@ -89,8 +94,12 @@ struct SettingsScreen: View {
     @AppStorage("settings.script") private var scriptRaw: String = ScriptChoice.both.rawValue
     @AppStorage("settings.translation") private var translationRaw: String = TranslationChoice.manmohanSingh.rawValue
 
-    // Phase A.4b cloud + debug settings.
-    @AppStorage(CloudTrialPolicy.enabledKey) private var cloudEnabled: Bool = false
+    // 2026-06-25: default flipped false → true so v1's
+    // .gurbanilensCloud asrProvider default actually applies on fresh
+    // installs (otherwise the onAppear snap would immediately force
+    // it to .whisperKit). The GurbaniLens Cloud endpoint is free for
+    // end users, so cloud-on-by-default is the correct UX.
+    @AppStorage(CloudTrialPolicy.enabledKey) private var cloudEnabled: Bool = true
     @AppStorage(CloudTrialPolicy.remainingKey) private var cloudFreeTrialRemaining: Int = CloudTrialPolicy.monthlyAllowance
     @AppStorage(CloudTrialPolicy.lastResetMonthKey) private var lastTrialResetMonth: String = ""
     @AppStorage("settings.debugCompareEnabled") private var debugCompareEnabled: Bool = false
@@ -258,48 +267,42 @@ struct SettingsScreen: View {
             .padding(.vertical, 4)
 
             if cloudEnabled {
-                // Provider picker — Gemini hidden 2026-06-24. Deep's
-                // on-device test of Gemini Live for Gurbani Punjabi
-                // showed the model hallucinates plausible-looking
-                // sacred text (Mool Mantar fragments, famous shabad
-                // openings, "ੴ ਸਤਿਨਾਮੁ ਸ੍ਰੀ ਵਾਹਿਗੁਰੂ") REGARDLESS of
-                // what the user actually said. Gemini behaves as a
-                // generative model with strong Sikh-text priors, not
-                // a transcription model for this domain. Unusable for
-                // STT. The ASRProviderId.gemini enum case + the
-                // GeminiProvider implementation are kept in code
-                // (Compare-mode debug screen still needs them) but
-                // never exposed to end users. If you're about to
-                // re-add the row, re-read this comment first.
+                // Provider picker — v1 production list.
+                // GurbaniLens Cloud is the v1 recommended default
+                // (added 2026-06-25, self-hosted IndicConformer
+                // Punjabi at asr.gurbanilens.com, free for end users).
+                //
+                // Sarvam HIDDEN (2026-06-25): GurbaniLens Cloud now
+                // covers the high-quality-Punjabi cloud slot at zero
+                // per-search cost. The ASRProviderId.sarvam enum
+                // case + SarvamProvider implementation are kept in
+                // code (DualLiveProvider's WhisperLiveTranscriber +
+                // Sarvam refinement still uses it internally; Compare
+                // debug references it too) but never exposed to end
+                // users. If you're about to re-add the Sarvam row,
+                // re-read this comment first.
+                //
+                // Gemini HIDDEN (a05f144 / 2026-06-24): hallucinates
+                // plausible-looking Gurbani sacred text regardless of
+                // input — unusable for STT.
+                //
+                // Dual mode HIDDEN: still works, still costs a Sarvam
+                // call per session. Once GurbaniLens Cloud proves
+                // itself in v1 we can decide whether to retire Dual
+                // entirely or keep as a debug option.
                 VStack(alignment: .leading, spacing: 4) {
                     CloudProviderRow(
-                        title: ASRProviderId.dual.cloudDisplayName,
-                        subtitle: "Live word-by-word as you speak, refined to Punjabi when Sarvam catches up",
-                        selected: asrProviderRaw == ASRProviderId.dual.rawValue,
-                        onTap: { asrProviderRaw = ASRProviderId.dual.rawValue }
-                    )
-                    CloudProviderRow(
-                        title: ASRProviderId.sarvam.cloudDisplayName,
-                        subtitle: "Indian language SOTA, ₹30/hour",
-                        selected: asrProviderRaw == ASRProviderId.sarvam.rawValue,
-                        onTap: { asrProviderRaw = ASRProviderId.sarvam.rawValue }
+                        title: ASRProviderId.gurbanilensCloud.cloudDisplayName,
+                        subtitle: "Self-hosted IndicConformer Punjabi · free · fast",
+                        selected: asrProviderRaw == ASRProviderId.gurbanilensCloud.rawValue,
+                        onTap: { asrProviderRaw = ASRProviderId.gurbanilensCloud.rawValue }
                     )
                 }
 
-                HStack {
-                    Text("Free trial: \(cloudFreeTrialRemaining) of \(CloudTrialPolicy.monthlyAllowance) cloud searches this month")
-                        .font(.system(size: 12))
-                        .foregroundColor(cloudFreeTrialRemaining > 0
-                                         ? Theme.onSurfaceVariant
-                                         : .red)
-                    Spacer()
-                }
-                .padding(.top, 4)
-
-                Text("Cloud providers require internet. Your audio is sent to the provider — Sarvam (api.sarvam.ai) or Google (generativelanguage.googleapis.com) — and processed there. Local Whisper keeps audio fully on device.")
+                Text("GurbaniLens Cloud is free for end users (Seva-funded). Your audio is sent to asr.gurbanilens.com over HTTPS and processed there; nothing is stored. Requires internet. Local Whisper keeps audio fully on device for offline use.")
                     .font(.system(size: 12))
                     .foregroundColor(Theme.onSurfaceVariant)
-                    .padding(.top, 2)
+                    .padding(.top, 6)
             } else {
                 Text("Off: voice search uses on-device Whisper only.")
                     .font(.system(size: 12))
@@ -317,13 +320,14 @@ struct SettingsScreen: View {
             set: { newValue in
                 cloudEnabled = newValue
                 if newValue {
-                    // Default cloud pick = Dual (Whisper live + Sarvam
-                    // refine) — best of both: instant text + Punjabi
-                    // quality at VAD boundaries. Sarvam-only and Gemini
-                    // remain selectable below for users who explicitly
-                    // want a single backend.
+                    // Default cloud pick = GurbaniLens Cloud (the v1
+                    // recommended provider — free, fast, Punjabi-
+                    // specific). Only override an existing pick if it
+                    // was the offline default; respect explicit cloud
+                    // selections (Dual etc. for power users via the
+                    // hidden enum).
                     if asrProviderRaw == ASRProviderId.whisperKit.rawValue {
-                        asrProviderRaw = ASRProviderId.dual.rawValue
+                        asrProviderRaw = ASRProviderId.gurbanilensCloud.rawValue
                     }
                 } else {
                     asrProviderRaw = ASRProviderId.whisperKit.rawValue
@@ -526,10 +530,11 @@ private struct CloudProviderRow: View {
 private extension ASRProviderId {
     var cloudDisplayName: String {
         switch self {
-        case .whisperKit: return "On-device Whisper"
-        case .sarvam:     return "Sarvam Saaras-v3"
-        case .gemini:     return "Gemini 2.5 Flash"
-        case .dual:       return "Dual (Whisper live + Sarvam refine)"
+        case .whisperKit:       return "On-device Whisper"
+        case .sarvam:           return "Sarvam Saaras-v3"
+        case .gemini:           return "Gemini 2.5 Flash"
+        case .dual:             return "Dual (Whisper live + Sarvam refine)"
+        case .gurbanilensCloud: return "GurbaniLens Cloud (recommended)"
         }
     }
 }
