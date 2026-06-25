@@ -96,9 +96,9 @@ public actor DualLiveProvider: ASRProvider {
         //    UI level meter animates. Tag with .whisperLive so the
         //    freeze-last-good guard treats them as Whisper-side traffic
         //    (lowest priority; never displaces Sarvam transcripts).
-        capture.onPeak = { [weak self] peak in
+        capture.onActivity = { [weak self] peak, rms, vadActive in
             guard let self else { return }
-            Task { await self.emitEnergyPartial(peak) }
+            Task { await self.emitEnergyPartial(rms: rms, vadActive: vadActive) }
         }
 
         // 4) Hook Sarvam to the broadcaster's downstream.
@@ -189,16 +189,15 @@ public actor DualLiveProvider: ASRProvider {
         partialsContinuation?.yield(p)
     }
 
-    private func emitEnergyPartial(_ peak: Float) {
-        // Match Sarvam's threshold for the "speaking" indicator so
-        // the VU bar behaves identically across modes.
-        let speaking = peak > 0.02
+    private func emitEnergyPartial(rms: Float, vadActive: Bool) {
+        // Brief #7 (2026-06-25): RMS replaces peak (smoother waveform);
+        // vadActive (Silero) replaces peak heuristic.
         partialsContinuation?.yield(Partial(
             text: "",
             latin: "",
             gurmukhi: "",
-            isSpeaking: speaking,
-            bufferEnergy: peak,
+            isSpeaking: vadActive,
+            bufferEnergy: rms,
             source: .whisperLive  // lowest-priority tag; empty text
                                   // partials never displace transcripts
                                   // via the freeze-last-good guard

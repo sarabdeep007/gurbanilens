@@ -157,9 +157,9 @@ public actor GurbaniLensCloudProvider: ASRProvider {
 
         do {
             let chunkStream = try capture.start()
-            capture.onPeak = { [weak self] peak in
+            capture.onActivity = { [weak self] peak, rms, vadActive in
                 guard let self else { return }
-                Task { await self.recordPeak(peak) }
+                Task { await self.recordActivity(peak: peak, rms: rms, vadActive: vadActive) }
             }
             self.captureTask = Task { [weak self] in
                 guard let self else { return }
@@ -190,9 +190,13 @@ public actor GurbaniLensCloudProvider: ASRProvider {
 
     // MARK: - Internals
 
-    private func recordPeak(_ peak: Float) {
-        lastEnergy = peak
-        lastIsSpeaking = peak > 0.02
+    private func recordActivity(peak: Float, rms: Float, vadActive: Bool) {
+        // Brief #7 (2026-06-25): RMS replaces peak as bufferEnergy
+        // (smoother waveform animation); vadActive (Silero) replaces
+        // the peak > 0.02 heuristic for isSpeaking — drives the
+        // VoiceSearchSession `.listening` → `.recording` transition.
+        lastEnergy = rms
+        lastIsSpeaking = vadActive
     }
 
     private func appendChunk(_ chunk: Data) async {

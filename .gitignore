@@ -89,6 +89,9 @@ ios/GurbaniLens/GurbaniLens/Resources/Data/
 # Noto Serif Gurmukhi (OFL) fetched from github.com/google/fonts.
 # Re-fetchable; never committed to keep repo light.
 ios/GurbaniLens/GurbaniLens/Resources/Fonts/
+# Silero VAD ONNX (~2.3 MB) fetched from snakers4/silero-vad.
+# Re-fetchable; never committed.
+ios/GurbaniLens/GurbaniLens/Resources/VAD/
 build/ios-deps-cache/
 
 # Whisper conversion artifacts

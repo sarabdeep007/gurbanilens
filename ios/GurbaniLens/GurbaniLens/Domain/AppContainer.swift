@@ -90,7 +90,7 @@ final class AppContainer: ObservableObject {
             return
         }
         switch session.state {
-        case .listening, .searching:
+        case .listening, .recording, .processing:
             NSLog("[DIAG] AppContainer.startRecording REFUSED — session in live state \(String(describing: session.state)) (Bug F guard)")
             return
         default:
@@ -215,7 +215,7 @@ final class AppContainer: ObservableObject {
         // "state → idle (reason=cancelLive previousState=listening(
         // text: ..., ...))"). Empty-session cancel (no audio captured
         // yet) still tears down cleanly.
-        if case .listening(let text, _, _) = session.state, !text.isEmpty {
+        if case .recording(let text, _, _) = session.state, !text.isEmpty {
             NSLog("[DIAG] AppContainer.cancelLiveRecording preserving partial.len=\(text.count) head40=\"\(String(text.prefix(40)))\" — routing to commit")
             commitLive()
             return
@@ -233,7 +233,7 @@ final class AppContainer: ObservableObject {
     /// "Stop doesn't change anything" bug).
     func stopLive() {
         NSLog("[DIAG] AppContainer.stopLive tapped — current state=\(String(describing: session.state))")
-        if case .listening(let text, _, _) = session.state, !text.isEmpty {
+        if case .recording(let text, _, _) = session.state, !text.isEmpty {
             commitLive()
             return
         }
@@ -280,7 +280,7 @@ final class AppContainer: ObservableObject {
 
     func handleStateChange() {
         switch session.state {
-        case .listening(_, let liveMatches, _):
+        case .recording(_, let liveMatches, _):
             // Eligibility check. We schedule (or keep) an auto-open
             // when all of the following hold:
             //   1. Setting enabled (default ON).
@@ -449,20 +449,16 @@ final class AppContainer: ObservableObject {
         // anything heavy (matcher build, WhisperKit pipe construction,
         // stream startup). Otherwise the first ~30 s of cold-start
         // happens with session.state == .idle, and a user who taps Stop
-        // during that window hits `case .listening = state` guards that
-        // refuse the commit (Deep's 2026-06-20 log: three consecutive
+        // during that window hits state guards that refuse the commit
+        // (Deep's 2026-06-20 log: three consecutive
         // "[DIAG] AppContainer.commitLiveStream skipping (state=idle)"
         // lines before the user gave up).
         //
-        // Explicit `[Match]()` rather than `[]` and explicit `Float(0)`
-        // so type inference can't get confused by the parallel A.4a/A.4b
-        // merge — Xcode 16 has been seen to fail to infer empty-literal
-        // types in some merge-conflict-adjacent contexts.
-        session.setListening(
-            text: "",
-            liveMatches: [Match](),
-            bufferEnergy: Float(0)
-        )
+        // Brief #7 reshape: setListening now means "VAD waiting, mic
+        // on, no speech yet". Once Silero detects speech the
+        // VoiceSearchSession's for-await loop transitions to
+        // .recording. Until then waveform animates idle.
+        session.setListening(bufferEnergy: Float(0))
 
         do {
             let matcher = try ensureMatcher()
@@ -491,11 +487,17 @@ final class AppContainer: ObservableObject {
         commitInFlight = true
         defer { commitInFlight = false }
 
-        // Guard: only commit while we're actually listening / committing.
-        // If the session is already .done (e.g. duplicate Stop tap), no-op.
-        guard case .listening = session.state else {
-            if case .searching = session.state {
-                NSLog("[DIAG] AppContainer.commitLiveStream already .searching — skipping")
+        // Guard: only commit while we're actively capturing (listening
+        // or recording, after Brief #7's state reshape). Already
+        // processing / done? no-op (duplicate Stop tap).
+        let isCapturing: Bool = {
+            if case .listening = session.state { return true }
+            if case .recording = session.state { return true }
+            return false
+        }()
+        guard isCapturing else {
+            if case .processing = session.state {
+                NSLog("[DIAG] AppContainer.commitLiveStream already .processing — skipping")
             } else {
                 NSLog("[DIAG] AppContainer.commitLiveStream skipping (state=\(String(describing: session.state)))")
             }

@@ -29,43 +29,49 @@ import GurbaniLensCore  // Gurmukhi.fromDevanagari + Matcher
 @MainActor
 public final class VoiceSearchSession: ObservableObject {
 
+    /// State machine reshape (Brief #7, 2026-06-25) — collapse the v1
+    /// + v2 muddle into a coherent 6-state set. Old states
+    /// (transcribing, matching, searching) collapse into `.processing`.
+    /// Old `.recording(peak)` (v1 bulk-capture) collapses into the
+    /// shared `.recording(text, matches, bufferEnergy)` with empty
+    /// text/matches. New `.listening(bufferEnergy)` represents "mic
+    /// on, VAD waiting for speech" (Silero VAD adds this distinction).
     public enum State: Equatable {
         case idle
-        // v1 cases
-        case recording(peak: Float)
-        case transcribing
-        case matching
-        // v2 cases — Phase A.3 reset: single `text` field
-        case listening(
+        /// **VAD waiting.** Mic is on, Silero hasn't crossed the speech
+        /// threshold yet. UI shows the waveform in idle (gray-blue)
+        /// colour. The `bufferEnergy` drives waveform animation.
+        case listening(bufferEnergy: Float)
+        /// **Capturing.** VAD has detected speech (or v1 bulk capture
+        /// is running). Live transcripts + match candidates accumulate
+        /// in `text` / `liveMatches`. For v1 one-shot mode `text` +
+        /// `liveMatches` stay empty — only `bufferEnergy` updates.
+        case recording(
             text: String,
             liveMatches: [Match],
             bufferEnergy: Float
         )
-        /// **v2 only.** Audio capture has stopped; the full
-        /// ``Matcher.match`` is running on the accumulated transcript.
-        /// `text` is the Gurmukhi snapshot the matcher is processing
-        /// — displayed under the "ਖੋਜ ਰਹੇ ਹਾਂ…" spinner in
-        /// LiveResultsScreen so the user has visible feedback that
-        /// the system is working (renamed from `.committing` on
-        /// 2026-06-24 so the UI state machine matches what the user
-        /// actually sees on screen).
-        case searching(text: String)
+        /// **ASR + matcher running.** Audio capture has stopped; the
+        /// full ``Matcher.match`` is running on the accumulated
+        /// transcript. `text` is the Gurmukhi snapshot the matcher is
+        /// processing — displayed under the "ਖੋਜ ਰਹੇ ਹਾਂ…" spinner.
+        case processing(text: String)
         // shared terminal cases
         case done(SearchResult)
         case error(String)
 
         public static func == (lhs: State, rhs: State) -> Bool {
             switch (lhs, rhs) {
-            case (.idle, .idle), (.transcribing, .transcribing), (.matching, .matching):
+            case (.idle, .idle):
                 return true
-            case (.recording(let a), .recording(let b)):
+            case (.listening(let a), .listening(let b)):
                 return a == b
-            case (.listening(let at, let am, let ae),
-                  .listening(let bt, let bm, let be_)):
+            case (.recording(let at, let am, let ae),
+                  .recording(let bt, let bm, let be_)):
                 return at == bt
                     && am.map(\.line.id) == bm.map(\.line.id)
                     && ae == be_
-            case (.searching(let a), .searching(let b)):
+            case (.processing(let a), .processing(let b)):
                 return a == b
             case (.done(let a), .done(let b)):
                 return a.transcript == b.transcript
@@ -93,43 +99,64 @@ public final class VoiceSearchSession: ObservableObject {
 
     public init() {}
 
-    // MARK: - v1 setters
+    // MARK: - v1 setters (compat — map onto new state shape)
 
+    /// v1 bulk-capture entry point. Maps onto the shared `.recording`
+    /// state with empty text + matches (v1 doesn't have live
+    /// partials). Only the `bufferEnergy` field updates per tick to
+    /// drive the VU meter.
     public func setRecording(peak: Float = 0) {
         if case .recording = state {} else {
-            NSLog("[DIAG] VoiceSearchSession state → recording (initial peak=\(peak))")
+            NSLog("[DIAG] VoiceSearchSession state → recording (v1 bulk peak=\(peak))")
         }
-        state = .recording(peak: peak)
+        state = .recording(text: "", liveMatches: [], bufferEnergy: peak)
     }
 
+    /// v1 ASR-running marker. Collapses into `.processing` per the
+    /// Brief #7 state reshape — UI shows the same "Searching…" spinner
+    /// either way.
     public func setTranscribing() {
-        NSLog("[DIAG] VoiceSearchSession state → transcribing")
-        state = .transcribing
+        NSLog("[DIAG] VoiceSearchSession state → processing (v1 transcribing)")
+        state = .processing(text: "")
     }
 
-    public func setMatching() {
-        NSLog("[DIAG] VoiceSearchSession state → matching")
-        state = .matching
+    /// v1 matcher-running marker. Same `.processing` collapse — the
+    /// transcript is now known so we carry it as `text`.
+    public func setMatching(text: String = "") {
+        NSLog("[DIAG] VoiceSearchSession state → processing (v1 matching text.len=\(text.count))")
+        state = .processing(text: text)
     }
 
     // MARK: - v2 setters
 
-    /// Set/update the `.listening` state. Logs `[DIAG] state → listening`
-    /// only on the initial transition to keep per-tick log volume down.
-    public func setListening(
+    /// **VAD waiting.** Mic is on; Silero hasn't crossed the speech
+    /// threshold yet. `bufferEnergy` drives the waveform.
+    public func setListening(bufferEnergy: Float = 0) {
+        if case .listening = state {} else {
+            NSLog("[DIAG] VoiceSearchSession state → listening (VAD waiting)")
+        }
+        state = .listening(bufferEnergy: bufferEnergy)
+    }
+
+    /// **Capturing.** v2 streaming entered the recording phase; live
+    /// transcripts + match candidates flow through. Logs only on
+    /// initial transition to keep per-partial log volume down.
+    public func setRecording(
         text: String,
         liveMatches: [Match],
         bufferEnergy: Float
     ) {
-        if case .listening = state {} else {
-            NSLog("[DIAG] VoiceSearchSession state → listening")
+        if case .recording = state {} else {
+            NSLog("[DIAG] VoiceSearchSession state → recording (v2 VAD active)")
         }
-        state = .listening(text: text, liveMatches: liveMatches, bufferEnergy: bufferEnergy)
+        state = .recording(text: text, liveMatches: liveMatches, bufferEnergy: bufferEnergy)
     }
 
-    public func setSearching(text: String, reason: String = "manual") {
-        NSLog("[DIAG] VoiceSearchSession state → searching (reason=\(reason) text.len=\(text.count) text.head40=\"\(String(text.prefix(40)))\")")
-        state = .searching(text: text)
+    /// ASR + matcher running on the accumulated transcript. `reason`
+    /// distinguishes silence_timeout / manual_stop / etc. in DIAG logs.
+    public func setProcessing(text: String, reason: String = "manual") {
+        NSLog("[DIAG] VoiceSearchSession state → processing (reason=\(reason) text.len=\(text.count) text.head40=\"\(String(text.prefix(40)))\")")
+        state = .processing(text: text)
     }
 
     // MARK: - Terminal setters
@@ -163,17 +190,27 @@ public final class VoiceSearchSession: ObservableObject {
     }
 
     public var recordingPeak: Float {
-        if case .recording(let p) = state { return p } else { return 0 }
+        if case .recording(_, _, let e) = state { return e }
+        if case .listening(let e) = state { return e }
+        return 0
     }
 
-    /// Snapshot of the current `.listening` payload (or nil otherwise).
-    /// Phase A.3 reset: single `text` field replaces the previous
-    /// confirmed / unconfirmed pair.
-    public var listeningSnapshot: (text: String, matches: [Match], energy: Float)? {
-        if case .listening(let t, let m, let e) = state {
+    /// Snapshot of the current `.recording` payload (or nil otherwise).
+    /// Renamed from `listeningSnapshot` 2026-06-25 alongside the state
+    /// machine reshape — what was "listening with text/matches" is now
+    /// `.recording`.
+    public var recordingSnapshot: (text: String, matches: [Match], energy: Float)? {
+        if case .recording(let t, let m, let e) = state {
             return (text: t, matches: m, energy: e)
         }
         return nil
+    }
+
+    /// Back-compat alias for the old name. Some external consumers may
+    /// still reference `listeningSnapshot`; route through to the new
+    /// name to avoid breaking them.
+    public var listeningSnapshot: (text: String, matches: [Match], energy: Float)? {
+        return recordingSnapshot
     }
 
     // MARK: - v1 one-shot end-to-end
@@ -205,7 +242,7 @@ public final class VoiceSearchSession: ObservableObject {
             matches = []
             NSLog("[DIAG] VoiceSearchSession.runSearch raw empty — skipping matcher + matching state")
         } else {
-            setMatching()
+            setMatching(text: displayText)
             let matcherRef = matcher
             let query = raw
             let matchStart = Date()
@@ -290,6 +327,24 @@ public final class VoiceSearchSession: ObservableObject {
                 }
             }
 
+            // VAD-aware state transition (Brief #7, 2026-06-25): if the
+            // partial reports speech (Silero-driven `isSpeaking` flag
+            // from CloudMicCapture) OR it carries non-empty transcript
+            // text, transition to `.recording`. Otherwise stay in
+            // `.listening`. Once we've entered `.recording`, never go
+            // back to `.listening` until the loop ends — energy-only
+            // partials between words are normal, not "VAD waiting".
+            let alreadyRecording: Bool = {
+                if case .recording = state { return true } else { return false }
+            }()
+            let shouldTransitionToRecording = partial.isSpeaking || !partial.gurmukhi.isEmpty
+            if !alreadyRecording && !shouldTransitionToRecording {
+                // Still VAD-waiting; update energy for waveform only.
+                setListening(bufferEnergy: partial.bufferEnergy)
+                continue
+            }
+
+            // From here we're in (or transitioning to) `.recording`.
             // Bug B freeze-last-good guard. If the new partial drops total
             // content drastically vs the previous AND the previous was
             // substantive, suppress the new partial — keep the prior text
@@ -300,14 +355,14 @@ public final class VoiceSearchSession: ObservableObject {
             // displace the previous (likely Whisper-live) text even if
             // shorter. Otherwise commit-time reads the rolling Whisper
             // transcript and the matcher loses Sarvam's quality.
-            let prev = listeningSnapshot
+            let prev = recordingSnapshot
             let prevLen = prev?.text.count ?? 0
             let newLen = partial.gurmukhi.count
             let dramaticShrink = prevLen > 12 && newLen < (prevLen / 2)
             let sarvamCanonical = partial.source == .sarvam && !partial.gurmukhi.isEmpty
             if dramaticShrink && !sarvamCanonical {
                 NSLog("[DIAG] VoiceSearchSession.startStreaming Bug-B freeze-last-good (prev=\(prevLen) new=\(newLen) source=\(String(describing: partial.source))) — preserving previous transcript")
-                setListening(
+                setRecording(
                     text: prev?.text ?? "",
                     liveMatches: prev?.matches ?? [],
                     bufferEnergy: partial.bufferEnergy
@@ -346,7 +401,7 @@ public final class VoiceSearchSession: ObservableObject {
             } else {
                 snappyText = prev?.text ?? ""
             }
-            setListening(
+            setRecording(
                 text: snappyText,
                 liveMatches: currentLiveMatches,
                 bufferEnergy: partial.bufferEnergy
@@ -395,9 +450,9 @@ public final class VoiceSearchSession: ObservableObject {
                     lastConfidentDisplayText = nil
                 }
 
-                if case .listening(let t, _, let e) = self.state {
+                if case .recording(let t, _, let e) = self.state {
                     let displayText = lastConfidentDisplayText ?? t
-                    self.setListening(text: displayText, liveMatches: liveMatches, bufferEnergy: e)
+                    self.setRecording(text: displayText, liveMatches: liveMatches, bufferEnergy: e)
                 }
             }
             lastMatchedQuery = query
@@ -425,7 +480,7 @@ public final class VoiceSearchSession: ObservableObject {
         // route the Gurmukhi snapshot back through Latin.from. For
         // honest Gurmukhi/Devanagari input the Latin.from script
         // detection will pick Gurmukhi and produce a clean Latin form.
-        let snapshot = listeningSnapshot
+        let snapshot = recordingSnapshot
         let gurmukhiSource = snapshot?.text ?? ""
         let queryLatin = Latin.from(gurmukhiSource)
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -433,7 +488,7 @@ public final class VoiceSearchSession: ObservableObject {
         NSLog("[DIAG] VoiceSearchSession.commit source.len=\(gurmukhiSource.count) queryLatin.len=\(queryLatin.count) queryLatin.head60=\"\(String(queryLatin.prefix(60)))\"")
 
         await asr.stop()
-        setSearching(text: gurmukhiSource, reason: "commit")
+        setProcessing(text: gurmukhiSource, reason: "commit")
 
         let matches: [Match]
         if queryLatin.isEmpty {

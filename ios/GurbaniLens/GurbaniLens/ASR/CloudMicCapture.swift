@@ -72,8 +72,60 @@ public final class CloudMicCapture {
     /// repeatedly but yields stop" vs "converter starves" failure modes.
     private static var tapCallCount: Int = 0
 
-    /// Per-tap peak amplitude (0..1) for VU display.
-    public var onPeak: ((Float) -> Void)?
+    /// Per-tap activity callback. Carries:
+    ///   - `peak`: max absolute sample amplitude in this tap (0..1).
+    ///     Legacy field; pre-VAD providers used `peak > 0.02` as a
+    ///     rough speech check.
+    ///   - `rms`: root-mean-square amplitude (0..1) — drives waveform
+    ///     animation amplitude in the UI.
+    ///   - `vadActive`: Silero VAD said speech was present in this
+    ///     tap. Providers should map this onto Partial.isSpeaking
+    ///     so VoiceSearchSession's state machine can transition from
+    ///     `.listening` (VAD waiting) to `.recording` (capturing).
+    ///
+    /// Renamed from `onPeak` 2026-06-25 (Brief #7) so the addition of
+    /// RMS + vadActive doesn't silently break compat — the old name
+    /// no longer exists; callers must update.
+    public var onActivity: ((_ peak: Float, _ rms: Float, _ vadActive: Bool) -> Void)?
+
+    // MARK: - Silero VAD integration (Brief #7, 2026-06-25)
+
+    /// Speech probability threshold above which Silero considers the
+    /// frame "voiced". 0.5 is the snakers4/silero-vad README default.
+    public static let vadThreshold: Float = 0.5
+    /// Trailing-silence window after which we auto-finish the stream.
+    public static let silenceTrailMs: Double = 1500
+    /// Minimum cumulative speech duration before silence-trail auto-stop
+    /// is allowed — prevents a 100 ms VAD blip on startup from auto-
+    /// stopping immediately.
+    public static let minSpeechMs: Double = 250
+    /// Hard cap: regardless of VAD state, finish the stream this far
+    /// in. Keeps a stuck-VAD recording from running forever.
+    public static let maxRecordingMs: Double = 15_000
+    /// Pre-speech ring buffer size. When VAD detects speech we flush
+    /// the last ~1 s of buffered audio to the consumer so ASR sees
+    /// the lead-in word's onset (otherwise the first ~80 ms of the
+    /// utterance is lost while VAD was deciding).
+    private static let preSpeechRingMaxBytes: Int = 32_000  // 1 s @ 16 kHz s16le
+
+    private var silero: SileroVAD?
+    private var sileroLoadAttempted: Bool = false
+
+    /// Buffer of resampled 16 kHz Float32 samples awaiting a complete
+    /// 512-sample VAD window. Drained per-tap.
+    private var vadWindowBuffer: [Float] = []
+    /// Did VAD detect speech in the current session? Once true, audio
+    /// flows through to the consumer (after the pre-speech ring flush).
+    private var hasSpeechStarted: Bool = false
+    /// Pre-speech audio buffered while VAD waits for the first
+    /// detection. Flushed on transition to speech.
+    private var preSpeechRing = Data()
+    /// Sample-accurate counters since speech start, for silence-trail
+    /// and max-recording auto-stop.
+    private var speechSampleCount: Int = 0
+    private var silenceSampleCount: Int = 0
+    private var totalSampleCount: Int = 0  // since speech started
+    private var autoFinishFired: Bool = false
 
     public var isRunning: Bool {
         stateLock.lock(); defer { stateLock.unlock() }
@@ -120,6 +172,17 @@ public final class CloudMicCapture {
         try configureSession()
         try requestPermissionIfNeeded()
 
+        // Per-session VAD state reset.
+        ensureSilero()
+        silero?.reset()
+        vadWindowBuffer.removeAll(keepingCapacity: true)
+        hasSpeechStarted = false
+        preSpeechRing.removeAll(keepingCapacity: true)
+        speechSampleCount = 0
+        silenceSampleCount = 0
+        totalSampleCount = 0
+        autoFinishFired = false
+
         let (stream, cont) = AsyncStream.makeStream(of: Data.self)
         stateLock.lock()
         self.chunkContinuation = cont
@@ -149,6 +212,26 @@ public final class CloudMicCapture {
 
         NSLog("[DIAG] CloudMicCapture.start nativeSR=\(nativeFormat?.sampleRate ?? -1) → 16000 mono s16le")
         return stream
+    }
+
+    /// Best-effort one-shot Silero VAD load. On any failure we log
+    /// and continue without VAD — providers fall back to the legacy
+    /// peak-threshold for the isSpeaking signal, and there's no
+    /// silence auto-stop. That's a worse UX but doesn't crash the
+    /// app, which is the right safety mode for a v1 dependency.
+    private func ensureSilero() {
+        if sileroLoadAttempted { return }
+        sileroLoadAttempted = true
+        guard let url = Bundle.main.url(forResource: "silero_vad", withExtension: "onnx") else {
+            NSLog("[DIAG] CloudMicCapture Silero VAD model not bundled — falling back to peak-threshold (no silence auto-stop)")
+            return
+        }
+        do {
+            silero = try SileroVAD(modelPath: url.path)
+            NSLog("[DIAG] CloudMicCapture Silero VAD loaded — VAD-gated capture + silence auto-stop active")
+        } catch {
+            NSLog("[DIAG] CloudMicCapture Silero VAD init failed: \(error.localizedDescription) — falling back to peak-threshold")
+        }
     }
 
     public func stop() {
@@ -268,7 +351,9 @@ public final class CloudMicCapture {
                 let a = abs(monoChunk[i]); if a > peak { peak = a }
             }
         }
-        onPeak?(peak)
+        // Peak alone is reported below alongside RMS + vadActive via
+        // `onActivity`. The legacy single-arg `onPeak` callback is
+        // gone (Brief #7); all providers were updated.
 
         // Wrap the mono float chunk in a PCMBuffer for AVAudioConverter.
         guard let monoNative = AVAudioFormat(
@@ -333,6 +418,44 @@ public final class CloudMicCapture {
         }
         guard let chan = outBuf.floatChannelData?[0] else { return }
 
+        // --- VAD + RMS over the converted 16 kHz mono Float32 frame ---
+        // RMS for waveform amplitude. Computed on the resampled Float32
+        // samples so it's independent of the device's native sample
+        // rate.
+        var sumSq: Float = 0
+        for i in 0..<outFrames {
+            sumSq += chan[i] * chan[i]
+        }
+        let rms = outFrames > 0 ? (sumSq / Float(outFrames)).squareRoot() : 0
+
+        // Silero VAD over 512-sample windows. Accumulate output
+        // samples; each complete window goes through Silero. The
+        // chunk-level vadActive is "did ANY window in this chunk
+        // detect speech".
+        var chunkVADActive = false
+        if let silero = silero {
+            for i in 0..<outFrames {
+                vadWindowBuffer.append(chan[i])
+            }
+            while vadWindowBuffer.count >= SileroVAD.windowSamples {
+                let window = Array(vadWindowBuffer.prefix(SileroVAD.windowSamples))
+                vadWindowBuffer.removeFirst(SileroVAD.windowSamples)
+                let prob = silero.probability(samples: window)
+                if prob >= Self.vadThreshold {
+                    chunkVADActive = true
+                }
+            }
+        } else {
+            // Fallback path when VAD didn't load — use legacy peak
+            // threshold so providers still get a meaningful isSpeaking.
+            chunkVADActive = peak > 0.02
+        }
+
+        // Report peak + rms + vadActive on the activity callback. UI
+        // / providers update Partial.isSpeaking from vadActive.
+        onActivity?(peak, rms, chunkVADActive)
+
+        // --- Build s16le bytes for the consumer (existing) ---
         var bytes = Data(count: outFrames * 2)
         bytes.withUnsafeMutableBytes { raw in
             guard let basePtr = raw.bindMemory(to: Int16.self).baseAddress else { return }
@@ -344,14 +467,83 @@ public final class CloudMicCapture {
             }
         }
 
-        // Hand the chunk to the consumer.
+        // --- Gating, pre-speech buffering, auto-stop ---
         stateLock.lock()
         let cont = chunkContinuation
         stateLock.unlock()
-        if tapNum <= 5 || tapNum % 50 == 0 {
-            NSLog("[DIAG] CloudMicCapture tap #\(tapNum) yielding bytes=\(bytes.count) hasConsumer=\(cont != nil)")
+
+        if silero == nil {
+            // No VAD model — keep legacy behaviour: forward every chunk
+            // to the consumer, no auto-stop, no pre-speech buffering.
+            if tapNum <= 5 || tapNum % 50 == 0 {
+                NSLog("[DIAG] CloudMicCapture tap #\(tapNum) yielding bytes=\(bytes.count) hasConsumer=\(cont != nil) [no-VAD]")
+            }
+            cont?.yield(bytes)
+            return
         }
+
+        // VAD-gated path.
+        let chunkSamples = outFrames
+        let chunkMs = Double(chunkSamples) / 16.0  // 16 samples per ms @ 16 kHz
+
+        if !hasSpeechStarted {
+            // Still waiting for first speech. Buffer current chunk in
+            // pre-speech ring; never forward yet.
+            preSpeechRing.append(bytes)
+            if preSpeechRing.count > Self.preSpeechRingMaxBytes {
+                let drop = preSpeechRing.count - Self.preSpeechRingMaxBytes
+                preSpeechRing.removeFirst(drop)
+            }
+            if chunkVADActive {
+                // First speech detected → transition to speech-active
+                // and flush the pre-speech ring (which already
+                // contains this chunk's bytes from the append above)
+                // to the consumer as a single concatenated Data.
+                hasSpeechStarted = true
+                speechSampleCount = chunkSamples
+                silenceSampleCount = 0
+                totalSampleCount = chunkSamples
+                let flush = preSpeechRing
+                preSpeechRing = Data()
+                NSLog("[DIAG] CloudMicCapture VAD speech-start detected — flushing pre-speech ring bytes=\(flush.count) (includes this chunk's bytes=\(bytes.count))")
+                cont?.yield(flush)
+            }
+            // !chunkVADActive: stay waiting; return without yielding.
+            return
+        }
+
+        // hasSpeechStarted == true: forward chunk to consumer.
         cont?.yield(bytes)
+        totalSampleCount += chunkSamples
+        if chunkVADActive {
+            speechSampleCount += chunkSamples
+            silenceSampleCount = 0
+        } else {
+            silenceSampleCount += chunkSamples
+        }
+
+        let silenceMs = Double(silenceSampleCount) / 16.0
+        let speechMs = Double(speechSampleCount) / 16.0
+        let totalMs = Double(totalSampleCount) / 16.0
+
+        // Auto-stop conditions:
+        //   1. silence-trail >= SILENCE_TRAIL_MS AND we've had enough
+        //      speech (MIN_SPEECH_MS) to be sure it wasn't a blip
+        //   2. hard cap: totalMs >= MAX_RECORDING_MS
+        let trailingSilenceStop =
+            silenceMs >= Self.silenceTrailMs && speechMs >= Self.minSpeechMs
+        let maxDurationStop = totalMs >= Self.maxRecordingMs
+
+        if !autoFinishFired && (trailingSilenceStop || maxDurationStop) {
+            autoFinishFired = true
+            let reason = trailingSilenceStop ? "silence_trail" : "max_recording"
+            NSLog("[DIAG] CloudMicCapture VAD auto-finish (reason=\(reason) silenceMs=\(Int(silenceMs)) speechMs=\(Int(speechMs)) totalMs=\(Int(totalMs)))")
+            stateLock.lock()
+            let finishCont = chunkContinuation
+            chunkContinuation = nil
+            stateLock.unlock()
+            finishCont?.finish()
+        }
     }
 
     // MARK: - Interruption handling

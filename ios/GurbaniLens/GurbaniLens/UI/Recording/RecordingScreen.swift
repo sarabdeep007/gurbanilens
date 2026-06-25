@@ -15,20 +15,22 @@ struct RecordingScreen: View {
 
     private var statusLabel: String {
         switch session.state {
-        case .recording:    return "Listening…"
-        case .transcribing: return "Transcribing…"
-        case .matching:     return "Searching…"
-        case .error:        return "Error"
-        default:            return ""
+        // Brief #7 state reshape: .transcribing + .matching collapsed
+        // into .processing. v1 doesn't distinguish the substates; the
+        // user sees "Searching…" the whole way from Done-tap to result.
+        case .listening, .recording: return "Listening…"
+        case .processing:            return "Searching…"
+        case .error:                 return "Error"
+        default:                     return ""
         }
     }
 
     private var peak: CGFloat {
         switch session.state {
-        case .recording(let p): return CGFloat(p)
-        case .transcribing:     return 1
-        case .matching:         return 1
-        default:                return 0
+        case .recording(_, _, let e): return CGFloat(e)
+        case .listening(let e):       return CGFloat(e)
+        case .processing:             return 1
+        default:                      return 0
         }
     }
 

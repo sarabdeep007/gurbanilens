@@ -54,7 +54,7 @@ struct LiveResultsScreen: View {
 
     var body: some View {
         Group {
-            if case .searching(let text) = session.state {
+            if case .processing(let text) = session.state {
                 searchingView(text: text)
             } else {
                 listeningView
@@ -221,7 +221,7 @@ struct LiveResultsScreen: View {
     }
 
     private var navTitle: String {
-        if case .searching = session.state { return "Searching…" }
+        if case .processing = session.state { return "Searching…" }
         return "Listening…"
     }
 
@@ -395,9 +395,9 @@ struct LiveResultsScreen: View {
 
     private var transcriptText: String {
         switch session.state {
-        case .listening(let t, _, _):
+        case .recording(let t, _, _):
             return t
-        case .searching(let t):
+        case .processing(let t):
             return t
         default:
             return ""
@@ -405,20 +405,37 @@ struct LiveResultsScreen: View {
     }
 
     private var liveMatches: [Match] {
-        if case .listening(_, let m, _) = session.state { return m }
+        if case .recording(_, let m, _) = session.state { return m }
         return []
     }
 
+    /// True when the mic is on — Brief #7 split this into two states
+    /// (.listening = VAD waiting, .recording = VAD active) but the UI
+    /// shows the "we're capturing" affordances (Stop button, etc.)
+    /// for both.
     private var isListening: Bool {
-        if case .listening = session.state { return true }
-        return false
+        switch session.state {
+        case .listening, .recording: return true
+        default: return false
+        }
     }
 
     private var stopLabel: String {
         switch session.state {
-        case .searching: return "Searching…"
-        case .done:      return "Done"
-        default:         return "Stop"
+        case .processing: return "Searching…"
+        case .done:       return "Done"
+        default:          return "Stop"
+        }
+    }
+
+    /// Current buffer energy — drives waveform amplitude when the
+    /// WaveformView ships in the follow-up commit. Reads from either
+    /// .listening or .recording payload.
+    private var bufferEnergy: Float {
+        switch session.state {
+        case .listening(let e): return e
+        case .recording(_, _, let e): return e
+        default: return 0
         }
     }
 }

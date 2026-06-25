@@ -46,6 +46,15 @@ packages:
   Starscream:
     url: https://github.com/daltoniam/Starscream.git
     from: "4.0.0"
+  # onnxruntime-objc — Microsoft's official Swift wrapper around the
+  # ONNX Runtime C API. Powers the on-device Silero VAD that gates
+  # `CloudMicCapture` (Brief #7, 2026-06-25). The package is a thin
+  # ObjC shim over a precompiled framework; if it conflicts with
+  # WhisperKit or Starscream at SPM-resolve time, the resolver will
+  # surface a clear error in Xcode and we iterate from there.
+  onnxruntime-objc:
+    url: https://github.com/microsoft/onnxruntime-swift-package-manager
+    from: "1.18.0"
 
 targets:
   GurbaniLens:
@@ -72,6 +81,12 @@ targets:
       # github.com/google/fonts/tree/main/ofl/notoserifgurmukhi.
       # Gitignored — fetched, not committed.
       - path: GurbaniLens/Resources/Fonts
+        optional: true
+      # Silero VAD v5 ONNX model (~2.3 MB, MIT-licensed). Drives the
+      # voice-activity gate in CloudMicCapture so we don't transcribe
+      # silence or background noise. Fetched by fetch_ios_deps.sh.
+      # Gitignored.
+      - path: GurbaniLens/Resources/VAD
         optional: true
     info:
       path: GurbaniLens/Resources/Info.plist
@@ -108,6 +123,8 @@ targets:
         product: WhisperKit
       - package: Starscream
         product: Starscream
+      - package: onnxruntime-objc
+        product: onnxruntime
     # Inject SARVAM_API_KEY + GEMINI_API_KEY from repo-root .env into the
     # built Info.plist so SarvamProvider + GeminiProvider can read them
     # via Bundle.main.object(forInfoDictionaryKey:). Wired here as a

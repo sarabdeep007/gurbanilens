@@ -51,9 +51,10 @@ RES_DIR="${REPO_ROOT}/ios/GurbaniLens/GurbaniLens/Resources"
 MODELS_DIR="${RES_DIR}/Models"
 DATA_DIR="${RES_DIR}/Data"
 FONTS_DIR="${RES_DIR}/Fonts"
+VAD_DIR="${RES_DIR}/VAD"
 CACHE_DIR="${REPO_ROOT}/build/ios-deps-cache"
 
-mkdir -p "$MODELS_DIR" "$DATA_DIR" "$FONTS_DIR" "$CACHE_DIR"
+mkdir -p "$MODELS_DIR" "$DATA_DIR" "$FONTS_DIR" "$VAD_DIR" "$CACHE_DIR"
 
 # ---------------------------------------------------------------- corpus --
 SGGS_SOURCE="${REPO_ROOT}/data/sggs/database.sqlite"
@@ -170,11 +171,35 @@ fetch_noto_font() {
   log "Noto Serif Gurmukhi at $NOTO_FONT_DEST ($(filesize "$NOTO_FONT_DEST") B)"
 }
 
+# ----------------------------------------------------- silero vad v5 --
+#
+# Silero VAD v5 — ~2.3 MB ONNX model, MIT-licensed. Drives the voice-
+# activity gate in `CloudMicCapture` so cloud providers don't
+# transcribe silence (Brief #7, 2026-06-25). Source is the same
+# repo the project was discovered through.
+SILERO_VAD_URL="https://raw.githubusercontent.com/snakers4/silero-vad/master/src/silero_vad/data/silero_vad.onnx"
+SILERO_VAD_LICENSE_URL="https://raw.githubusercontent.com/snakers4/silero-vad/master/LICENSE"
+SILERO_VAD_DEST="${VAD_DIR}/silero_vad.onnx"
+SILERO_VAD_LICENSE_DEST="${VAD_DIR}/silero_vad-LICENSE.txt"
+
+fetch_silero_vad() {
+  if [[ $FORCE -eq 0 && -f "$SILERO_VAD_DEST" && $(filesize "$SILERO_VAD_DEST") -gt 1000000 ]]; then
+    log "Silero VAD already at $SILERO_VAD_DEST ($(filesize "$SILERO_VAD_DEST") B) — skipping"
+    return
+  fi
+  log "Downloading Silero VAD → $SILERO_VAD_DEST"
+  curl -fSL --max-time 60 -o "$SILERO_VAD_DEST" "$SILERO_VAD_URL"
+  curl -fSL --max-time 30 -o "$SILERO_VAD_LICENSE_DEST" "$SILERO_VAD_LICENSE_URL" \
+    || warn "LICENSE download failed — model itself OK"
+  log "Silero VAD at $SILERO_VAD_DEST ($(filesize "$SILERO_VAD_DEST") B)"
+}
+
 # ---------------------------------------------------------------- main --
 ensure_tool curl
 
 copy_sggs_db
 fetch_noto_font
+fetch_silero_vad
 if [[ $BUNDLE_MODEL -eq 1 ]]; then
   fetch_whisperkit_model
 fi
@@ -184,6 +209,7 @@ cat <<EOF
 iOS deps in place:
   $(ls -lh "${SGGS_DEST}" 2>/dev/null | awk '{print $5, $NF}')
   $(ls -lh "${NOTO_FONT_DEST}" 2>/dev/null | awk '{print $5, $NF}')
+  $(ls -lh "${SILERO_VAD_DEST}" 2>/dev/null | awk '{print $5, $NF}')
 EOF
 
 if [[ $BUNDLE_MODEL -eq 1 ]]; then

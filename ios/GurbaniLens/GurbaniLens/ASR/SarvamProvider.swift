@@ -191,9 +191,9 @@ public actor SarvamProvider: ASRProvider {
                 // so the level meter animates. Bug-B freeze-last-good in
                 // VoiceSearchSession prevents these empty-text partials
                 // from clobbering accumulated transcript text.
-                capture.onPeak = { [weak self] peak in
+                capture.onActivity = { [weak self] peak, rms, vadActive in
                     guard let self else { return }
-                    Task { await self.recordPeak(peak) }
+                    Task { await self.recordActivity(peak: peak, rms: rms, vadActive: vadActive) }
                 }
             }
 
@@ -253,14 +253,18 @@ public actor SarvamProvider: ASRProvider {
 
     // MARK: - Internals
 
-    private func recordPeak(_ peak: Float) {
-        let speaking = peak > 0.02
+    private func recordActivity(peak: Float, rms: Float, vadActive: Bool) {
+        // Brief #7 (2026-06-25): RMS replaces peak as bufferEnergy
+        // (smoother waveform); vadActive (Silero) replaces peak >
+        // 0.02 heuristic — drives VoiceSearchSession's listening →
+        // recording transition. Energy-only Partials carry no
+        // transcript; UI uses bufferEnergy for waveform animation.
         partialsContinuation?.yield(Partial(
             text: "",
             latin: "",
             gurmukhi: "",
-            isSpeaking: speaking,
-            bufferEnergy: peak
+            isSpeaking: vadActive,
+            bufferEnergy: rms
         ))
     }
 
