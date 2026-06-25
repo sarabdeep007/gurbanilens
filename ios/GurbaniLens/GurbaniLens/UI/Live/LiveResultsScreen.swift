@@ -92,18 +92,17 @@ struct LiveResultsScreen: View {
         VStack(spacing: 0) {
             // Active-provider caption — tiny strip at the very top so
             // the user always knows which ASR backend is running.
-            // Especially important once Settings exposes the
-            // "disable Whisper" toggle for cloud-only testing.
             providerCaption
                 .padding(.top, 6)
 
-            // Bounded transcript header.
-            transcriptHeader
-                .frame(maxWidth: .infinity)
-                .background(Theme.surface)
-                .clipShape(RoundedRectangle(cornerRadius: 12))
+            // Brief #7 (2026-06-25): the partial-transcript box +
+            // "ਸੁਣ ਰਿਹਾ ਹਾਂ…" placeholder reinforced false transcripts
+            // and looked unprofessional. Replaced with a real-time
+            // waveform + state label. The waveform IS the visual
+            // feedback now.
+            waveformHeader
                 .padding(.horizontal, 16)
-                .padding(.top, 8)
+                .padding(.top, 12)
 
             // Match count above list (Amrit-Kirtan-style "N Shabads found").
             matchCountStrip
@@ -123,6 +122,34 @@ struct LiveResultsScreen: View {
             stopButton
                 .padding(.horizontal, 16)
                 .padding(.vertical, 12)
+        }
+    }
+
+    /// Replaces the old transcriptHeader. WaveformView animates with
+    /// the current `bufferEnergy`; colour intensifies when Silero has
+    /// detected speech (state `.recording`). When the WhisperKit model
+    /// is downloading on first launch, swaps in the progress UI
+    /// instead.
+    @ViewBuilder
+    private var waveformHeader: some View {
+        if let progress = downloadProgress {
+            modelDownloadHeader(progress: progress)
+                .background(Theme.surface)
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+        } else {
+            let recording: Bool = {
+                if case .recording = session.state { return true } else { return false }
+            }()
+            VStack(spacing: 8) {
+                WaveformView(amplitude: bufferEnergy, isActive: recording)
+                Text(recording ? "Recording…" : "Listening…")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(Theme.onSurfaceVariant)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 8)
+            .background(Theme.surface)
+            .clipShape(RoundedRectangle(cornerRadius: 12))
         }
     }
 
@@ -227,18 +254,9 @@ struct LiveResultsScreen: View {
 
     // MARK: - Header
 
-    private var transcriptHeader: some View {
-        Group {
-            if let progress = downloadProgress {
-                // Phase A.4a: WhisperKit model is downloading. Swap the
-                // listening placeholder for a progress UI.
-                modelDownloadHeader(progress: progress)
-            } else {
-                liveTranscriptHeader
-            }
-        }
-    }
-
+    /// First-launch WhisperKit model-download progress UI. Shown
+    /// in-place of the waveform via the `waveformHeader` ViewBuilder
+    /// when `downloadProgress` is non-nil.
     private func modelDownloadHeader(progress: Float) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Downloading voice model")
@@ -256,31 +274,6 @@ struct LiveResultsScreen: View {
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    private var liveTranscriptHeader: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("You said:")
-                        .font(.system(size: 13))
-                        .foregroundColor(Theme.onSurfaceVariant)
-                    Text(transcriptText.isEmpty ? "ਸੁਣ ਰਿਹਾ ਹਾਂ…" : transcriptText)
-                        .font(.notoSerifGurmukhi(18, weight: .medium))
-                        .foregroundColor(Theme.onSurface)
-                        .multilineTextAlignment(.leading)
-                        .id("bottom")
-                }
-                .padding(12)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .frame(maxHeight: Self.headerMaxHeight)
-            .onChange(of: transcriptText) { _ in
-                withAnimation(.easeOut(duration: 0.15)) {
-                    proxy.scrollTo("bottom", anchor: .bottom)
-                }
-            }
-        }
     }
 
     // MARK: - Match count
