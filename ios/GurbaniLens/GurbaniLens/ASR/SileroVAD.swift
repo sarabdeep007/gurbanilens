@@ -1,5 +1,5 @@
 import Foundation
-import onnxruntime_objc
+import OnnxRuntimeBindings
 
 /// Silero VAD v5 wrapper. Tiny LSTM-based voice-activity classifier
 /// (1.8 MB ONNX) that returns a 0–1 speech probability per 512-sample
