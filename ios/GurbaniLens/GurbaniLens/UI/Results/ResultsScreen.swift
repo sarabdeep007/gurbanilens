@@ -9,6 +9,8 @@ struct ResultsScreen: View {
     let onTryAgain: () -> Void
     let onOpenShabad: (Match) -> Void
 
+    @State private var showAlternates: Bool = false
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             transcriptStrip
@@ -17,21 +19,16 @@ struct ResultsScreen: View {
                 .padding(.top, 16)
             Spacer().frame(height: 16)
 
-            if let top = result.top {
+            if result.topConfidence.isNoMatch {
+                // < 50 — matcher gave up. Surface transcript prominently;
+                // don't auto-pick a top result. If we have any matches
+                // at all (40-49 ish), show them as a "did you mean" list.
+                noClearMatchState
+            } else if let top = result.top {
                 MatchCard(match: top, isTopMatch: true) { onOpenShabad(top) }
                 if !result.alternates.isEmpty {
                     Spacer().frame(height: 24)
-                    Text("Did you mean…")
-                        .font(.system(size: 17, weight: .medium))
-                        .foregroundColor(Theme.onSurfaceVariant)
-                    Spacer().frame(height: 8)
-                    ScrollView {
-                        LazyVStack(spacing: 8) {
-                            ForEach(result.alternates, id: \.line.id) { alt in
-                                MatchCard(match: alt, isTopMatch: false) { onOpenShabad(alt) }
-                            }
-                        }
-                    }
+                    alternatesSection
                 }
             } else {
                 emptyState
@@ -75,16 +72,97 @@ struct ResultsScreen: View {
     private var confidencePill: some View {
         let color: Color = {
             switch result.topConfidence {
-            case .strong:   return Theme.success
-            case .possible: return Theme.warning
-            case .low:      return Theme.error
+            case .found:        return Theme.success
+            case .bestMatch:    return Theme.success
+            case .likelyMatch:  return Theme.warning
+            case .didYouMean:   return Theme.warning
+            case .noClearMatch: return Theme.error
             }
         }()
+        let icon: String? = (result.topConfidence == .found) ? "checkmark.circle.fill" : nil
         return HStack(spacing: 8) {
-            Circle().fill(color).frame(width: 10, height: 10)
+            if let icon = icon {
+                Image(systemName: icon).foregroundColor(color).font(.system(size: 18, weight: .semibold))
+            } else {
+                Circle().fill(color).frame(width: 10, height: 10)
+            }
             Text(result.topConfidence.display)
                 .font(.system(size: 17, weight: .medium))
                 .foregroundColor(color)
+        }
+    }
+
+    /// Heading + list of alternative matches, presentation varies by
+    /// tier:
+    ///   .found      → "Other possibilities" inside a disclosure
+    ///                 (collapsed by default — top match is the answer)
+    ///   .bestMatch  → "Other possibilities" inside a disclosure
+    ///   .likelyMatch → "Did you mean…" inline (visible)
+    ///   .didYouMean  → "Did you mean…" inline (visible)
+    @ViewBuilder
+    private var alternatesSection: some View {
+        switch result.topConfidence {
+        case .found, .bestMatch:
+            DisclosureGroup(
+                isExpanded: $showAlternates,
+                content: {
+                    LazyVStack(spacing: 8) {
+                        ForEach(result.alternates, id: \.line.id) { alt in
+                            MatchCard(match: alt, isTopMatch: false) { onOpenShabad(alt) }
+                        }
+                    }
+                    .padding(.top, 8)
+                },
+                label: {
+                    Text("Other possibilities (\(result.alternates.count))")
+                        .font(.system(size: 15, weight: .medium))
+                        .foregroundColor(Theme.onSurfaceVariant)
+                }
+            )
+            .tint(Theme.onSurfaceVariant)
+        case .likelyMatch, .didYouMean:
+            Text("Did you mean…")
+                .font(.system(size: 17, weight: .medium))
+                .foregroundColor(Theme.onSurfaceVariant)
+            Spacer().frame(height: 8)
+            ScrollView {
+                LazyVStack(spacing: 8) {
+                    ForEach(result.alternates, id: \.line.id) { alt in
+                        MatchCard(match: alt, isTopMatch: false) { onOpenShabad(alt) }
+                    }
+                }
+            }
+        case .noClearMatch:
+            // Not reached — noClearMatch is handled separately above.
+            EmptyView()
+        }
+    }
+
+    /// Shown when the matcher's top score is below 50 — we don't claim
+    /// a winner. Surfaces the transcript prominently so the user can
+    /// tell whether ASR or matching was the failure.
+    private var noClearMatchState: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Couldn't find a clear match for what we heard.")
+                .font(.system(size: 17, weight: .medium))
+                .foregroundColor(Theme.onSurface)
+            Text("Tap the retry button (top-right) to try again. The transcript above shows what we heard — if it's wrong, the ASR was the problem; if it looks close to your Pangti, the matcher couldn't find it in the corpus.")
+                .font(.system(size: 14))
+                .foregroundColor(Theme.onSurfaceVariant)
+                .fixedSize(horizontal: false, vertical: true)
+            if !result.matches.isEmpty {
+                Text("Closest guesses:")
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundColor(Theme.onSurfaceVariant)
+                    .padding(.top, 8)
+                ScrollView {
+                    LazyVStack(spacing: 8) {
+                        ForEach(Array(result.matches.prefix(3)), id: \.line.id) { alt in
+                            MatchCard(match: alt, isTopMatch: false) { onOpenShabad(alt) }
+                        }
+                    }
+                }
+            }
         }
     }
 

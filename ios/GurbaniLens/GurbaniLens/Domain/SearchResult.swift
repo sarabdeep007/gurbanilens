@@ -18,9 +18,16 @@ public struct SearchResult: Sendable {
     }
 
     public static func from(transcript: String, matches: [Match]) -> SearchResult {
-        let label = matches.first.map { ConfidenceLabel.forScore($0.score) } ?? .low
+        // Use ambiguity-aware tier computation: when top and runner-up
+        // are within 2 points, demote a high-confidence tier so the UI
+        // doesn't claim "Found ✓" on a tie.
+        let label: ConfidenceLabel = {
+            guard let top = matches.first else { return .noClearMatch }
+            let runnerUp = matches.dropFirst().first?.score
+            return ConfidenceLabel.forScores(top: top.score, runnerUp: runnerUp)
+        }()
         return SearchResult(transcript: transcript, matches: matches, topConfidence: label)
     }
 
-    public static let empty = SearchResult(transcript: "", matches: [], topConfidence: .low)
+    public static let empty = SearchResult(transcript: "", matches: [], topConfidence: .noClearMatch)
 }
