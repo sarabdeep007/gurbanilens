@@ -266,7 +266,7 @@ struct LiveResultsScreen: View {
                         .font(.system(size: 13))
                         .foregroundColor(Theme.onSurfaceVariant)
                     Text(transcriptText.isEmpty ? "ਸੁਣ ਰਿਹਾ ਹਾਂ…" : transcriptText)
-                        .font(.system(size: 18, weight: .medium))
+                        .font(.notoSerifGurmukhi(18, weight: .medium))
                         .foregroundColor(Theme.onSurface)
                         .multilineTextAlignment(.leading)
                         .id("bottom")
@@ -330,7 +330,7 @@ struct LiveResultsScreen: View {
                 Spacer()
             }
             Text(rowGurmukhi(match.line))
-                .font(.system(size: 18, weight: .medium))
+                .font(.notoSerifGurmukhi(18, weight: .medium))
                 .foregroundColor(Theme.onSurface)
                 .multilineTextAlignment(.leading)
                 .lineLimit(2)

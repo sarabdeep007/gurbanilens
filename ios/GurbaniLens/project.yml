@@ -67,6 +67,12 @@ targets:
       # `scripts/fetch_ios_deps.sh` from data/sggs/database.sqlite. Gitignored.
       - path: GurbaniLens/Resources/Data
         optional: true
+      # Bundled Noto Serif Gurmukhi (variable font, OFL-licensed).
+      # Populated by `scripts/fetch_ios_deps.sh` from
+      # github.com/google/fonts/tree/main/ofl/notoserifgurmukhi.
+      # Gitignored — fetched, not committed.
+      - path: GurbaniLens/Resources/Fonts
+        optional: true
     info:
       path: GurbaniLens/Resources/Info.plist
       properties:
@@ -78,6 +84,13 @@ targets:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
+        # Noto Serif Gurmukhi (variable font) is bundled under
+        # Resources/Fonts/ and registered via UIAppFonts so SwiftUI
+        # `Font.custom(...)` can resolve it. Variable font: a single
+        # file carries the full weight axis; SwiftUI's `.weight()`
+        # modifier picks the closest registered instance.
+        UIAppFonts:
+          - Fonts/NotoSerifGurmukhi-Variable.ttf
         # Microphone permission. Plain language; we tell the user exactly
         # what we do with audio. v1 is tap-to-record only — no background
         # listening, no recording without an explicit tap.

@@ -127,8 +127,8 @@ private struct MatchCard: View {
                     }
                 }
                 Text(Self.rowGurmukhi(match.line))
-                    .font(.system(size: isTopMatch ? 22 : 17,
-                                  weight: isTopMatch ? .medium : .regular))
+                    .font(.notoSerifGurmukhi(isTopMatch ? 22 : 17,
+                                             weight: isTopMatch ? .medium : .regular))
                     .foregroundColor(Theme.onSurface)
                     .multilineTextAlignment(.leading)
             }

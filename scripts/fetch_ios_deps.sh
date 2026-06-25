@@ -50,9 +50,10 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 RES_DIR="${REPO_ROOT}/ios/GurbaniLens/GurbaniLens/Resources"
 MODELS_DIR="${RES_DIR}/Models"
 DATA_DIR="${RES_DIR}/Data"
+FONTS_DIR="${RES_DIR}/Fonts"
 CACHE_DIR="${REPO_ROOT}/build/ios-deps-cache"
 
-mkdir -p "$MODELS_DIR" "$DATA_DIR" "$CACHE_DIR"
+mkdir -p "$MODELS_DIR" "$DATA_DIR" "$FONTS_DIR" "$CACHE_DIR"
 
 # ---------------------------------------------------------------- corpus --
 SGGS_SOURCE="${REPO_ROOT}/data/sggs/database.sqlite"
@@ -143,10 +144,37 @@ fetch_whisperkit_model() {
   log "WhisperKit model at $dest"
 }
 
+# -------------------------------------------------- noto serif gurmukhi --
+#
+# Variable Noto Serif Gurmukhi (a single TTF carrying the full weight
+# axis) is bundled into Resources/Fonts/ so SwiftUI `Font.custom("Noto
+# Serif Gurmukhi", size:)` resolves. Registered via UIAppFonts in
+# project.yml. Source is google/fonts (the same repo Google Fonts the
+# web service hosts) — OFL-1.1 licensed; Seva-compatible. The upstream
+# filename has literal square brackets ("NotoSerifGurmukhi[wght].ttf")
+# which are awkward in iOS bundle paths, so we rename on copy.
+NOTO_FONT_URL="https://raw.githubusercontent.com/google/fonts/main/ofl/notoserifgurmukhi/NotoSerifGurmukhi%5Bwght%5D.ttf"
+NOTO_LICENSE_URL="https://raw.githubusercontent.com/google/fonts/main/ofl/notoserifgurmukhi/OFL.txt"
+NOTO_FONT_DEST="${FONTS_DIR}/NotoSerifGurmukhi-Variable.ttf"
+NOTO_LICENSE_DEST="${FONTS_DIR}/NotoSerifGurmukhi-OFL.txt"
+
+fetch_noto_font() {
+  if [[ $FORCE -eq 0 && -f "$NOTO_FONT_DEST" && $(filesize "$NOTO_FONT_DEST") -gt 100000 ]]; then
+    log "Noto Serif Gurmukhi already at $NOTO_FONT_DEST ($(filesize "$NOTO_FONT_DEST") B) — skipping"
+    return
+  fi
+  log "Downloading Noto Serif Gurmukhi → $NOTO_FONT_DEST"
+  curl -fSL --max-time 60 -o "$NOTO_FONT_DEST" "$NOTO_FONT_URL"
+  curl -fSL --max-time 30 -o "$NOTO_LICENSE_DEST" "$NOTO_LICENSE_URL" \
+    || warn "OFL.txt download failed — font itself OK"
+  log "Noto Serif Gurmukhi at $NOTO_FONT_DEST ($(filesize "$NOTO_FONT_DEST") B)"
+}
+
 # ---------------------------------------------------------------- main --
 ensure_tool curl
 
 copy_sggs_db
+fetch_noto_font
 if [[ $BUNDLE_MODEL -eq 1 ]]; then
   fetch_whisperkit_model
 fi
@@ -155,6 +183,7 @@ cat <<EOF
 
 iOS deps in place:
   $(ls -lh "${SGGS_DEST}" 2>/dev/null | awk '{print $5, $NF}')
+  $(ls -lh "${NOTO_FONT_DEST}" 2>/dev/null | awk '{print $5, $NF}')
 EOF
 
 if [[ $BUNDLE_MODEL -eq 1 ]]; then

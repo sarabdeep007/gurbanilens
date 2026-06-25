@@ -93,7 +93,7 @@ private struct LineRow: View {
         VStack(alignment: .leading, spacing: 4) {
             if script != .transliteration {
                 Text(line.gurmukhiUnicode ?? Gurmukhi.fromAnmolLipi(line.gurmukhi))
-                    .font(.system(size: 22, weight: .medium))
+                    .font(.notoSerifGurmukhi(22, weight: .medium))
                     .foregroundColor(Theme.onSurface)
             }
             if script != .gurmukhi, let translit = line.transliterationEn {

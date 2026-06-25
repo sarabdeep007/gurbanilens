@@ -86,6 +86,9 @@ ios/GurbaniLens/GurbaniLens.xcworkspace/
 ios/GurbaniLens/GurbaniLens/Resources/Models/
 ios/GurbaniLens/GurbaniLens/Resources/Database/
 ios/GurbaniLens/GurbaniLens/Resources/Data/
+# Noto Serif Gurmukhi (OFL) fetched from github.com/google/fonts.
+# Re-fetchable; never committed to keep repo light.
+ios/GurbaniLens/GurbaniLens/Resources/Fonts/
 build/ios-deps-cache/
 
 # Whisper conversion artifacts
