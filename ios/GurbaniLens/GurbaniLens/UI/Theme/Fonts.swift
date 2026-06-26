@@ -28,17 +28,42 @@ public enum AppFonts {
     /// "Noto" (case-insensitive). Call once at app start so the Xcode
     /// console makes the answer easy to find. Idempotent; subsequent
     /// calls re-log the same data.
+    ///
+    /// Brief #7.1 (2026-06-26): also dumps the bundle-resource path
+    /// resolution for the font file. If the file isn't found, the
+    /// fix is usually one of:
+    ///   - run `scripts/fetch_ios_deps.sh` to download the font
+    ///   - re-run `xcodegen generate` so the project picks it up
+    ///   - verify `UIAppFonts` in project.yml points at the right
+    ///     bundle path (no Fonts/ prefix — XcodeGen flattens
+    ///     group references to the bundle root)
     public static func logRegisteredNotoFamilies() {
+        // 1. Resource-existence probe — direct Bundle lookup.
+        let resourceCandidates: [(String, String)] = [
+            ("NotoSerifGurmukhi-Variable", "ttf"),
+            ("NotoSerifGurmukhi[wght]", "ttf"),
+        ]
+        var firstFound: URL?
+        for (name, ext) in resourceCandidates {
+            if let url = Bundle.main.url(forResource: name, withExtension: ext) {
+                NSLog("[DIAG] Fonts.bundleProbe FOUND name=\"\(name).\(ext)\" path=\(url.path)")
+                if firstFound == nil { firstFound = url }
+            } else {
+                NSLog("[DIAG] Fonts.bundleProbe MISSING name=\"\(name).\(ext)\"")
+            }
+        }
+
+        // 2. Registered-family scan.
         let matching = UIFont.familyNames
             .filter { $0.range(of: "Noto", options: .caseInsensitive) != nil }
             .sorted()
         if matching.isEmpty {
-            NSLog("[DIAG] Fonts.notoFamilies=[] — Noto Serif Gurmukhi NOT registered. Run `scripts/fetch_ios_deps.sh` then re-build, or verify UIAppFonts in project.yml.")
-            return
-        }
-        for family in matching {
-            let postScriptNames = UIFont.fontNames(forFamilyName: family)
-            NSLog("[DIAG] Fonts.notoFamilies family=\"\(family)\" postScriptNames=\(postScriptNames)")
+            NSLog("[DIAG] Fonts.notoFamilies=[] — Noto Serif Gurmukhi NOT registered. Bundle probe above shows whether the file is even in the .app. If MISSING: run scripts/fetch_ios_deps.sh + xcodegen generate. If FOUND but not registered: UIAppFonts entry in project.yml has the wrong path.")
+        } else {
+            for family in matching {
+                let postScriptNames = UIFont.fontNames(forFamilyName: family)
+                NSLog("[DIAG] Fonts.notoFamilies family=\"\(family)\" postScriptNames=\(postScriptNames)")
+            }
         }
     }
 }
