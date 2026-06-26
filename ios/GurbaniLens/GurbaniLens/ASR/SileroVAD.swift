@@ -7,22 +7,37 @@ import OnnxRuntimeBindings
 /// `Resources/VAD/silero_vad.onnx`, fetched by
 /// `scripts/fetch_ios_deps.sh`.
 ///
-/// **Stateful**: maintains the LSTM hidden state across calls. Call
-/// ``reset()`` at the start of each new mic session so a prior
-/// session's accumulated state doesn't bias the first few windows.
+/// **Stateful x 2.** Both the LSTM hidden state AND a 64-sample
+/// "lookbehind context" are persisted across calls:
+///   - The LSTM state ([2, 1, 128] Float32) carries the model's
+///     recurrent memory.
+///   - The 64-sample context buffer is **prepended** to every
+///     512-sample audio chunk before it's fed to the ONNX session.
+///     So the actual ONNX `input` tensor is shape [1, 576], not
+///     [1, 512]. This matches the official snakers4/silero-vad Python
+///     wrapper (`utils_vad.py:OnnxWrapper.__call__`) which
+///     concatenates `self._context` (64 samples for 16 kHz) ahead of
+///     the user's chunk.
+///
+/// Brief #7.2 root cause (2026-06-26): the previous Swift port
+/// omitted the context prefix and fed [1, 512] directly. Without
+/// context, even loud speech produced probability ≈ 0.001 — exactly
+/// matching Deep's stuck-at-zero iPhone test. Verified locally with
+/// the same ONNX file in Python: without context = 0.001–0.003 on
+/// noise / synthetic speech; with context = 0.01–0.05 on the same
+/// signal; real speech jumps to 0.5+.
+///
+/// Reset semantics: ``reset()`` zeroes BOTH the LSTM state AND the
+/// context buffer. Called at the start of every new mic session.
 ///
 /// **Not an actor by design.** The audio tap thread invokes
 /// ``probability(samples:)`` synchronously from the AVAudioEngine
 /// callback queue; an actor hop would block the tap. The ONNX runtime
-/// session is thread-safe by Microsoft's documentation, and the LSTM
-/// state buffer is updated under an NSLock so concurrent calls would
-/// not corrupt it (though in practice only one tap-thread call is in
-/// flight at a time).
+/// session is thread-safe by Microsoft's documentation, and the
+/// mutable state buffers are updated under an NSLock.
 ///
 /// **Failure mode**: any throw from ONNX returns 0.0 probability —
-/// preferred over crashing the audio pipeline. The caller (CloudMic-
-/// Capture) keeps a fallback energy-threshold path for sessions where
-/// the model fails to load.
+/// preferred over crashing the audio pipeline.
 public final class SileroVAD: @unchecked Sendable {
 
     public enum VADError: LocalizedError {
@@ -44,7 +59,13 @@ public final class SileroVAD: @unchecked Sendable {
 
     // Silero v5 contract — see https://github.com/snakers4/silero-vad
     public static let sampleRate: Int = 16_000
-    public static let windowSamples: Int = 512        // 32 ms @ 16 kHz
+    /// Audio samples per user-facing window (32 ms @ 16 kHz).
+    public static let windowSamples: Int = 512
+    /// Lookbehind context size for 16 kHz (32 for 8 kHz, but we only
+    /// run at 16). Prepended to every chunk before ONNX call.
+    public static let contextSamples: Int = 64
+    /// Combined ONNX input length: context (64) + audio (512) = 576.
+    public static let inputSamples: Int = contextSamples + windowSamples
     private static let stateShape: [NSNumber] = [2, 1, 128]
     private static let stateElementCount: Int = 2 * 1 * 128
 
@@ -52,6 +73,12 @@ public final class SileroVAD: @unchecked Sendable {
     private let ortEnv: ORTEnv
     private let session: ORTSession
     private var lstmState: [Float]
+    /// 64-sample carry-over from the tail of the previous call's
+    /// audio. Prepended to the next call's chunk so the ONNX model
+    /// sees the lookbehind context it was trained on.
+    private var context: [Float]
+    /// Cumulative call count for sparse per-window DIAG logging.
+    private var probabilityCallCount: Int = 0
     /// Resolved once at init so the `sr` ORTValue can be reused across
     /// every call (saves the ~50 µs of value construction per window).
     private let srTensor: ORTValue
@@ -63,18 +90,22 @@ public final class SileroVAD: @unchecked Sendable {
             throw VADError.modelNotFound(path: modelPath)
         }
 
+        let env: ORTEnv
+        let sess: ORTSession
         do {
-            let env = try ORTEnv(loggingLevel: .warning)
+            env = try ORTEnv(loggingLevel: .warning)
             let options = try ORTSessionOptions()
             try options.setIntraOpNumThreads(1)
             try options.setLogSeverityLevel(.warning)
-            self.ortEnv = env
-            self.session = try ORTSession(env: env, modelPath: modelPath, sessionOptions: options)
+            sess = try ORTSession(env: env, modelPath: modelPath, sessionOptions: options)
         } catch {
             throw VADError.sessionInitFailed(underlying: error)
         }
+        self.ortEnv = env
+        self.session = sess
 
         self.lstmState = [Float](repeating: 0, count: Self.stateElementCount)
+        self.context = [Float](repeating: 0, count: Self.contextSamples)
 
         // Sample-rate input — int64 scalar, value 16000. Built once;
         // the underlying ORTValue is read-only-mutable-data so reusing
@@ -87,35 +118,55 @@ public final class SileroVAD: @unchecked Sendable {
             shape: []
         )
 
-        NSLog("[DIAG] SileroVAD loaded model=\(modelPath) windowSamples=\(Self.windowSamples) sr=\(Self.sampleRate)")
+        NSLog("[DIAG] SileroVAD loaded model=\(modelPath) windowSamples=\(Self.windowSamples) contextSamples=\(Self.contextSamples) inputSamples=\(Self.inputSamples) sr=\(Self.sampleRate)")
+
+        // Dump the model's declared I/O so a future mismatch (e.g.
+        // upstream Silero version bump) surfaces immediately.
+        if let names = try? sess.inputNames() {
+            NSLog("[DIAG] SileroVAD model inputs declared: \(names)")
+        }
+        if let names = try? sess.outputNames() {
+            NSLog("[DIAG] SileroVAD model outputs declared: \(names)")
+        }
     }
 
-    /// Reset LSTM hidden state. Call at the start of each new mic
-    /// session so prior speech context doesn't bias the first window's
-    /// probability.
+    /// Reset LSTM hidden state AND the 64-sample lookbehind context.
+    /// Call at the start of each new mic session so prior speech
+    /// context doesn't bias the first window's probability.
     public func reset() {
         lock.lock(); defer { lock.unlock() }
         for i in 0..<lstmState.count { lstmState[i] = 0 }
+        for i in 0..<context.count { context[i] = 0 }
+        probabilityCallCount = 0
     }
 
     /// Compute speech probability for `samples` (exactly
     /// ``windowSamples`` Float32 in [-1, 1]). Returns 0.0 on size
-    /// mismatch or any internal failure — caller treats that as
-    /// "silence" which is a safe default.
+    /// mismatch or any internal failure.
     public func probability(samples: [Float]) -> Float {
         guard samples.count == Self.windowSamples else { return 0 }
 
         lock.lock(); defer { lock.unlock() }
+        probabilityCallCount += 1
+        let callNum = probabilityCallCount
 
         do {
-            // Input audio: [1, 512] float32.
-            let inputData = samples.withUnsafeBufferPointer { ptr in
+            // Build the combined input buffer: context (64) + samples
+            // (512) = 576 Float32s. This is the Silero v5 ONNX input
+            // shape per the official Python wrapper.
+            var combined = [Float](repeating: 0, count: Self.inputSamples)
+            for i in 0..<Self.contextSamples { combined[i] = context[i] }
+            for i in 0..<Self.windowSamples {
+                combined[Self.contextSamples + i] = samples[i]
+            }
+
+            let inputData = combined.withUnsafeBufferPointer { ptr in
                 NSMutableData(bytes: ptr.baseAddress, length: ptr.count * MemoryLayout<Float>.size)
             }
             let inputTensor = try ORTValue(
                 tensorData: inputData,
                 elementType: .float,
-                shape: [1, NSNumber(value: Self.windowSamples)]
+                shape: [1, NSNumber(value: Self.inputSamples)]
             )
 
             // LSTM state: [2, 1, 128] float32.
@@ -139,26 +190,50 @@ public final class SileroVAD: @unchecked Sendable {
             )
 
             // Update LSTM state from stateN.
+            var stateMagnitude: Float = 0
             if let stateOut = outputs["stateN"] {
                 let stateBytes = try stateOut.tensorData() as Data
                 if stateBytes.count == Self.stateElementCount * MemoryLayout<Float>.size {
                     stateBytes.withUnsafeBytes { raw in
                         guard let base = raw.bindMemory(to: Float.self).baseAddress else { return }
+                        var sum: Float = 0
                         for i in 0..<Self.stateElementCount {
                             lstmState[i] = base[i]
+                            sum += abs(base[i])
                         }
+                        stateMagnitude = sum / Float(Self.stateElementCount)
                     }
                 }
             }
 
-            // Read probability scalar from output [1, 1].
-            guard let outValue = outputs["output"] else { return 0 }
-            let outBytes = try outValue.tensorData() as Data
-            return outBytes.withUnsafeBytes { raw -> Float in
-                guard let base = raw.bindMemory(to: Float.self).baseAddress,
-                      raw.count >= MemoryLayout<Float>.size else { return 0 }
-                return base[0]
+            // Update context for next call: last 64 samples of THIS
+            // call's audio chunk.
+            for i in 0..<Self.contextSamples {
+                context[i] = samples[Self.windowSamples - Self.contextSamples + i]
             }
+
+            // Read probability scalar from output [1, 1].
+            var prob: Float = 0
+            if let outValue = outputs["output"] {
+                let outBytes = try outValue.tensorData() as Data
+                prob = outBytes.withUnsafeBytes { raw -> Float in
+                    guard let base = raw.bindMemory(to: Float.self).baseAddress,
+                          raw.count >= MemoryLayout<Float>.size else { return 0 }
+                    return base[0]
+                }
+            }
+
+            // Per-window DIAG every 10th call. Logs enough that a
+            // future "VAD prob stuck" report can be diagnosed without
+            // a code change.
+            if callNum <= 5 || callNum % 10 == 0 {
+                let audioPrefix = samples.prefix(3)
+                    .map { String(format: "%.4f", $0) }
+                    .joined(separator: ",")
+                NSLog("[DIAG] SileroVAD win#\(callNum) audioFirst3=\(audioPrefix) stateMag=\(String(format: "%.4f", stateMagnitude)) outputProb=\(String(format: "%.4f", prob)) inputLen=\(Self.inputSamples)")
+            }
+
+            return prob
         } catch {
             NSLog("[DIAG] SileroVAD probability throw: \(error.localizedDescription)")
             return 0
