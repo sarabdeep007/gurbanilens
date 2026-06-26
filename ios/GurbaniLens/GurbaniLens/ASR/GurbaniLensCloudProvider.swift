@@ -191,12 +191,23 @@ public actor GurbaniLensCloudProvider: ASRProvider {
     // MARK: - Internals
 
     private func recordActivity(peak: Float, rms: Float, vadActive: Bool) {
-        // Brief #7 (2026-06-25): RMS replaces peak as bufferEnergy
-        // (smoother waveform animation); vadActive (Silero) replaces
-        // the peak > 0.02 heuristic for isSpeaking — drives the
-        // VoiceSearchSession `.listening` → `.recording` transition.
+        // Brief #7.1 (2026-06-26): yield an energy-only Partial on
+        // every audio-tap so the UI's waveform + state machine see
+        // bufferEnergy / isSpeaking updates between transcript
+        // responses. Without this the UI freezes on
+        // `.listening(bufferEnergy: 0)` forever because the only
+        // Partials this provider yields are full transcript responses
+        // — and those never arrive while VAD gates the whole stream.
+        // Mirrors SarvamProvider.recordActivity.
         lastEnergy = rms
         lastIsSpeaking = vadActive
+        partialsContinuation?.yield(Partial(
+            text: "",
+            latin: "",
+            gurmukhi: "",
+            isSpeaking: vadActive,
+            bufferEnergy: rms
+        ))
     }
 
     private func appendChunk(_ chunk: Data) async {

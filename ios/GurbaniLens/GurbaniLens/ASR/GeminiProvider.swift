@@ -177,10 +177,19 @@ public actor GeminiProvider: ASRProvider {
     // MARK: - Internals
 
     private func recordActivity(peak: Float, rms: Float, vadActive: Bool) {
-        // Brief #7 (2026-06-25): RMS replaces peak as bufferEnergy
-        // (waveform); vadActive (Silero) replaces peak heuristic.
+        // Brief #7.1 (2026-06-26): yield energy-only Partials per
+        // audio tap so the UI gets bufferEnergy / isSpeaking updates
+        // between transcript responses (which arrive at chunk
+        // cadence, not per-tap). Mirrors SarvamProvider pattern.
         lastEnergy = rms
         lastIsSpeaking = vadActive
+        partialsContinuation?.yield(Partial(
+            text: "",
+            latin: "",
+            gurmukhi: "",
+            isSpeaking: vadActive,
+            bufferEnergy: rms
+        ))
     }
 
     private func appendChunk(_ chunk: Data) async {

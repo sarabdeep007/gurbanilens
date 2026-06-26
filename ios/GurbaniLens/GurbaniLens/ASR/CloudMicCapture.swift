@@ -91,8 +91,11 @@ public final class CloudMicCapture {
     // MARK: - Silero VAD integration (Brief #7, 2026-06-25)
 
     /// Speech probability threshold above which Silero considers the
-    /// frame "voiced". 0.5 is the snakers4/silero-vad README default.
-    public static let vadThreshold: Float = 0.5
+    /// frame "voiced". snakers4/silero-vad README default is 0.5;
+    /// Brief #7.1 (2026-06-26) lowers to 0.3 for diagnosis after Deep's
+    /// iPhone test showed VAD never triggering. Tune back up once we
+    /// know the probability distribution from the on-device test.
+    public static let vadThreshold: Float = 0.3
     /// Trailing-silence window after which we auto-finish the stream.
     public static let silenceTrailMs: Double = 1500
     /// Minimum cumulative speech duration before silence-trail auto-stop
@@ -330,15 +333,38 @@ public final class CloudMicCapture {
         let frames = Int(buf.frameLength)
         if frames == 0 { return }
 
-        // Downmix to mono + per-tap peak.
+        // Brief #7.1 (2026-06-26): peek at raw chanData[0] BEFORE
+        // downmix on the first 3 taps. Deep's iPhone test showed
+        // bufferEnergy=0.0 throughout — we need to know whether the
+        // mic itself is delivering zero samples or something
+        // downstream is zeroing them.
+        if tapNum <= 3 {
+            let raw0 = chanData[0]
+            let n = min(5, frames)
+            var rawSamples: [String] = []
+            for i in 0..<n {
+                rawSamples.append(String(format: "%.5f", raw0[i]))
+            }
+            NSLog("[DIAG] CloudMicCapture tap #\(tapNum) RAW chanData[0] nch=\(nch) frames=\(frames) first5=\(rawSamples.joined(separator: ","))")
+        }
+
+        // Downmix to mono + per-tap peak + per-tap NATIVE-RATE RMS.
+        // Native-rate RMS is the most reliable signal source: it
+        // doesn't depend on the AVAudioConverter producing valid
+        // output, which is one of the suspects in the bufferEnergy=0
+        // bug. We pass this RMS to the onActivity callback so the
+        // waveform stays connected to actual mic input even if the
+        // resampler is broken.
         var monoChunk = [Float](repeating: 0, count: frames)
         var peak: Float = 0
+        var sumSqNative: Float = 0
         if nch == 1 {
             let chan = chanData[0]
             for i in 0..<frames {
                 let v = chan[i]
                 monoChunk[i] = v
                 let a = abs(v); if a > peak { peak = a }
+                sumSqNative += v * v
             }
         } else {
             let inv = 1.0 / Float(nch)
@@ -349,11 +375,17 @@ public final class CloudMicCapture {
             for i in 0..<frames {
                 monoChunk[i] *= inv
                 let a = abs(monoChunk[i]); if a > peak { peak = a }
+                sumSqNative += monoChunk[i] * monoChunk[i]
             }
         }
-        // Peak alone is reported below alongside RMS + vadActive via
-        // `onActivity`. The legacy single-arg `onPeak` callback is
-        // gone (Brief #7); all providers were updated.
+        let rmsNative = frames > 0 ? (sumSqNative / Float(frames)).squareRoot() : 0
+
+        if tapNum <= 3 {
+            let n = min(5, frames)
+            var monoSamples: [String] = []
+            for i in 0..<n { monoSamples.append(String(format: "%.5f", monoChunk[i])) }
+            NSLog("[DIAG] CloudMicCapture tap #\(tapNum) MONO peak=\(String(format: "%.5f", peak)) rmsNative=\(String(format: "%.5f", rmsNative)) first5=\(monoSamples.joined(separator: ","))")
+        }
 
         // Wrap the mono float chunk in a PCMBuffer for AVAudioConverter.
         guard let monoNative = AVAudioFormat(
@@ -419,20 +451,33 @@ public final class CloudMicCapture {
         guard let chan = outBuf.floatChannelData?[0] else { return }
 
         // --- VAD + RMS over the converted 16 kHz mono Float32 frame ---
-        // RMS for waveform amplitude. Computed on the resampled Float32
-        // samples so it's independent of the device's native sample
-        // rate.
+        // Compute the resampled-stage RMS too (diagnostic only — the
+        // callback uses rmsNative which is more reliable). If the
+        // converter is producing zeros, rmsResampled will be 0 even
+        // when rmsNative is healthy — that's our smoking gun.
         var sumSq: Float = 0
+        var peakResampled: Float = 0
         for i in 0..<outFrames {
-            sumSq += chan[i] * chan[i]
+            let v = chan[i]
+            sumSq += v * v
+            let a = abs(v); if a > peakResampled { peakResampled = a }
         }
-        let rms = outFrames > 0 ? (sumSq / Float(outFrames)).squareRoot() : 0
+        let rmsResampled = outFrames > 0 ? (sumSq / Float(outFrames)).squareRoot() : 0
+
+        if tapNum <= 3 {
+            let n = min(5, outFrames)
+            var resampledSamples: [String] = []
+            for i in 0..<n { resampledSamples.append(String(format: "%.5f", chan[i])) }
+            NSLog("[DIAG] CloudMicCapture tap #\(tapNum) RESAMPLED outFrames=\(outFrames) peak=\(String(format: "%.5f", peakResampled)) rmsResampled=\(String(format: "%.5f", rmsResampled)) first5=\(resampledSamples.joined(separator: ","))")
+        }
 
         // Silero VAD over 512-sample windows. Accumulate output
         // samples; each complete window goes through Silero. The
         // chunk-level vadActive is "did ANY window in this chunk
         // detect speech".
         var chunkVADActive = false
+        var chunkMaxProb: Float = 0
+        var chunkWindowCount: Int = 0
         if let silero = silero {
             for i in 0..<outFrames {
                 vadWindowBuffer.append(chan[i])
@@ -441,9 +486,17 @@ public final class CloudMicCapture {
                 let window = Array(vadWindowBuffer.prefix(SileroVAD.windowSamples))
                 vadWindowBuffer.removeFirst(SileroVAD.windowSamples)
                 let prob = silero.probability(samples: window)
+                chunkWindowCount += 1
+                if prob > chunkMaxProb { chunkMaxProb = prob }
                 if prob >= Self.vadThreshold {
                     chunkVADActive = true
                 }
+            }
+            // Log probabilities for the first 5 taps (high info), plus
+            // a sparse stream after that so production sessions still
+            // get sample data.
+            if tapNum <= 5 || tapNum % 50 == 0 {
+                NSLog("[DIAG] CloudMicCapture tap #\(tapNum) VAD windowsThisTap=\(chunkWindowCount) maxProb=\(String(format: "%.3f", chunkMaxProb)) threshold=\(String(format: "%.2f", Self.vadThreshold)) vadActive=\(chunkVADActive)")
             }
         } else {
             // Fallback path when VAD didn't load — use legacy peak
@@ -451,9 +504,11 @@ public final class CloudMicCapture {
             chunkVADActive = peak > 0.02
         }
 
-        // Report peak + rms + vadActive on the activity callback. UI
-        // / providers update Partial.isSpeaking from vadActive.
-        onActivity?(peak, rms, chunkVADActive)
+        // Report peak + RMS (NATIVE-rate; more reliable than the
+        // post-resample one) + vadActive on the activity callback.
+        // Providers map vadActive onto Partial.isSpeaking and pass
+        // rmsNative as Partial.bufferEnergy for the waveform.
+        onActivity?(peak, rmsNative, chunkVADActive)
 
         // --- Build s16le bytes for the consumer (existing) ---
         var bytes = Data(count: outFrames * 2)
