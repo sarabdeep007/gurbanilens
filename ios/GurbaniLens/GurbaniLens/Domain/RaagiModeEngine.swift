@@ -95,16 +95,41 @@ public final class RaagiModeEngine: ObservableObject {
 
     // MARK: - Tunables
 
-    /// Acceptance floor for tier 1 / tier 2 / tier 3 matches.
-    /// Brief #8.5 (2026-06-27): lowered 70 → 60 after Deep's #8.4
-    /// trace showed several genuinely-correct Tier 1 hits stranded
-    /// at topEff=69.7 (one point shy of 70) because the multiplicative
-    /// `eff = partialRatio × coverage` scoring drags an 87.5/0.80
-    /// case below threshold. Threshold 60 catches that band without
-    /// substantially loosening the false-positive boundary — the
-    /// 1.8× runner-up confidence gate (Brief #8.5 commit 2) handles
-    /// even lower-scoring confident matches.
-    private static let matchConfidenceThreshold: Double = 60.0
+    /// **Tier 1 / Tier 2 acceptance floor.** Brief #8.5 (2026-06-27):
+    /// lowered 70 → 60 after correct Tier 1 hits stranded at
+    /// topEff=69.7 one point shy of 70. The multiplicative
+    /// `eff = partialRatio × coverage` scoring drags 87.5/0.80
+    /// cases below threshold; 60 catches that band. The 1.8×
+    /// runner-up confidence gate handles even lower-score
+    /// dominant matches.
+    ///
+    /// Tier 1/2 scope is a small candidate pool (~4-20 lines for
+    /// currentShabad, ~80-300 for cached) so a 60-threshold here
+    /// has high precision — false positives would require a
+    /// random wrong-shabad line to score 60+ against the query,
+    /// which essentially doesn't happen at small scope.
+    private static let tier12ConfidenceThreshold: Double = 60.0
+    /// **Tier 3 acceptance floor.** Brief #8.6 (2026-06-27): split
+    /// from the unified tier12 threshold and lowered to 45 after
+    /// Deep's #8.5 trace logged three real shabad changes silently
+    /// dropped because Tier 3 hit at 52.9–59.1 — below the
+    /// (then-unified) 60 threshold — and the engine fell through
+    /// to "no confident match", leaving the previous shabad on
+    /// screen across several utterances until eventually one
+    /// pangti scored 60+ and the display jumped.
+    ///
+    /// Tier 3 searches the WHOLE 56K-line SGGS. Legitimate top
+    /// matches against noisy ASR transcripts routinely land in
+    /// the 50-65 band — that's the regime the matcher was
+    /// designed for. Threshold 45 accepts those at the cost of
+    /// some weaker false-positive risk; the alternative ("show
+    /// nothing, keep stale display") is worse.
+    ///
+    /// The 1.8× confidence gate is NOT applied at Tier 3 — at
+    /// full-corpus scope, a 40-with-1.8×-gap match is too easy
+    /// to hit by accident on random partially-overlapping
+    /// pangtis.
+    private static let tier3ConfidenceThreshold: Double = 45.0
     private static let jaikaraBannerSeconds: Double = 3.0
     /// Cap on concurrent in-flight /transcribe requests. Brief #8.2:
     /// 3 is chosen so a fast singer cutting one pangti every ~600 ms
@@ -121,13 +146,13 @@ public final class RaagiModeEngine: ObservableObject {
     /// flicking the display to whichever pangti loosely matches.
     private static let shortTranscriptCharThreshold: Int = 6
     /// Confidence floor for Tier 1 hits on short transcripts. Set
-    /// higher than the normal `matchConfidenceThreshold` (60, lowered
-    /// from 70 in Brief #8.5) so a 60-84 same-shabad hit on a 3-
-    /// char transcript is rejected as too speculative. Brief #8.5
-    /// constraint: short-transcript guard untouched.
+    /// higher than `tier12ConfidenceThreshold` (60) so a 60-84
+    /// same-shabad hit on a 3-char transcript is rejected as too
+    /// speculative. Brief #8.5/#8.6 constraint: short-transcript
+    /// guard untouched.
     private static let shortTranscriptTier1Threshold: Double = 85.0
     /// **Confidence acceptance floor** (Brief #8.5, 2026-06-27).
-    /// Below `matchConfidenceThreshold` (60) but at or above this
+    /// Below `tier12ConfidenceThreshold` (60) but at or above this
     /// value, a Tier 1 / Tier 2 hit can still be accepted IF the
     /// top match is at least ``confidenceRatioThreshold`` times the
     /// runner-up's score. Deep's #8.4 trace showed correct matches
@@ -135,6 +160,8 @@ public final class RaagiModeEngine: ObservableObject {
     /// absolute score is low but the candidate clearly stands out
     /// from the rest of the scope, so the matcher is confident.
     /// Floor is 40 (below this, even a strong gap is too noisy).
+    /// Brief #8.6 keeps the confidence gate exclusive to Tier 1/2;
+    /// Tier 3 just lowered its absolute threshold to 45 instead.
     private static let confidenceAcceptanceFloor: Double = 40.0
     /// **Confidence ratio threshold** (Brief #8.5). The
     /// top-vs-runner-up gap required for a sub-threshold match to be
@@ -527,7 +554,7 @@ public final class RaagiModeEngine: ObservableObject {
     /// for `tier` and short-circuit the cascade, logging the
     /// outcome. The decision tree:
     ///
-    ///   - `topScore >= matchConfidenceThreshold (60)` → ACCEPT
+    ///   - `topScore >= tier12ConfidenceThreshold (60)` → ACCEPT
     ///     (normal path; no extra DIAG line — the existing
     ///     `display update tier=N` log carries the story).
     ///   - `topScore >= confidenceAcceptanceFloor (40)` AND
@@ -541,11 +568,11 @@ public final class RaagiModeEngine: ObservableObject {
     ///   - Below the floor → REJECT silently; the caller's
     ///     existing "no confident match" path covers this.
     ///
-    /// Tier 3 retains the simple `>= matchConfidenceThreshold`
+    /// Tier 3 retains the simple `>= tier3ConfidenceThreshold (45)`
     /// check — its candidate pool is the whole corpus, so a 40-
     /// score-with-1.8×-gap match isn't trustworthy at that scope.
     /// The short-transcript guard path inside Tier 1 is untouched
-    /// per Brief #8.5 constraint.
+    /// per Brief #8.5/#8.6 constraint.
     private func shouldAcceptTierMatch(
         matches: [Match],
         tier: Int,
@@ -555,13 +582,13 @@ public final class RaagiModeEngine: ObservableObject {
         let runnerUp = matches.count > 1 ? matches[1].score : 0
         let ratio = runnerUp > 0 ? top.score / runnerUp : .infinity
 
-        if top.score >= Self.matchConfidenceThreshold {
+        if top.score >= Self.tier12ConfidenceThreshold {
             return true
         }
         if top.score >= Self.confidenceAcceptanceFloor {
             let ratioStr = ratio == .infinity ? "∞" : String(format: "%.2f", ratio)
             if ratio >= Self.confidenceRatioThreshold {
-                NSLog("[DIAG] RaagiModeEngine tier=\(tier) accepting confident match topEff=\(String(format: "%.1f", top.score)) runnerUpEff=\(String(format: "%.1f", runnerUp)) ratio=\(ratioStr) (below threshold \(Self.matchConfidenceThreshold) but confident) utterance #\(seqNum)")
+                NSLog("[DIAG] RaagiModeEngine tier=\(tier) accepting confident match topEff=\(String(format: "%.1f", top.score)) runnerUpEff=\(String(format: "%.1f", runnerUp)) ratio=\(ratioStr) (below threshold \(Self.tier12ConfidenceThreshold) but confident) utterance #\(seqNum)")
                 return true
             }
             NSLog("[DIAG] RaagiModeEngine tier=\(tier) rejecting low confidence topEff=\(String(format: "%.1f", top.score)) runnerUpEff=\(String(format: "%.1f", runnerUp)) ratio=\(ratioStr) utterance #\(seqNum)")
@@ -700,10 +727,10 @@ public final class RaagiModeEngine: ObservableObject {
             return nil
         }
 
-        if let top = tier3Matches.first, top.score >= Self.matchConfidenceThreshold {
+        if let top = tier3Matches.first, top.score >= Self.tier3ConfidenceThreshold {
             return (top, 3)
         }
-        NSLog("[DIAG] RaagiModeEngine utterance #\(seqNum) no confident match across all tiers (tier3Top=\(String(format: "%.1f", tier3Top)) threshold=\(Self.matchConfidenceThreshold))")
+        NSLog("[DIAG] RaagiModeEngine utterance #\(seqNum) no confident match across all tiers (tier3Top=\(String(format: "%.1f", tier3Top)) threshold=\(Self.tier3ConfidenceThreshold))")
         return nil
     }
 
