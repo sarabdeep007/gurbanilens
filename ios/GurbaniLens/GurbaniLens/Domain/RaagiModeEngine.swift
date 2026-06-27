@@ -102,6 +102,20 @@ public final class RaagiModeEngine: ObservableObject {
     /// (rare but possible) still queues smoothly; we never want the
     /// server to see a thundering herd.
     private static let maxInflightTranscriptions: Int = 3
+    /// Below this many transcript chars (grapheme clusters), only a
+    /// Tier 1 hit at ``shortTranscriptTier1Threshold`` or above is
+    /// accepted — anything else is dropped. Brief #8.3 short-
+    /// transcript guard. Example: "ਰਹਾਉ" alone is ~3 chars and
+    /// shouldn't shift display unless it's a same-shabad highlight
+    /// landing high-confidence. Prevents one-syllable noise (mic
+    /// false-positive, distant cough, brief alaap fragment) from
+    /// flicking the display to whichever pangti loosely matches.
+    private static let shortTranscriptCharThreshold: Int = 6
+    /// Confidence floor for Tier 1 hits on short transcripts. Set
+    /// higher than the normal `matchConfidenceThreshold` (70) so a
+    /// 70-84 same-shabad hit on a 3-char transcript is rejected as
+    /// too speculative.
+    private static let shortTranscriptTier1Threshold: Double = 85.0
 
     // MARK: - Continuous-capture state (Brief #8.2)
 
@@ -127,6 +141,13 @@ public final class RaagiModeEngine: ObservableObject {
     /// sings 4+ utterances within a typical server response window
     /// (~500-800 ms). In practice this stays empty.
     private var pendingUtterances: [(Int, Data)] = []
+    /// Shabad IDs the engine has successfully fetched + cached this
+    /// session. Tracked here (rather than queried from ``ShabadCache``)
+    /// so the Tier 2 candidate set can be built synchronously on the
+    /// main actor without crossing an actor boundary. Brief #8.3.
+    /// Stays in sync with `cache` because every fetch path inserts
+    /// here on success; the cache only grows during a session.
+    private var cachedShabadIds: Set<String> = []
 
     // MARK: - ASR endpoint (mirrors GurbaniLensCloudProvider's init)
 
@@ -182,6 +203,7 @@ public final class RaagiModeEngine: ObservableObject {
         currentDisplaySeq = 0
         inflightCount = 0
         pendingUtterances.removeAll(keepingCapacity: true)
+        cachedShabadIds.removeAll(keepingCapacity: true)
         // Sticky display stays as-is if the user re-entered Raagi
         // Mode without an explicit stop. The normal Home→mic flow
         // goes through start AFTER stop, where stop() cleared it.
@@ -237,6 +259,7 @@ public final class RaagiModeEngine: ObservableObject {
         currentDisplaySeq = 0
         inflightCount = 0
         pendingUtterances.removeAll(keepingCapacity: true)
+        cachedShabadIds.removeAll(keepingCapacity: true)
     }
 
     // MARK: - Activity → audioState (called per-tap, ~85 ms cadence)
@@ -378,43 +401,38 @@ public final class RaagiModeEngine: ObservableObject {
             return
         }
 
-        let matcherRef = matcher
-        let q = queryLatin
-        let matches = await Task.detached(priority: .userInitiated) {
-            matcherRef.match(q, topN: 5)
-        }.value
-
-        guard let top = matches.first, top.score >= Self.matchConfidenceThreshold else {
-            let topScore = matches.first.map { String(format: "%.1f", $0.score) } ?? "n/a"
-            NSLog("[DIAG] RaagiModeEngine utterance #\(seqNum) no confident match topScore=\(topScore) threshold=\(Self.matchConfidenceThreshold)")
-            return
-        }
-
-        // Stale check #2 (post-matcher): matcher took time on the
-        // detached thread; a newer utterance may have completed
-        // and updated display in the interim.
-        if seqNum < currentDisplaySeq {
-            NSLog("[DIAG] RaagiModeEngine match returned utterance #\(seqNum) seqNum=\(seqNum) currentDisplaySeq=\(currentDisplaySeq) result=stale (post-matcher)")
+        // Three-tier scoped match cascade (Brief #8.3).
+        guard let (top, tier) = await runScopedCascade(
+            queryLatin: queryLatin,
+            transcript: transcript,
+            seqNum: seqNum
+        ) else {
+            // Cascade already logged the rejection reason (no confident
+            // match, short-transcript guard reject, or stale).
             return
         }
 
         let matchedShabadId = top.line.shabadId
         let matchedLineId = top.line.id
-        NSLog("[DIAG] RaagiModeEngine match utterance #\(seqNum) topScore=\(String(format: "%.1f", top.score)) shabadId=\(matchedShabadId) lineId=\(matchedLineId) ang=\(top.line.ang)")
+        NSLog("[DIAG] RaagiModeEngine match utterance #\(seqNum) tier=\(tier) topScore=\(String(format: "%.1f", top.score)) shabadId=\(matchedShabadId) lineId=\(matchedLineId) ang=\(top.line.ang)")
 
         let fetched: FullShabad
         do {
             fetched = try await cache.shabad(forId: matchedShabadId)
+            // Track for Tier 2 on subsequent utterances. Insert
+            // unconditionally — the cache de-dupes by id internally,
+            // we de-dupe by Set semantics.
+            cachedShabadIds.insert(matchedShabadId)
         } catch {
             NSLog("[DIAG] RaagiModeEngine utterance #\(seqNum) shabad fetch failed: \(error.localizedDescription) — keeping sticky display")
             return
         }
 
-        // Stale check #3 (post-fetch): cache miss may have hit the
-        // corpus + parsed lines on a background queue. One more
-        // gate before mutating display.
+        // Stale check (post-fetch): cache miss may have hit the corpus +
+        // parsed lines on a background queue. One more gate before
+        // mutating display.
         if seqNum < currentDisplaySeq {
-            NSLog("[DIAG] RaagiModeEngine match returned utterance #\(seqNum) seqNum=\(seqNum) currentDisplaySeq=\(currentDisplaySeq) result=stale (post-fetch)")
+            NSLog("[DIAG] RaagiModeEngine match result tier=\(tier) topScore=\(String(format: "%.1f", top.score)) shabadId=\(matchedShabadId) lineId=\(matchedLineId) — dropped (stale post-fetch) seqNum=\(seqNum) currentDisplaySeq=\(currentDisplaySeq)")
             return
         }
 
@@ -424,18 +442,145 @@ public final class RaagiModeEngine: ObservableObject {
         if currentShabad?.id == matchedShabadId {
             let oldLine = currentLineId ?? "nil"
             currentLineId = matchedLineId
-            NSLog("[DIAG] RaagiModeEngine display update: same-shabad highlight from=\(oldLine) to=\(matchedLineId) seqNum=\(seqNum)")
+            NSLog("[DIAG] RaagiModeEngine display update: same-shabad highlight from=\(oldLine) to=\(matchedLineId) seqNum=\(seqNum) tier=\(tier)")
         } else if let prev = currentShabad {
             currentShabad = fetched
             currentLineId = matchedLineId
-            NSLog("[DIAG] RaagiModeEngine display update: shabad swap from=\(prev.id) to=\(matchedShabadId) lineId=\(matchedLineId) seqNum=\(seqNum)")
+            NSLog("[DIAG] RaagiModeEngine display update: shabad swap from=\(prev.id) to=\(matchedShabadId) lineId=\(matchedLineId) seqNum=\(seqNum) tier=\(tier)")
         } else {
             currentShabad = fetched
             currentLineId = matchedLineId
-            NSLog("[DIAG] RaagiModeEngine display update: first shabad shabadId=\(matchedShabadId) lineId=\(matchedLineId) seqNum=\(seqNum)")
+            NSLog("[DIAG] RaagiModeEngine display update: first shabad shabadId=\(matchedShabadId) lineId=\(matchedLineId) seqNum=\(seqNum) tier=\(tier)")
         }
         currentDisplaySeq = seqNum
+        NSLog("[DIAG] RaagiModeEngine match result tier=\(tier) topScore=\(String(format: "%.1f", top.score)) shabadId=\(matchedShabadId) lineId=\(matchedLineId) — used seqNum=\(seqNum)")
         NSLog("[DIAG] RaagiModeEngine.currentShabad sticky shabadId=\(matchedShabadId) lineId=\(matchedLineId) currentDisplaySeq=\(seqNum)")
+    }
+
+    /// **Three-tier scoped match cascade** (Brief #8.3). Tries
+    /// progressively wider candidate sets until a confident match
+    /// lands or all tiers are exhausted.
+    ///
+    ///   - **Tier 1**: lines in `currentShabad` only (~20 lines, ~5 ms).
+    ///     The hot path — most utterances during a shabad are
+    ///     same-shabad pangti movements.
+    ///   - **Tier 2**: lines in cached shabads minus current
+    ///     (~80–300 lines, ~10–50 ms). Catches shabad switches
+    ///     back to one we've already followed in this session.
+    ///   - **Tier 3**: full SGGS (~56 K lines, ~17 s on iPhone).
+    ///     The cold path — only a true brand-new shabad reaches
+    ///     here. Runs `Task.detached` so main is free during the
+    ///     long match; stale check guards the result.
+    ///
+    /// Tiers 1 and 2 run synchronously on main — they're fast
+    /// enough that blocking is invisible and avoids the overhead +
+    /// stale-window of a `Task.detached`. Tier 3 is async because
+    /// it's the only one whose latency exceeds the inter-utterance
+    /// gap.
+    ///
+    /// Short-transcript guard: transcripts under
+    /// ``shortTranscriptCharThreshold`` chars only accept a Tier 1
+    /// hit at ``shortTranscriptTier1Threshold`` or above. Otherwise
+    /// the cascade short-circuits and returns nil.
+    ///
+    /// Returns `(top match, tier)` on success, nil on
+    /// no-confident-match / short-transcript reject / stale.
+    private func runScopedCascade(
+        queryLatin: String,
+        transcript: String,
+        seqNum: Int
+    ) async -> (Match, Int)? {
+        let isShort = transcript.count < Self.shortTranscriptCharThreshold
+
+        // ── Tier 1: currentShabad ─────────────────────────────────
+        if let currentShabadId = currentShabad?.id {
+            let tier1ShabadIds: Set<String> = [currentShabadId]
+            let tier1Count = matcher.shabadIndex[currentShabadId]?.count ?? 0
+            let tier1Start = Date()
+            let tier1Matches = matcher.match(
+                queryLatin,
+                restrictedToShabadIds: tier1ShabadIds,
+                topN: 5
+            )
+            let tier1Ms = Int(Date().timeIntervalSince(tier1Start) * 1000)
+            let tier1Top = tier1Matches.first?.score ?? 0
+            NSLog("[DIAG] RaagiModeEngine scopedMatch tier=1 candidates=\(tier1Count) topScore=\(String(format: "%.1f", tier1Top)) ms=\(tier1Ms)")
+
+            // Short-transcript guard: accept only Tier 1 at a high bar.
+            if isShort {
+                if let top = tier1Matches.first, top.score >= Self.shortTranscriptTier1Threshold {
+                    NSLog("[DIAG] RaagiModeEngine short-transcript guard utterance #\(seqNum) transcript.len=\(transcript.count) tier1Top=\(String(format: "%.1f", tier1Top)) result=accept")
+                    return (top, 1)
+                }
+                NSLog("[DIAG] RaagiModeEngine short-transcript guard utterance #\(seqNum) transcript.len=\(transcript.count) tier1Top=\(String(format: "%.1f", tier1Top)) result=reject")
+                return nil
+            }
+
+            if let top = tier1Matches.first, top.score >= Self.matchConfidenceThreshold {
+                return (top, 1)
+            }
+        } else if isShort {
+            // No current shabad to match against AND transcript too
+            // short to risk a Tier 2/3 attempt. Reject early.
+            NSLog("[DIAG] RaagiModeEngine short-transcript guard utterance #\(seqNum) transcript.len=\(transcript.count) tier1Top=n/a (no_current_shabad) result=reject")
+            return nil
+        }
+
+        // ── Tier 2: cached shabads (excluding current) ────────────
+        let tier2ShabadIds = currentShabad.map { cachedShabadIds.subtracting([$0.id]) }
+            ?? cachedShabadIds
+        if !tier2ShabadIds.isEmpty {
+            var tier2Count = 0
+            for sid in tier2ShabadIds {
+                tier2Count += matcher.shabadIndex[sid]?.count ?? 0
+            }
+            let tier2Start = Date()
+            let tier2Matches = matcher.match(
+                queryLatin,
+                restrictedToShabadIds: tier2ShabadIds,
+                topN: 5
+            )
+            let tier2Ms = Int(Date().timeIntervalSince(tier2Start) * 1000)
+            let tier2Top = tier2Matches.first?.score ?? 0
+            NSLog("[DIAG] RaagiModeEngine scopedMatch tier=2 candidates=\(tier2Count) topScore=\(String(format: "%.1f", tier2Top)) ms=\(tier2Ms)")
+
+            if let top = tier2Matches.first, top.score >= Self.matchConfidenceThreshold {
+                return (top, 2)
+            }
+        }
+
+        // Pre-Tier-3 stale check: Tier 1/2 already took a few ms; if
+        // a newer utterance landed and updated display while we were
+        // here, skip the expensive Tier 3 entirely.
+        if seqNum < currentDisplaySeq {
+            NSLog("[DIAG] RaagiModeEngine cascade aborted utterance #\(seqNum) seqNum=\(seqNum) currentDisplaySeq=\(currentDisplaySeq) result=stale (skipping_tier3)")
+            return nil
+        }
+
+        // ── Tier 3: full SGGS, async ──────────────────────────────
+        let tier3Count = matcher.lines.count
+        let tier3Start = Date()
+        let matcherRef = matcher
+        let q = queryLatin
+        let tier3Matches = await Task.detached(priority: .userInitiated) {
+            matcherRef.match(q, topN: 5)
+        }.value
+        let tier3Ms = Int(Date().timeIntervalSince(tier3Start) * 1000)
+        let tier3Top = tier3Matches.first?.score ?? 0
+        NSLog("[DIAG] RaagiModeEngine scopedMatch tier=3 candidates=\(tier3Count) topScore=\(String(format: "%.1f", tier3Top)) ms=\(tier3Ms)")
+
+        // Post-Tier-3 stale check: the long one. Most stale drops
+        // land here.
+        if seqNum < currentDisplaySeq {
+            NSLog("[DIAG] RaagiModeEngine match result tier=3 topScore=\(String(format: "%.1f", tier3Top)) — dropped (stale post-tier3) seqNum=\(seqNum) currentDisplaySeq=\(currentDisplaySeq)")
+            return nil
+        }
+
+        if let top = tier3Matches.first, top.score >= Self.matchConfidenceThreshold {
+            return (top, 3)
+        }
+        NSLog("[DIAG] RaagiModeEngine utterance #\(seqNum) no confident match across all tiers (tier3Top=\(String(format: "%.1f", tier3Top)) threshold=\(Self.matchConfidenceThreshold))")
+        return nil
     }
 
     // MARK: - Jaikara
