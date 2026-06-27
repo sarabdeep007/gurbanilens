@@ -40,6 +40,16 @@ public struct JaikaraDetector: Sendable {
     /// seed; longer fragments come from real pangtis and shouldn't
     /// short-circuit to a jaikara.
     public static let prefixMatchMaxLength: Int = 8
+    /// **Prefix-match minimum length** (Brief #8.6). Single- and
+    /// two-character transcripts are short-circuited to "noise":
+    /// they're statistically indistinguishable from background
+    /// breath / mic clicks / VAD false-starts. Deep's #8.5 trace
+    /// logged transcript="ਸ" (1 char) prefix-matching
+    /// "ਸਤਿ ਨਾਮੁ ਵਾਹਿਗੁਰੂ" → false jaikara banner. 3 chars is the
+    /// floor for an ASR fragment that could plausibly disambiguate
+    /// a seed prefix — "ਵਾਹਿ" (3 grapheme clusters → ਵਾ + ਹਿ) →
+    /// ਵਾਹਿਗੁਰੂ still resolves correctly.
+    public static let prefixMatchMinLength: Int = 3
 
     /// v1 seed phrases. Ordered loosely by likely frequency so the
     /// short single-word jaikaras don't shadow the multi-word ones.
@@ -61,7 +71,7 @@ public struct JaikaraDetector: Sendable {
     /// emits exactly one `[DIAG] JaikaraDetector probe …` line per
     /// call so on-device traces show every probe and its outcome.
     ///
-    /// Match semantics (Brief #8.4):
+    /// Match semantics (Brief #8.4, tightened in Brief #8.6):
     ///   1. Length gate: transcript > `maxJaikaraLength` chars
     ///      bypasses detection entirely (real pangti masquerading).
     ///   2. **Prefix path** (transcript < `prefixMatchMaxLength`):
@@ -69,6 +79,8 @@ public struct JaikaraDetector: Sendable {
     ///      Catches ASR truncations like "ਵਾਹਿ" → ਵਾਹਿਗੁਰੂ. Runs
     ///      FIRST because for fragment transcripts the substring
     ///      scan can't fire (transcript shorter than every seed).
+    ///      **Floor**: requires `count >= prefixMatchMinLength (3)`
+    ///      so 1- and 2-char noise can't trigger a banner.
     ///   3. Substring path: any seed is a case-insensitive substring
     ///      of the transcript. Multi-word seeds win over single-
     ///      word ones by seed-array order.
@@ -84,8 +96,16 @@ public struct JaikaraDetector: Sendable {
         }
 
         // Prefix path — only for short fragments. Use `.anchored` so
-        // the match is required at the seed's start.
+        // the match is required at the seed's start. Brief #8.6
+        // gate: transcripts under `prefixMatchMinLength` (3) chars
+        // can't plausibly disambiguate any seed and have a high
+        // false-positive risk (background noise, single-syllable
+        // breaths) — short-circuit them with an explicit reject log.
         if trimmed.count < Self.prefixMatchMaxLength {
+            if trimmed.count < Self.prefixMatchMinLength {
+                NSLog("[DIAG] JaikaraDetector probe transcript=\"\(trimmed)\" len=\(trimmed.count) type=prefix REJECTED (below min length \(Self.prefixMatchMinLength))")
+                return nil
+            }
             for seed in Self.seeds {
                 if seed.range(of: trimmed, options: [.caseInsensitive, .anchored]) != nil {
                     NSLog("[DIAG] JaikaraDetector probe transcript=\"\(trimmed)\" len=\(trimmed.count) type=prefix matchedSeed=\"\(seed)\" result=true")
