@@ -25,8 +25,8 @@ import GurbaniLensCore
 ///   ├────────────────────────────────────────────────────┤
 ///   │  ▁▂▄▅▆▅▄▂▁   ਸੁਣ ਰਿਹਾ ਹਾਂ                          │ status
 ///   └────────────────────────────────────────────────────┘
-struct RaagiModeScreen: View {
-    @ObservedObject var engine: RaagiModeEngine
+struct RaagiModeScreen<Engine: RaagiModeViewModel>: View {
+    @ObservedObject var engine: Engine
     let onExit: () -> Void
 
     @AppStorage("settings.raagiViewMode") private var viewModeRaw: String = "raagi"
