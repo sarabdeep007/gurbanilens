@@ -95,7 +95,16 @@ public final class RaagiModeEngine: ObservableObject {
 
     // MARK: - Tunables
 
-    private static let matchConfidenceThreshold: Double = 70.0
+    /// Acceptance floor for tier 1 / tier 2 / tier 3 matches.
+    /// Brief #8.5 (2026-06-27): lowered 70 → 60 after Deep's #8.4
+    /// trace showed several genuinely-correct Tier 1 hits stranded
+    /// at topEff=69.7 (one point shy of 70) because the multiplicative
+    /// `eff = partialRatio × coverage` scoring drags an 87.5/0.80
+    /// case below threshold. Threshold 60 catches that band without
+    /// substantially loosening the false-positive boundary — the
+    /// 1.8× runner-up confidence gate (Brief #8.5 commit 2) handles
+    /// even lower-scoring confident matches.
+    private static let matchConfidenceThreshold: Double = 60.0
     private static let jaikaraBannerSeconds: Double = 3.0
     /// Cap on concurrent in-flight /transcribe requests. Brief #8.2:
     /// 3 is chosen so a fast singer cutting one pangti every ~600 ms
@@ -112,9 +121,10 @@ public final class RaagiModeEngine: ObservableObject {
     /// flicking the display to whichever pangti loosely matches.
     private static let shortTranscriptCharThreshold: Int = 6
     /// Confidence floor for Tier 1 hits on short transcripts. Set
-    /// higher than the normal `matchConfidenceThreshold` (70) so a
-    /// 70-84 same-shabad hit on a 3-char transcript is rejected as
-    /// too speculative.
+    /// higher than the normal `matchConfidenceThreshold` (60, lowered
+    /// from 70 in Brief #8.5) so a 60-84 same-shabad hit on a 3-
+    /// char transcript is rejected as too speculative. Brief #8.5
+    /// constraint: short-transcript guard untouched.
     private static let shortTranscriptTier1Threshold: Double = 85.0
 
     // MARK: - Continuous-capture state (Brief #8.2)
