@@ -31,6 +31,16 @@ public struct JaikaraDetector: Sendable {
     /// word.
     public static let maxJaikaraLength: Int = 24
 
+    /// **Prefix-match window** (Brief #8.4). When transcript.count is
+    /// strictly below this many chars, also accept a hit if the
+    /// transcript is a *prefix* of any seed. Catches ASR truncations
+    /// like "ਵਾਹਿ" (3 chars, fragment of "ਵਾਹਿਗੁਰੂ") that the
+    /// substring scan would miss (the seed isn't contained in the
+    /// transcript). 8 chars is one shy of the shortest single-word
+    /// seed; longer fragments come from real pangtis and shouldn't
+    /// short-circuit to a jaikara.
+    public static let prefixMatchMaxLength: Int = 8
+
     /// v1 seed phrases. Ordered loosely by likely frequency so the
     /// short single-word jaikaras don't shadow the multi-word ones.
     public static let seeds: [String] = [
@@ -47,22 +57,53 @@ public struct JaikaraDetector: Sendable {
 
     public init() {}
 
-    /// Return the matching seed (display string) or nil.
+    /// Return the matching seed (display string) or nil. Always
+    /// emits exactly one `[DIAG] JaikaraDetector probe …` line per
+    /// call so on-device traces show every probe and its outcome.
+    ///
+    /// Match semantics (Brief #8.4):
+    ///   1. Length gate: transcript > `maxJaikaraLength` chars
+    ///      bypasses detection entirely (real pangti masquerading).
+    ///   2. **Prefix path** (transcript < `prefixMatchMaxLength`):
+    ///      transcript is a case-insensitive PREFIX of some seed.
+    ///      Catches ASR truncations like "ਵਾਹਿ" → ਵਾਹਿਗੁਰੂ. Runs
+    ///      FIRST because for fragment transcripts the substring
+    ///      scan can't fire (transcript shorter than every seed).
+    ///   3. Substring path: any seed is a case-insensitive substring
+    ///      of the transcript. Multi-word seeds win over single-
+    ///      word ones by seed-array order.
     public func detect(transcript: String) -> String? {
         let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty { return nil }
-        // Length gate — long utterances bypass jaikara detection so
-        // a pangti containing "ਵਾਹਿਗੁਰੂ" as a word isn't misdetected.
-        if trimmed.count > Self.maxJaikaraLength { return nil }
-        // Case-insensitive substring scan. Multi-word seeds first
-        // (already ordered in the seed array) — if both
-        // "ਵਾਹਿਗੁਰੂ ਵਾਹਿਗੁਰੂ" and "ਵਾਹਿਗੁਰੂ" would match,
-        // the longer / more specific wins.
+        if trimmed.isEmpty {
+            NSLog("[DIAG] JaikaraDetector probe transcript=\"\" result=false (empty)")
+            return nil
+        }
+        if trimmed.count > Self.maxJaikaraLength {
+            NSLog("[DIAG] JaikaraDetector probe transcript=\"\(String(trimmed.prefix(30)))…\" len=\(trimmed.count) result=false (over_max_length)")
+            return nil
+        }
+
+        // Prefix path — only for short fragments. Use `.anchored` so
+        // the match is required at the seed's start.
+        if trimmed.count < Self.prefixMatchMaxLength {
+            for seed in Self.seeds {
+                if seed.range(of: trimmed, options: [.caseInsensitive, .anchored]) != nil {
+                    NSLog("[DIAG] JaikaraDetector probe transcript=\"\(trimmed)\" len=\(trimmed.count) type=prefix matchedSeed=\"\(seed)\" result=true")
+                    return seed
+                }
+            }
+        }
+
+        // Substring scan (existing behaviour, used when the trimmed
+        // transcript is long enough to contain a seed).
         for seed in Self.seeds {
             if trimmed.range(of: seed, options: [.caseInsensitive]) != nil {
+                NSLog("[DIAG] JaikaraDetector probe transcript=\"\(trimmed)\" len=\(trimmed.count) type=substring matchedSeed=\"\(seed)\" result=true")
                 return seed
             }
         }
+
+        NSLog("[DIAG] JaikaraDetector probe transcript=\"\(trimmed)\" len=\(trimmed.count) result=false")
         return nil
     }
 }
