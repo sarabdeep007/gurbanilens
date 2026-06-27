@@ -269,20 +269,25 @@ public final class Matcher: @unchecked Sendable {
         return filtered
     }
 
-    /// **Scoped match** (Brief #8.3, 2026-06-27). Run Stage 1
-    /// (`partial_ratio` over normalised text) + Stage 2
-    /// (`token_coverage` rescoring) over the subset of ``lines``
-    /// whose `shabadId` is in `shabadIds`. The Stage 0 first-letters
-    /// prefilter is **skipped entirely** — it exists to slice 60K →
-    /// 1.5K, which is meaningless when the input is already 20–300
-    /// lines from a tiny scope.
+    /// **Scoped match** (Brief #8.3, scoring fix in #8.4, 2026-06-27).
+    /// Run Stage 1 (`partial_ratio` over normalised text, **length-
+    /// softened**) + Stage 2 (`token_coverage` rescoring) over the
+    /// subset of ``lines`` whose `shabadId` is in `shabadIds`. The
+    /// Stage 0 first-letters prefilter is skipped — it exists to
+    /// slice 60K → 1.5K, meaningless on 20–300-line scopes.
     ///
-    /// Scoring is identical to ``match(_:topN:)`` over the same
-    /// candidate set; the only difference is the input. Used by
-    /// ``RaagiModeEngine`` to constrain matching to the currently-
-    /// displayed shabad (Tier 1, ~20 lines, ~5 ms) and to the
-    /// cached-shabad set (Tier 2, ~80–300 lines, ~10–50 ms) before
-    /// falling back to the full corpus (Tier 3, ~56K lines, ~17 s).
+    /// **Stage 1 length softening** (Brief #8.4). Brief #8.3 ran a
+    /// raw `partial_ratio` here, identical to the full ``match``'s
+    /// Stage 1. That works in the full-corpus path because the Stage
+    /// 0 prefilter implicitly biases the 1500 candidates entering
+    /// Stage 1 toward length-matched lines (via its own
+    /// `pr * sqrt(lengthFactor)` softening). With ~6 BSJ candidates
+    /// in Tier 1, the prefilter is absent and a single short Rahao
+    /// (~4 chars) can trivially `partial_ratio=100` against a 60-
+    /// char query — winning Stage 1 over the actual length-matched
+    /// pangti. Adding the prefilter's softening directly into
+    /// matchScoped's Stage 1 restores parity-with-prefilter semantics
+    /// while preserving the Stage 2 `× coverage` rescoring shape.
     ///
     /// Returns an empty array if `shabadIds` is empty or no
     /// matching lines exist. Confidence cutoff is applied by the
@@ -297,9 +302,9 @@ public final class Matcher: @unchecked Sendable {
         let normalised = normalize(query)
         if normalised.isEmpty { return [] }
         let qLong = longTokens(normalised)
+        let qLen = normalised.count
 
-        // Gather candidate indices from the precomputed shabadIndex
-        // (one Set lookup per id, no full-corpus scan).
+        // Gather candidate indices from the precomputed shabadIndex.
         var candidateIndices: [Int] = []
         candidateIndices.reserveCapacity(64)
         for sid in shabadIds {
@@ -312,26 +317,48 @@ public final class Matcher: @unchecked Sendable {
             return []
         }
 
-        // Stage 1: partial_ratio over the scoped candidates.
+        // Stage 1: length-softened partial_ratio over the scoped
+        // candidates. The softened score `effective = pr * sqrt(lf)`
+        // is what selects the top-50 for Stage 2 AND becomes the
+        // `partial` input to Stage 2's `final = partial * coverage`.
+        // This means short trivial-substring matches get penalised
+        // both for ranking and for Stage 2 throughput, matching the
+        // ranking the prefilter would have given a full-corpus match.
         let stage1Start = Date()
-        var stage1: [(score: Double, index: Int)] = []
+        struct ScoredCandidate {
+            let effective: Double
+            let rawPartial: Double
+            let lengthFactor: Double
+            let index: Int
+        }
+        var stage1: [ScoredCandidate] = []
         stage1.reserveCapacity(candidateIndices.count)
         for i in candidateIndices {
-            let pr = StringMetrics.partialRatio(normalised, normalizedTexts[i])
-            stage1.append((pr, i))
+            let lineText = normalizedTexts[i]
+            if lineText.isEmpty { continue }
+            let pr = StringMetrics.partialRatio(normalised, lineText)
+            let lLen = lineText.count
+            let lf = Double(min(qLen, lLen)) / Double(max(qLen, lLen))
+            let effective = pr * sqrt(lf)
+            stage1.append(ScoredCandidate(
+                effective: effective,
+                rawPartial: pr,
+                lengthFactor: lf,
+                index: i
+            ))
         }
-        stage1.sort { $0.score > $1.score }
+        stage1.sort { $0.effective > $1.effective }
         let candidates = stage1.prefix(Self.candidatePool)
         let stage1Ms = Int(Date().timeIntervalSince(stage1Start) * 1000)
 
-        // Stage 2: rescore by partial_ratio × token_coverage.
+        // Stage 2: rescore by softened_partial × token_coverage.
         let stage2Start = Date()
-        var rescored: [(score: Double, partial: Double, coverage: Double, index: Int)] = []
+        var rescored: [(score: Double, partial: Double, coverage: Double, lengthFactor: Double, index: Int)] = []
         rescored.reserveCapacity(candidates.count)
-        for (partial, index) in candidates {
-            let cov = tokenCoverage(queryLongTokens: qLong, candidateTokens: tokens[index])
-            let final = partial * cov
-            rescored.append((final, partial, cov, index))
+        for cand in candidates {
+            let cov = tokenCoverage(queryLongTokens: qLong, candidateTokens: tokens[cand.index])
+            let final = cand.effective * cov
+            rescored.append((final, cand.effective, cov, cand.lengthFactor, cand.index))
         }
         rescored.sort { $0.score > $1.score }
         let stage2Ms = Int(Date().timeIntervalSince(stage2Start) * 1000)
@@ -339,6 +366,18 @@ public final class Matcher: @unchecked Sendable {
 
         let topScore = rescored.first.map { String(format: "%.1f", $0.score) } ?? "n/a"
         NSLog("[DIAG] Matcher.matchScoped shabadIds=\(shabadIds.count) candidates=\(candidateIndices.count) topScore=\(topScore) stage1Ms=\(stage1Ms) stage2Ms=\(stage2Ms) totalMs=\(totalMs)")
+
+        // TOP10 diagnostic (mirrors matchByFirstLetters' top-10 log).
+        // Shows partial / coverage / lengthFactor / effective / ang
+        // per candidate so on-device traces can pin a low topScore
+        // back to either the partial_ratio, the coverage, or the
+        // length penalty.
+        let top10 = Array(rescored.prefix(10))
+        let log10 = top10.enumerated().map { (idx, r) -> String in
+            let line = lines[r.index]
+            return "[\(idx + 1)] pr=\(String(format: "%.1f", r.partial)) cov=\(String(format: "%.2f", r.coverage)) lf=\(String(format: "%.2f", r.lengthFactor)) eff=\(String(format: "%.1f", r.score)) ang=\(line.ang) lineId=\(line.id)"
+        }.joined(separator: " | ")
+        NSLog("[DIAG] Matcher.matchScoped TOP10: \(log10)")
 
         return rescored.prefix(topN).map { entry in
             Match(
