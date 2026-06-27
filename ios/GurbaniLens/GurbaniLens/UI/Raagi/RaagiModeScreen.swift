@@ -1,30 +1,30 @@
 import SwiftUI
 import GurbaniLensCore
 
-/// Root container for Raagi Mode. Brief #8 Commit 6/7.
+/// Root container for Raagi Mode. Brief #8 Commit 6 → reshaped in
+/// Brief #8.1 for sticky display.
+///
+/// **Sticky display rule** (Brief #8.1). The primary content area
+/// renders based on `engine.currentShabad`:
+///   - non-nil → RaagiView or SangatView with `engine.currentLineId`
+///                highlighted (per the view-mode @AppStorage)
+///   - nil     → entry hint "ਪਾਠ ਸ਼ੁਰੂ ਕਰੋ"
+///
+/// The shabad NEVER drops between utterances. The audio pipeline
+/// state (`engine.audioState`) only drives the bottom status bar.
 ///
 /// **Composition**:
-///   - Top toolbar: X exit button (left), view-mode toggle (right)
-///   - Center: state-conditional content
-///       .idle / .listening / .recording (no shabad yet) → entry hint
-///       .processing (no shabad yet)                     → entry hint
-///       .displaying (shabad on screen)                  → RaagiView
-///                                                          or
-///                                                          SangatView
-///                                                          per view
-///                                                          toggle
-///       .error                                          → small
-///                                                          retry hint
-///   - Bottom: per-tap waveform + status caption
-///   - Overlay: JaikaraBanner (when engine.jaikaraBanner != nil)
-///
-/// **View toggle**: persisted via @AppStorage so re-entering Raagi
-/// Mode remembers the user's choice. Default "raagi".
-///
-/// **Sticky display**: once a shabad is displayed, the RaagiView /
-/// SangatView stays visible even while subsequent utterances go
-/// through .recording / .processing. The bottom waveform + status
-/// strip is what shows the live activity.
+///   ┌────────────────────────────────────────────────────┐
+///   │ X                          [Raagi]  [Sangat]       │ toolbar
+///   ├────────────────────────────────────────────────────┤
+///   │                                                    │
+///   │         (RaagiView or SangatView or hint)          │
+///   │                                                    │
+///   │  + JaikaraBanner overlay (when activeJaikara)      │
+///   │                                                    │
+///   ├────────────────────────────────────────────────────┤
+///   │  ▁▂▄▅▆▅▄▂▁   ਸੁਣ ਰਿਹਾ ਹਾਂ                          │ status
+///   └────────────────────────────────────────────────────┘
 struct RaagiModeScreen: View {
     @ObservedObject var engine: RaagiModeEngine
     let onExit: () -> Void
@@ -69,12 +69,12 @@ struct RaagiModeScreen: View {
             // jaikara is on screen.
             VStack {
                 Spacer().frame(height: 56)
-                if let jaikara = engine.jaikaraBanner {
+                if let jaikara = engine.activeJaikara {
                     JaikaraBanner(text: jaikara)
                 }
                 Spacer()
             }
-            .animation(.easeInOut(duration: 0.25), value: engine.jaikaraBanner)
+            .animation(.easeInOut(duration: 0.25), value: engine.activeJaikara)
             .allowsHitTesting(false)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -127,26 +127,44 @@ struct RaagiModeScreen: View {
         }
     }
 
-    // MARK: - Content
+    // MARK: - Content (sticky display — driven by currentShabad)
 
     @ViewBuilder
     private var content: some View {
-        switch engine.state {
-        case .idle, .listening, .recording, .processing:
-            // No shabad yet — entry hint.
-            entryHint
-        case .displaying(let shabad, let lineId):
-            // Sticky display — the view stays on through subsequent
-            // .recording / .processing transitions until a new match
-            // arrives.
-            switch viewMode {
-            case .raagi:
-                RaagiView(shabad: shabad, currentLineId: lineId)
-            case .sangat:
-                SangatView(shabad: shabad, currentLineId: lineId)
+        Group {
+            if let shabad = engine.currentShabad, let lineId = engine.currentLineId {
+                // Sticky shabad on screen. Audio cycles in the bottom
+                // bar independently — this view doesn't react to
+                // .listening / .recording / .processing transitions
+                // at all.
+                shabadView(shabad: shabad, lineId: lineId)
+                    // .id() on the shabadId means SwiftUI treats a
+                    // cross-shabad swap as "different view", which
+                    // makes the .transition(.opacity) actually fire
+                    // the cross-fade. Without the .id, SwiftUI sees
+                    // the same RaagiView/SangatView struct and just
+                    // updates props.
+                    .id("\(shabad.id)#\(viewMode.rawValue)")
+                    .transition(.opacity)
+            } else {
+                entryHint
+                    .id("entry-hint")
+                    .transition(.opacity)
             }
-        case .error(let msg):
-            errorHint(msg)
+        }
+        // .animation pulls SwiftUI into the .transition for both
+        // (nil ↔ shabad) and (shabadA ↔ shabadB) swaps. 250 ms
+        // matches the jaikara banner fade.
+        .animation(.easeInOut(duration: 0.25), value: engine.currentShabad?.id)
+    }
+
+    @ViewBuilder
+    private func shabadView(shabad: FullShabad, lineId: String) -> some View {
+        switch viewMode {
+        case .raagi:
+            RaagiView(shabad: shabad, currentLineId: lineId)
+        case .sangat:
+            SangatView(shabad: shabad, currentLineId: lineId)
         }
     }
 
@@ -169,53 +187,59 @@ struct RaagiModeScreen: View {
         .frame(maxWidth: .infinity)
     }
 
-    private func errorHint(_ msg: String) -> some View {
-        VStack(spacing: 12) {
-            Spacer()
-            Image(systemName: "exclamationmark.triangle")
-                .font(.system(size: 32))
-                .foregroundColor(Theme.warning)
-            Text("Connection hiccup — retrying…")
-                .font(.system(size: 16))
-                .foregroundColor(Theme.onSurface)
-            Text(msg)
-                .font(.system(size: 12))
-                .foregroundColor(Theme.onSurfaceVariant)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 36)
-            Spacer()
-        }
-        .frame(maxWidth: .infinity)
-    }
-
     // MARK: - Bottom status bar
 
+    /// Always visible, subtle, non-displacing. Reflects `audioState`
+    /// + bufferEnergy but does NOT control the shabad content above.
     private var bottomStatusBar: some View {
-        VStack(spacing: 6) {
+        HStack(spacing: 12) {
+            // Tiny waveform (compressed height — 36 pt vs 80 pt in
+            // LiveResultsScreen). Animates with rms input.
             WaveformView(amplitude: engine.bufferEnergy, isActive: isRecording)
-                .padding(.horizontal, 28)
-            Text(statusCaption)
-                .font(.system(size: 12))
-                .foregroundColor(Theme.onSurfaceVariant)
+                .frame(maxWidth: 140, maxHeight: 36)
+                .scaleEffect(y: 0.45, anchor: .center)
+            statusLabel
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .padding(.vertical, 10)
+        .padding(.horizontal, 18)
+        .padding(.vertical, 8)
         .frame(maxWidth: .infinity)
         .background(Theme.surface.opacity(0.4))
+        .animation(.easeInOut(duration: 0.2), value: engine.audioState)
+    }
+
+    @ViewBuilder
+    private var statusLabel: some View {
+        switch engine.audioState {
+        case .idle:
+            EmptyView()
+        case .listening:
+            Text("ਸੁਣ ਰਿਹਾ ਹਾਂ")
+                .font(.notoSerifGurmukhi(13))
+                .foregroundColor(Theme.onSurfaceVariant)
+        case .recording:
+            Text("ਰਿਕਾਰਡ")
+                .font(.notoSerifGurmukhi(13, weight: .medium))
+                .foregroundColor(Theme.primary)
+        case .processing:
+            HStack(spacing: 6) {
+                ProgressView()
+                    .controlSize(.small)
+                    .tint(Theme.onSurfaceVariant)
+                Text("ਖੋਜ ਰਿਹਾ ਹਾਂ")
+                    .font(.notoSerifGurmukhi(13))
+                    .foregroundColor(Theme.onSurfaceVariant)
+            }
+        case .error(let msg):
+            Text("ਮੁੜ ਕੋਸ਼ਿਸ਼ ਕਰ ਰਹੇ — \(String(msg.prefix(30)))")
+                .font(.system(size: 11))
+                .foregroundColor(Theme.warning)
+                .lineLimit(1)
+        }
     }
 
     private var isRecording: Bool {
-        if case .recording = engine.state { return true }
+        if case .recording = engine.audioState { return true }
         return false
-    }
-
-    private var statusCaption: String {
-        switch engine.state {
-        case .idle:                       return "Stopped"
-        case .listening:                  return "Listening…"
-        case .recording:                  return "Recording…"
-        case .processing:                 return "Searching…"
-        case .displaying:                 return "Listening for next Pangti…"
-        case .error:                      return "Retrying…"
-        }
     }
 }

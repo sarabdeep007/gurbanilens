@@ -1,67 +1,40 @@
 import Foundation
 import GurbaniLensCore
 
-/// State machine for Raagi Mode — continuous-listening UX where the
-/// app follows a Raagi performing kirtan, switches between shabads as
-/// they're recited, and highlights the active pangti.
+/// **Audio state** for the Raagi Mode engine. Brief #8.1 (2026-06-27)
+/// reshape: this used to be a single `RaagiModeState` enum that mixed
+/// "what's the mic doing" with "is a shabad on screen". That coupling
+/// caused the bug Deep saw on Brief #8's first test — between
+/// utterances the engine flipped back to `.listening`, which the UI
+/// rendered as the "ਪਾਠ ਸ਼ੁਰੂ ਕਰੋ" idle screen, blowing away the
+/// previously-displayed shabad until the next match landed.
 ///
-/// **Differences from the quick-search state machine** (VoiceSearch-
-/// Session): no `.idle` → `.recording` → `.processing` → `.done`
-/// terminal. Raagi Mode loops continuously: each utterance plays
-/// through `.listening` → `.recording` → `.processing` → `.displaying`,
-/// then returns to `.listening` for the next utterance. `.displaying`
-/// is sticky — when the next utterance is mid-pipeline we DON'T drop
-/// the shabad from screen; we keep it visible until a new match
-/// arrives (or the utterance is rejected / a jaikara fires).
-///
-/// Jaikara hits are surfaced via a separate `jaikaraBanner: String?`
-/// @Published property on the engine — they're an overlay, not a
-/// state replacement, so the underlying shabad stays on screen behind
-/// the banner.
-public enum RaagiModeState: Equatable, Sendable {
-    /// Engine constructed but not yet started, or stopped after
-    /// running. UI shows the "ਪਾਠ ਸ਼ੁਰੂ ਕਰੋ" entry prompt.
+/// **Now**: this enum only describes the audio pipeline. The displayed
+/// shabad is a SEPARATE sticky `@Published currentShabad: FullShabad?`
+/// on the engine, plus `currentLineId: String?` for the highlight. The
+/// shabad persists across audio-state cycles and only mutates on
+/// confirmed match (or session exit).
+public enum RaagiAudioState: Equatable, Sendable {
+    /// Engine constructed / stopped. Bottom status bar is empty.
     case idle
-
-    /// Mic is on, VAD has NOT detected speech yet. UI shows the
-    /// waveform in idle (gray-blue) plus the listening hint.
+    /// Mic on, VAD waiting for speech.
     case listening
-
-    /// VAD detected speech — capturing audio for the current
-    /// utterance. UI animates the waveform in vivid colour.
+    /// VAD detected speech — capturing.
     case recording
-
-    /// Audio capture stopped (VAD silence trail or stream close).
-    /// /transcribe + matcher pipeline in flight. `text` is the
-    /// Gurmukhi transcript (when it arrives).
-    case processing(text: String)
-
-    /// Showing a shabad with the matched pangti highlighted. `lineId`
-    /// is the SGGS Line.id of the currently-highlighted pangti.
-    /// Subsequent matches that resolve to the SAME shabadId update
-    /// `lineId` (highlight moves, auto-scroll fires); matches to a
-    /// DIFFERENT shabadId replace `shabad` entirely (cache hit /
-    /// miss handled by ShabadCache).
-    case displaying(shabad: FullShabad, lineId: String)
-
-    /// Pipeline error — engine logs + auto-retries after a short
-    /// backoff. UI may show a small "..." indicator.
+    /// Audio capture stopped (silence trail / explicit stop) and
+    /// the /transcribe + matcher pipeline is in flight.
+    case processing
+    /// Pipeline error — engine logs + auto-retries on next loop
+    /// iteration. Bottom status bar surfaces a brief hint.
     case error(String)
 
-    public static func == (lhs: RaagiModeState, rhs: RaagiModeState) -> Bool {
-        switch (lhs, rhs) {
-        case (.idle, .idle), (.listening, .listening), (.recording, .recording):
-            return true
-        case (.processing(let a), .processing(let b)):
-            return a == b
-        case (.displaying(let sa, let la), .displaying(let sb, let lb)):
-            // Compare shabad by id only (lines never change for same
-            // shabadId); compare current line by id.
-            return sa.id == sb.id && la == lb
-        case (.error(let a), .error(let b)):
-            return a == b
-        default:
-            return false
+    public var displayLabel: String {
+        switch self {
+        case .idle:       return ""
+        case .listening:  return "ਸੁਣ ਰਿਹਾ ਹਾਂ"
+        case .recording:  return "ਰਿਕਾਰਡ"
+        case .processing: return "ਖੋਜ ਰਿਹਾ ਹਾਂ"
+        case .error:      return "ਮੁੜ ਕੋਸ਼ਿਸ਼…"
         }
     }
 }
