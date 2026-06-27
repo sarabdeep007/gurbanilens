@@ -60,6 +60,13 @@ public final class Matcher: @unchecked Sendable {
     /// by ``matchByFirstLetters(_:topN:)`` to make v2 live-matching robust
     /// to Whisper's voiced/unvoiced confusion (b↔p, g↔k, d↔t, j↔c).
     let phoneticFirstLetters: [String]
+    /// Map from shabadId to the indices into ``lines`` that belong to
+    /// that shabad. Built once at init. Powers
+    /// ``match(_:restrictedToShabadIds:topN:)`` for O(1) shabad-scoped
+    /// subset access — used by Raagi Mode's three-tier match cascade
+    /// (Brief #8.3) to constrain matching to currentShabad / cached
+    /// shabads before falling back to the full corpus.
+    public let shabadIndex: [String: [Int]]
 
     public init(corpus: Corpus) throws {
         var ls: [Line] = []
@@ -103,7 +110,8 @@ public final class Matcher: @unchecked Sendable {
         self.tokens = ts
         self.firstLetters = fl
         self.phoneticFirstLetters = pfl
-        NSLog("[DIAG] Matcher.init indexed=\(ls.count) skippedSirlekh=\(skippedSirlekh) skippedNoTranslit=\(skippedNoTranslit)")
+        self.shabadIndex = Self.buildShabadIndex(lines: ls)
+        NSLog("[DIAG] Matcher.init indexed=\(ls.count) shabads=\(shabadIndex.count) skippedSirlekh=\(skippedSirlekh) skippedNoTranslit=\(skippedNoTranslit)")
     }
 
     /// Convenience init for tests / future use that bypasses Corpus.
@@ -117,6 +125,16 @@ public final class Matcher: @unchecked Sendable {
         let fl = filtered.map { Self.firstLettersOf(tokens: $0.tokens) }
         self.firstLetters = fl
         self.phoneticFirstLetters = fl.map { PhoneticEquivalence.canonicalize($0) }
+        self.shabadIndex = Self.buildShabadIndex(lines: self.lines)
+    }
+
+    private static func buildShabadIndex(lines: [Line]) -> [String: [Int]] {
+        var idx: [String: [Int]] = [:]
+        idx.reserveCapacity(8_000)
+        for (i, line) in lines.enumerated() {
+            idx[line.shabadId, default: []].append(i)
+        }
+        return idx
     }
 
     /// Case-insensitive Sirlekh check — corpus may emit "Sirlekh",
@@ -249,6 +267,87 @@ public final class Matcher: @unchecked Sendable {
         let filtered = allMatches.filter { $0.score >= cutoff }
         NSLog("[DIAG] Matcher.matchByFirstLetters confidence filter — cutoffRatio=\(String(format: "%.2f", confidenceCutoff)) cutoff=\(String(format: "%.1f", cutoff)) kept=\(filtered.count)/\(allMatches.count)")
         return filtered
+    }
+
+    /// **Scoped match** (Brief #8.3, 2026-06-27). Run Stage 1
+    /// (`partial_ratio` over normalised text) + Stage 2
+    /// (`token_coverage` rescoring) over the subset of ``lines``
+    /// whose `shabadId` is in `shabadIds`. The Stage 0 first-letters
+    /// prefilter is **skipped entirely** — it exists to slice 60K →
+    /// 1.5K, which is meaningless when the input is already 20–300
+    /// lines from a tiny scope.
+    ///
+    /// Scoring is identical to ``match(_:topN:)`` over the same
+    /// candidate set; the only difference is the input. Used by
+    /// ``RaagiModeEngine`` to constrain matching to the currently-
+    /// displayed shabad (Tier 1, ~20 lines, ~5 ms) and to the
+    /// cached-shabad set (Tier 2, ~80–300 lines, ~10–50 ms) before
+    /// falling back to the full corpus (Tier 3, ~56K lines, ~17 s).
+    ///
+    /// Returns an empty array if `shabadIds` is empty or no
+    /// matching lines exist. Confidence cutoff is applied by the
+    /// caller (Raagi uses the same 70 threshold as ``match``).
+    public func match(
+        _ query: String,
+        restrictedToShabadIds shabadIds: Set<String>,
+        topN: Int = 5
+    ) -> [Match] {
+        let totalStart = Date()
+        if shabadIds.isEmpty { return [] }
+        let normalised = normalize(query)
+        if normalised.isEmpty { return [] }
+        let qLong = longTokens(normalised)
+
+        // Gather candidate indices from the precomputed shabadIndex
+        // (one Set lookup per id, no full-corpus scan).
+        var candidateIndices: [Int] = []
+        candidateIndices.reserveCapacity(64)
+        for sid in shabadIds {
+            if let indices = shabadIndex[sid] {
+                candidateIndices.append(contentsOf: indices)
+            }
+        }
+        if candidateIndices.isEmpty {
+            NSLog("[DIAG] Matcher.matchScoped shabadIds=\(shabadIds.count) no_candidates")
+            return []
+        }
+
+        // Stage 1: partial_ratio over the scoped candidates.
+        let stage1Start = Date()
+        var stage1: [(score: Double, index: Int)] = []
+        stage1.reserveCapacity(candidateIndices.count)
+        for i in candidateIndices {
+            let pr = StringMetrics.partialRatio(normalised, normalizedTexts[i])
+            stage1.append((pr, i))
+        }
+        stage1.sort { $0.score > $1.score }
+        let candidates = stage1.prefix(Self.candidatePool)
+        let stage1Ms = Int(Date().timeIntervalSince(stage1Start) * 1000)
+
+        // Stage 2: rescore by partial_ratio × token_coverage.
+        let stage2Start = Date()
+        var rescored: [(score: Double, partial: Double, coverage: Double, index: Int)] = []
+        rescored.reserveCapacity(candidates.count)
+        for (partial, index) in candidates {
+            let cov = tokenCoverage(queryLongTokens: qLong, candidateTokens: tokens[index])
+            let final = partial * cov
+            rescored.append((final, partial, cov, index))
+        }
+        rescored.sort { $0.score > $1.score }
+        let stage2Ms = Int(Date().timeIntervalSince(stage2Start) * 1000)
+        let totalMs = Int(Date().timeIntervalSince(totalStart) * 1000)
+
+        let topScore = rescored.first.map { String(format: "%.1f", $0.score) } ?? "n/a"
+        NSLog("[DIAG] Matcher.matchScoped shabadIds=\(shabadIds.count) candidates=\(candidateIndices.count) topScore=\(topScore) stage1Ms=\(stage1Ms) stage2Ms=\(stage2Ms) totalMs=\(totalMs)")
+
+        return rescored.prefix(topN).map { entry in
+            Match(
+                line: lines[entry.index],
+                score: entry.score,
+                partialRatio: entry.partial,
+                coverage: entry.coverage
+            )
+        }
     }
 
     public func match(_ query: String, topN: Int = 5) -> [Match] {
