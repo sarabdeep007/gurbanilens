@@ -42,8 +42,16 @@ public final class Matcher: @unchecked Sendable {
 
     // Pre-filter knobs — chosen to preserve port-parity while bringing
     // iPhone-ARM match time from ~213 s to ~2-5 s on a 60K-line corpus.
-    /// Maximum candidates handed to Stage 1 after the first-letters filter.
-    public static let prefilterPoolCap: Int = 1500
+    /// Maximum candidates handed to Stage 1 after the first-letters
+    /// filter. Brief #8.5 (2026-06-27): lowered 1500 → 600 to cut
+    /// Tier 3 from 5-13 s to ~2-5 s after Deep's #8.4 trace logged
+    /// 5-13-second Tier 3 dispatches dominating session latency. The
+    /// 1500 cap was chosen to comfortably retain port-parity recall
+    /// on the 11/11 test_vectors.json battery; 600 is still well
+    /// above the "honest recall" threshold for queries that meet the
+    /// 3-char `prefilterMinQueryFL`, but tune+verify against the
+    /// battery is the rollback plan if accuracy regresses.
+    public static let prefilterPoolCap: Int = 600
     /// Queries with fewer than this many chars of first-letters skip the
     /// pre-filter entirely (too short to discriminate meaningfully).
     public static let prefilterMinQueryFL: Int = 3
@@ -501,7 +509,7 @@ public final class Matcher: @unchecked Sendable {
         let stage2Ms = Int(Date().timeIntervalSince(stage2Start) * 1000)
         let totalMs = Int(Date().timeIntervalSince(totalStart) * 1000)
 
-        NSLog("[DIAG] Matcher.match totalLines=\(normalizedTexts.count) qFL=\"\(qFL)\" usedPrefilter=\(usedPrefilter) stage1Candidates=\(candidateIndices.count) prefilterMs=\(prefilterMs) stage1Ms=\(stage1Ms) stage2Ms=\(stage2Ms) totalMs=\(totalMs)")
+        NSLog("[DIAG] Matcher.match totalLines=\(normalizedTexts.count) qFL=\"\(qFL)\" usedPrefilter=\(usedPrefilter) stage1Candidates=\(candidateIndices.count) cap=\(Self.prefilterPoolCap) prefilterMs=\(prefilterMs) stage1Ms=\(stage1Ms) stage2Ms=\(stage2Ms) totalMs=\(totalMs)")
 
         return rescored.prefix(topN).map { entry in
             Match(
