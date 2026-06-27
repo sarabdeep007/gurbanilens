@@ -55,7 +55,10 @@ public final class RaagiModeEngine: ObservableObject {
     private let matcher: Matcher
     private let corpus: Corpus
     private let cache: ShabadCache
+    private let jaikaraDetector: JaikaraDetector
     private static let matchConfidenceThreshold: Double = 70.0
+    private static let jaikaraBannerSeconds: Double = 3.0
+    private var jaikaraFadeTask: Task<Void, Never>?
 
     private var loopTask: Task<Void, Never>?
     private var currentAsr: StreamingASR?
@@ -69,6 +72,7 @@ public final class RaagiModeEngine: ObservableObject {
         self.matcher = matcher
         self.corpus = corpus
         self.cache = ShabadCache(corpus: corpus)
+        self.jaikaraDetector = JaikaraDetector()
         NSLog("[DIAG] RaagiModeEngine.init")
     }
 
@@ -97,6 +101,8 @@ public final class RaagiModeEngine: ObservableObject {
         NSLog("[DIAG] RaagiModeEngine.stop")
         loopTask?.cancel()
         loopTask = nil
+        jaikaraFadeTask?.cancel()
+        jaikaraFadeTask = nil
         let asrToStop = currentAsr
         currentAsr = nil
         let cacheRef = cache
@@ -204,8 +210,18 @@ public final class RaagiModeEngine: ObservableObject {
         NSLog("[DIAG] RaagiModeEngine processUtterance head60=\"\(String(transcript.prefix(60)))\" len=\(transcript.count)")
         state = .processing(text: transcript)
 
-        // Commit 3 will plug JaikaraDetector in here, BEFORE the
-        // matcher. Skip for Commit 1.
+        // Jaikara check first — if the transcript is a kirtan-darbar
+        // jaikara (ਵਾਹਿਗੁਰੂ / ਬੋਲੇ ਸੋ ਨਿਹਾਲ / etc.), show the
+        // overlay banner for 3 s and keep the currently-displayed
+        // shabad unchanged. Don't run the matcher (jaikaras don't
+        // map to SGGS pangtis; matcher would either return junk or
+        // burn a wasted full-match round-trip).
+        if let jaikara = jaikaraDetector.detect(transcript: transcript) {
+            NSLog("[DIAG] RaagiModeEngine JAIKARA detected text=\"\(jaikara)\" — skipping matcher")
+            showJaikara(jaikara)
+            restoreStickyOrListening()
+            return
+        }
 
         let queryLatin = Latin.from(transcript)
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -258,6 +274,21 @@ public final class RaagiModeEngine: ObservableObject {
     /// the second).
     private func loadShabad(id: String) async throws -> FullShabad {
         return try await cache.shabad(forId: id)
+    }
+
+    /// Show the jaikara banner for ~3 s. Cancels any in-flight fade
+    /// so back-to-back jaikaras chain cleanly (banner stays up across
+    /// repeated calls — the timer just gets reset).
+    private func showJaikara(_ text: String) {
+        jaikaraFadeTask?.cancel()
+        jaikaraBanner = text
+        jaikaraFadeTask = Task { [weak self] in
+            let nanos = UInt64(Self.jaikaraBannerSeconds * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: nanos)
+            if Task.isCancelled { return }
+            guard let self else { return }
+            self.jaikaraBanner = nil
+        }
     }
 
     /// Helper for the "no match / empty transcript / fetch failed"
