@@ -126,6 +126,22 @@ public final class RaagiModeEngine: ObservableObject {
     /// char transcript is rejected as too speculative. Brief #8.5
     /// constraint: short-transcript guard untouched.
     private static let shortTranscriptTier1Threshold: Double = 85.0
+    /// **Confidence acceptance floor** (Brief #8.5, 2026-06-27).
+    /// Below `matchConfidenceThreshold` (60) but at or above this
+    /// value, a Tier 1 / Tier 2 hit can still be accepted IF the
+    /// top match is at least ``confidenceRatioThreshold`` times the
+    /// runner-up's score. Deep's #8.4 trace showed correct matches
+    /// at topEff=46.4 with runner-ups at 20.4 (2.27× gap) — the
+    /// absolute score is low but the candidate clearly stands out
+    /// from the rest of the scope, so the matcher is confident.
+    /// Floor is 40 (below this, even a strong gap is too noisy).
+    private static let confidenceAcceptanceFloor: Double = 40.0
+    /// **Confidence ratio threshold** (Brief #8.5). The
+    /// top-vs-runner-up gap required for a sub-threshold match to be
+    /// accepted. 1.8 = the top is at least 80 % higher than #2 —
+    /// strong dominance, signal not noise. Combined with the floor
+    /// to avoid runaway low-confidence matches.
+    private static let confidenceRatioThreshold: Double = 1.8
 
     // MARK: - Continuous-capture state (Brief #8.2)
 
@@ -506,6 +522,53 @@ public final class RaagiModeEngine: ObservableObject {
         NSLog("[DIAG] RaagiModeEngine.currentShabad sticky shabadId=\(matchedShabadId) lineId=\(matchedLineId) currentDisplaySeq=\(seqNum)")
     }
 
+    /// **Tier 1 / Tier 2 acceptance decision** (Brief #8.5).
+    /// Returns `true` if the cascade should accept the top match
+    /// for `tier` and short-circuit the cascade, logging the
+    /// outcome. The decision tree:
+    ///
+    ///   - `topScore >= matchConfidenceThreshold (60)` → ACCEPT
+    ///     (normal path; no extra DIAG line — the existing
+    ///     `display update tier=N` log carries the story).
+    ///   - `topScore >= confidenceAcceptanceFloor (40)` AND
+    ///     `topScore >= confidenceRatioThreshold (1.8) × runnerUp`
+    ///     → ACCEPT as "confident-but-low" — the top stands out
+    ///     dominantly from the rest of the candidate pool. Logs an
+    ///     explicit `accepting confident match` line.
+    ///   - `topScore >= confidenceAcceptanceFloor (40)` but the gap
+    ///     is too small → REJECT, log explicit `rejecting low
+    ///     confidence` so on-device traces show every near-miss.
+    ///   - Below the floor → REJECT silently; the caller's
+    ///     existing "no confident match" path covers this.
+    ///
+    /// Tier 3 retains the simple `>= matchConfidenceThreshold`
+    /// check — its candidate pool is the whole corpus, so a 40-
+    /// score-with-1.8×-gap match isn't trustworthy at that scope.
+    /// The short-transcript guard path inside Tier 1 is untouched
+    /// per Brief #8.5 constraint.
+    private func shouldAcceptTierMatch(
+        matches: [Match],
+        tier: Int,
+        seqNum: Int
+    ) -> Bool {
+        guard let top = matches.first else { return false }
+        let runnerUp = matches.count > 1 ? matches[1].score : 0
+        let ratio = runnerUp > 0 ? top.score / runnerUp : .infinity
+
+        if top.score >= Self.matchConfidenceThreshold {
+            return true
+        }
+        if top.score >= Self.confidenceAcceptanceFloor {
+            let ratioStr = ratio == .infinity ? "∞" : String(format: "%.2f", ratio)
+            if ratio >= Self.confidenceRatioThreshold {
+                NSLog("[DIAG] RaagiModeEngine tier=\(tier) accepting confident match topEff=\(String(format: "%.1f", top.score)) runnerUpEff=\(String(format: "%.1f", runnerUp)) ratio=\(ratioStr) (below threshold \(Self.matchConfidenceThreshold) but confident) utterance #\(seqNum)")
+                return true
+            }
+            NSLog("[DIAG] RaagiModeEngine tier=\(tier) rejecting low confidence topEff=\(String(format: "%.1f", top.score)) runnerUpEff=\(String(format: "%.1f", runnerUp)) ratio=\(ratioStr) utterance #\(seqNum)")
+        }
+        return false
+    }
+
     /// **Three-tier scoped match cascade** (Brief #8.3). Tries
     /// progressively wider candidate sets until a confident match
     /// lands or all tiers are exhausted.
@@ -565,7 +628,8 @@ public final class RaagiModeEngine: ObservableObject {
                 return nil
             }
 
-            if let top = tier1Matches.first, top.score >= Self.matchConfidenceThreshold {
+            if let top = tier1Matches.first,
+               shouldAcceptTierMatch(matches: tier1Matches, tier: 1, seqNum: seqNum) {
                 return (top, 1)
             }
         } else if isShort {
@@ -593,7 +657,8 @@ public final class RaagiModeEngine: ObservableObject {
             let tier2Top = tier2Matches.first?.score ?? 0
             NSLog("[DIAG] RaagiModeEngine scopedMatch tier=2 candidates=\(tier2Count) topScore=\(String(format: "%.1f", tier2Top)) ms=\(tier2Ms)")
 
-            if let top = tier2Matches.first, top.score >= Self.matchConfidenceThreshold {
+            if let top = tier2Matches.first,
+               shouldAcceptTierMatch(matches: tier2Matches, tier: 2, seqNum: seqNum) {
                 return (top, 2)
             }
         }
