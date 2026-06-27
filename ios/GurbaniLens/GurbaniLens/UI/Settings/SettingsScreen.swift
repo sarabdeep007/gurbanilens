@@ -115,6 +115,12 @@ struct SettingsScreen: View {
     // on-device path is the long-term default. See StreamingASR.init.
     @AppStorage("settings.disableWhisper") private var disableWhisper: Bool = false
 
+    // Brief #8 (2026-06-27): Raagi Mode opt-in. When ON, the home
+    // mic tap opens RaagiModeScreen (continuous-listening kirtan
+    // follow) instead of LiveResultsScreen (single quick search).
+    // Default OFF — quick-search is the v1 default.
+    @AppStorage("settings.raagiMode") private var raagiModeEnabled: Bool = false
+
     @State private var showResetWhisperToast: Bool = false
 
     // Local UI state for the version-tap unlock + trial-exhausted modal.
@@ -139,6 +145,21 @@ struct SettingsScreen: View {
                             silenceThresholdRaw = opt.rawValue
                         }
                     }
+                }
+
+                section("Raagi Mode") {
+                    Toggle(isOn: $raagiModeEnabled) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Continuous kirtan-follow mode")
+                                .font(.system(size: 16))
+                                .foregroundColor(Theme.onSurface)
+                            Text("When ON, the mic button opens Raagi Mode — the app listens continuously, opens the matching Shabad as the raagi sings, and follows along Pangti by Pangti. Default OFF (quick search).")
+                                .font(.system(size: 12))
+                                .foregroundColor(Theme.onSurfaceVariant)
+                        }
+                    }
+                    .tint(Theme.primary)
+                    .padding(.vertical, 4)
                 }
 
                 section("Auto-open exact matches") {

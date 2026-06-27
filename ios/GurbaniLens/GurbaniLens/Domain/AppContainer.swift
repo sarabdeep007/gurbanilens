@@ -38,6 +38,14 @@ final class AppContainer: ObservableObject {
     /// auto-open never fires. 1 s visual delay so the user sees what
     /// matched before the navigation happens.
     private var autoOpenTask: Task<Void, Never>?
+
+    /// Brief #8 (2026-06-27): the Raagi Mode engine. Lazy — only
+    /// instantiated when the user first taps Listen with the Raagi
+    /// Mode toggle on. Held across sessions so the same engine
+    /// instance can be reused if the user exits + re-enters within
+    /// the same app launch (its state machine handles the reset
+    /// internally).
+    @Published var raagiModeEngine: RaagiModeEngine?
     /// The line.id the currently-scheduled auto-open is targeting. Used
     /// to detect "same target, keep the task" vs "different target,
     /// reschedule". Without this, every fresh `.listening` partial
@@ -162,6 +170,51 @@ final class AppContainer: ObservableObject {
         session.reset(reason: "tryAgainLive")
         path = []
         startLiveRecording()
+    }
+
+    // MARK: - Raagi Mode (Brief #8)
+
+    /// Entry from HomeScreen tap when settings.raagiMode is ON.
+    /// Lazy-builds the engine + Corpus/Matcher dependencies, pushes
+    /// .raagiMode onto the nav stack, starts the continuous-listen
+    /// loop.
+    func startRaagiMode() {
+        // Don't double-push if the user is already inside Raagi Mode.
+        if path.last == .raagiMode {
+            NSLog("[DIAG] AppContainer.startRaagiMode REFUSED — already on .raagiMode")
+            return
+        }
+        do {
+            let matcher = try ensureMatcher()
+            let corpus = try ensureCorpus()
+            let engine: RaagiModeEngine
+            if let existing = raagiModeEngine {
+                engine = existing
+            } else {
+                engine = RaagiModeEngine(matcher: matcher, corpus: corpus)
+                raagiModeEngine = engine
+            }
+            engine.start()
+            path.append(.raagiMode)
+        } catch {
+            NSLog("[DIAG] AppContainer.startRaagiMode failed: \(error.localizedDescription)")
+            session.setError(error.localizedDescription)
+        }
+    }
+
+    /// Tap-X path from RaagiModeScreen. Stops the engine (which also
+    /// clears the ShabadCache), pops .raagiMode off the nav stack.
+    /// Returns the user to Home.
+    func exitRaagiMode() {
+        NSLog("[DIAG] AppContainer.exitRaagiMode")
+        raagiModeEngine?.stop()
+        // Pop everything from .raagiMode onward — defensive against
+        // any sub-routes pushed in future revisions.
+        while let last = path.last, last == .raagiMode {
+            path.removeLast()
+        }
+        // Leave the engine instance allocated; the user might re-enter
+        // in the same launch. start() resets internal state.
     }
 
     func returnHome() {

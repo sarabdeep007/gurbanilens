@@ -18,6 +18,10 @@ struct AppNavGraph: View {
     @ObservedObject var container: AppContainer
     @ObservedObject var session: VoiceSearchSession
     @AppStorage("settings.searchMode") private var searchModeRaw: String = SearchModeChoice.live.rawValue
+    /// Brief #8 (2026-06-27): Raagi Mode opt-in. When ON, the home
+    /// mic tap opens RaagiModeScreen instead of LiveResultsScreen.
+    /// Default OFF — quick-search remains the v1 default.
+    @AppStorage("settings.raagiMode") private var raagiModeEnabled: Bool = false
 
     init(container: AppContainer) {
         _container = ObservedObject(wrappedValue: container)
@@ -32,7 +36,9 @@ struct AppNavGraph: View {
         NavigationStack(path: $container.path) {
             HomeScreen(
                 onSearchTap: {
-                    if searchMode == .oneShot {
+                    if raagiModeEnabled {
+                        container.startRaagiMode()
+                    } else if searchMode == .oneShot {
                         container.startRecording()
                     } else {
                         container.startLiveRecording()
@@ -88,6 +94,21 @@ struct AppNavGraph: View {
                     )
                 case .settings:
                     SettingsScreen(onBack: { container.path.removeLast() })
+                case .raagiMode:
+                    if let engine = container.raagiModeEngine {
+                        RaagiModeScreen(
+                            engine: engine,
+                            onExit: { container.exitRaagiMode() }
+                        )
+                    } else {
+                        // Shouldn't reach this — startRaagiMode()
+                        // builds the engine before pushing the route
+                        // — but be defensive against a swipe-back-
+                        // forward race.
+                        Color.clear.onAppear {
+                            container.path.removeLast()
+                        }
+                    }
                 }
             }
             .onChange(of: session.state) { _ in
@@ -109,6 +130,7 @@ enum Route: Hashable {
     case results
     case shabad(ShabadPayload)
     case settings
+    case raagiMode        // Brief #8: continuous-listening kirtan-follow
 }
 
 struct ShabadPayload: Hashable {
