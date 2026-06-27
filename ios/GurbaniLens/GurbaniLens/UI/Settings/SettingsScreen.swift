@@ -120,6 +120,11 @@ struct SettingsScreen: View {
     // follow) instead of LiveResultsScreen (single quick search).
     // Default OFF — quick-search is the v1 default.
     @AppStorage("settings.raagiMode") private var raagiModeEnabled: Bool = false
+    /// Brief #9-iOS (2026-06-27): streaming WebSocket mode toggle.
+    /// Default OFF — only the buffered behaviour ships first; user
+    /// flips ON for the real-time experience once the server endpoint
+    /// is live.
+    @AppStorage("settings.streamingModeEnabled") private var streamingModeEnabled: Bool = false
 
     @State private var showResetWhisperToast: Bool = false
 
@@ -154,6 +159,18 @@ struct SettingsScreen: View {
                                 .font(.system(size: 16))
                                 .foregroundColor(Theme.onSurface)
                             Text("When ON, the mic button opens Raagi Mode — the app listens continuously, opens the matching Shabad as the raagi sings, and follows along Pangti by Pangti. Default OFF (quick search).")
+                                .font(.system(size: 12))
+                                .foregroundColor(Theme.onSurfaceVariant)
+                        }
+                    }
+                    .tint(Theme.primary)
+                    .padding(.vertical, 4)
+                    Toggle(isOn: $streamingModeEnabled) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Streaming mode (beta)")
+                                .font(.system(size: 16))
+                                .foregroundColor(Theme.onSurface)
+                            Text("Real-time pangti detection. Sends audio continuously to the GurbaniLens server, which streams matches back as you sing — sub-second latency. Requires a good network connection. Default OFF (buffered local matching).")
                                 .font(.system(size: 12))
                                 .foregroundColor(Theme.onSurfaceVariant)
                         }

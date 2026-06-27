@@ -95,7 +95,22 @@ struct AppNavGraph: View {
                 case .settings:
                     SettingsScreen(onBack: { container.path.removeLast() })
                 case .raagiMode:
-                    if let engine = container.raagiModeEngine {
+                    // Brief #9-iOS: pick streaming engine when toggle
+                    // is on, else fall back to buffered. Check the
+                    // toggle DIRECTLY (not which engine instance is
+                    // non-nil) so a toggle flip between sessions —
+                    // both engines may exist as cached instances —
+                    // always picks the right one. AppContainer.
+                    // startRaagiMode does the same check before
+                    // pushing this route.
+                    let streamingOn = UserDefaults.standard
+                        .bool(forKey: "settings.streamingModeEnabled")
+                    if streamingOn, let streaming = container.streamingRaagiModeEngine {
+                        RaagiModeScreen(
+                            engine: streaming,
+                            onExit: { container.exitRaagiMode() }
+                        )
+                    } else if !streamingOn, let engine = container.raagiModeEngine {
                         RaagiModeScreen(
                             engine: engine,
                             onExit: { container.exitRaagiMode() }

@@ -46,6 +46,22 @@ final class AppContainer: ObservableObject {
     /// the same app launch (its state machine handles the reset
     /// internally).
     @Published var raagiModeEngine: RaagiModeEngine?
+    /// Brief #9-iOS (2026-06-27): the streaming Raagi Mode engine.
+    /// Built only when the user has the `settings.streamingModeEnabled`
+    /// AppStorage key set ON. Mutually exclusive with
+    /// ``raagiModeEngine`` — exactly one is non-nil while the user is
+    /// inside Raagi Mode. Held across sessions for the same reuse
+    /// reason.
+    @Published var streamingRaagiModeEngine: StreamingRaagiModeEngine?
+    /// Shared singleton ``StreamingProvider`` (Brief #9-iOS). Lazy —
+    /// only built when streaming mode is enabled. Reused across Raagi
+    /// sessions; the engine calls `connect()` / `disconnect()` for
+    /// per-session WebSocket lifecycle.
+    private var streamingProvider: StreamingProvider?
+    /// UserDefaults key for the streaming-mode toggle. Read here at
+    /// `startRaagiMode` time so the user's last choice is honoured
+    /// without needing the engine to subscribe to AppStorage.
+    private static let streamingModeKey = "settings.streamingModeEnabled"
     /// The line.id the currently-scheduled auto-open is targeting. Used
     /// to detect "same target, keep the task" vs "different target,
     /// reschedule". Without this, every fresh `.listening` partial
@@ -184,17 +200,37 @@ final class AppContainer: ObservableObject {
             NSLog("[DIAG] AppContainer.startRaagiMode REFUSED — already on .raagiMode")
             return
         }
+        let streamingEnabled = UserDefaults.standard.bool(forKey: Self.streamingModeKey)
         do {
-            let matcher = try ensureMatcher()
             let corpus = try ensureCorpus()
-            let engine: RaagiModeEngine
-            if let existing = raagiModeEngine {
-                engine = existing
+            if streamingEnabled {
+                NSLog("[DIAG] AppContainer.startRaagiMode mode=streaming")
+                // Tear down the buffered engine if it was previously
+                // active — they can't share the mic.
+                raagiModeEngine?.stop()
+                let provider = ensureStreamingProvider()
+                let engine: StreamingRaagiModeEngine
+                if let existing = streamingRaagiModeEngine {
+                    engine = existing
+                } else {
+                    engine = StreamingRaagiModeEngine(corpus: corpus, provider: provider)
+                    streamingRaagiModeEngine = engine
+                }
+                engine.start()
             } else {
-                engine = RaagiModeEngine(matcher: matcher, corpus: corpus)
-                raagiModeEngine = engine
+                NSLog("[DIAG] AppContainer.startRaagiMode mode=buffered")
+                // Tear down the streaming engine if previously active.
+                streamingRaagiModeEngine?.stop()
+                let matcher = try ensureMatcher()
+                let engine: RaagiModeEngine
+                if let existing = raagiModeEngine {
+                    engine = existing
+                } else {
+                    engine = RaagiModeEngine(matcher: matcher, corpus: corpus)
+                    raagiModeEngine = engine
+                }
+                engine.start()
             }
-            engine.start()
             path.append(.raagiMode)
         } catch {
             NSLog("[DIAG] AppContainer.startRaagiMode failed: \(error.localizedDescription)")
@@ -202,18 +238,31 @@ final class AppContainer: ObservableObject {
         }
     }
 
+    /// Lazy build of the shared ``StreamingProvider``. Token + URL
+    /// come from Info.plist (`GurbaniLensASRToken`,
+    /// `GurbaniLensASRStreamURL`).
+    private func ensureStreamingProvider() -> StreamingProvider {
+        if let p = streamingProvider { return p }
+        let p = StreamingProvider()
+        streamingProvider = p
+        return p
+    }
+
     /// Tap-X path from RaagiModeScreen. Stops the engine (which also
     /// clears the ShabadCache), pops .raagiMode off the nav stack.
     /// Returns the user to Home.
     func exitRaagiMode() {
         NSLog("[DIAG] AppContainer.exitRaagiMode")
+        // Stop whichever engine is active. Both calls are no-ops if
+        // the corresponding engine is nil or already stopped.
         raagiModeEngine?.stop()
+        streamingRaagiModeEngine?.stop()
         // Pop everything from .raagiMode onward — defensive against
         // any sub-routes pushed in future revisions.
         while let last = path.last, last == .raagiMode {
             path.removeLast()
         }
-        // Leave the engine instance allocated; the user might re-enter
+        // Leave the engine instances allocated; the user might re-enter
         // in the same launch. start() resets internal state.
     }
 
