@@ -88,6 +88,29 @@ public final class CloudMicCapture {
     /// no longer exists; callers must update.
     public var onActivity: ((_ peak: Float, _ rms: Float, _ vadActive: Bool) -> Void)?
 
+    /// **Continuous-mode utterance callback** (Brief #8.2, 2026-06-27).
+    /// Fires when Silero VAD has decided one utterance is complete —
+    /// either a silence-trail (raagi finished the pangti) or a max-
+    /// recording cap (raagi sang past the 7-sec limit). The `Data` is
+    /// a snapshot of the s16le bytes for THIS utterance only; safe to
+    /// take ownership of and pass to a transcribe Task. The Int is
+    /// the per-session utterance index (1-based, monotonic).
+    ///
+    /// Unlike `start()`'s `AsyncStream<Data>`, the callback model means
+    /// **the mic stays running across utterance boundaries**. After
+    /// the snapshot is delivered, this capture instance resets the
+    /// VAD LSTM context + clears the internal buffer + sets
+    /// `hasSpeechStarted = false`, then immediately resumes listening
+    /// for the next utterance's onset. No stop/restart gap.
+    ///
+    /// The callback is invoked from the AVAudioEngine tap thread (NOT
+    /// main). Consumers MUST hop to their isolation domain themselves
+    /// — typically `Task { @MainActor in ... }` or
+    /// `Task { await actor.method(...) }`. Set this BEFORE calling
+    /// ``startContinuous()`` — there is no internal lock around the
+    /// read on the tap thread, so a later assignment races.
+    public var onUtteranceComplete: ((_ utteranceData: Data, _ utteranceNumber: Int) -> Void)?
+
     // MARK: - Silero VAD integration (Brief #7, 2026-06-25)
 
     /// Speech probability threshold above which Silero considers the
@@ -97,14 +120,25 @@ public final class CloudMicCapture {
     /// know the probability distribution from the on-device test.
     public static let vadThreshold: Float = 0.3
     /// Trailing-silence window after which we auto-finish the stream.
-    public static let silenceTrailMs: Double = 1500
+    /// Brief #8.2 (2026-06-27): 1500 → 500 ms. Deep's iPhone test
+    /// showed actual between-pangti pauses in live kirtan are 300–
+    /// 800 ms (breath catches, brief musical fills). 1500 ms never
+    /// fired during continuous recitation, so the buffer grew until
+    /// the max-recording hard cap cut a 15-sec multi-pangti blob —
+    /// which IndicConformer transcribed as one continuous string
+    /// the matcher couldn't pin to any single pangti.
+    public static let silenceTrailMs: Double = 500
     /// Minimum cumulative speech duration before silence-trail auto-stop
     /// is allowed — prevents a 100 ms VAD blip on startup from auto-
     /// stopping immediately.
     public static let minSpeechMs: Double = 250
     /// Hard cap: regardless of VAD state, finish the stream this far
-    /// in. Keeps a stuck-VAD recording from running forever.
-    public static let maxRecordingMs: Double = 15_000
+    /// in. Keeps a stuck-VAD recording from running forever. Brief
+    /// #8.2 (2026-06-27): 15 → 7 sec. A typical pangti is 3–5 sec
+    /// sung; 7 sec is a generous safety cap for the long ones. In
+    /// continuous mode the cap just ends the current utterance and
+    /// starts the next one — no audio is lost across the boundary.
+    public static let maxRecordingMs: Double = 7_000
     /// Pre-speech ring buffer size. When VAD detects speech we flush
     /// the last ~1 s of buffered audio to the consumer so ASR sees
     /// the lead-in word's onset (otherwise the first ~80 ms of the
@@ -129,6 +163,24 @@ public final class CloudMicCapture {
     private var silenceSampleCount: Int = 0
     private var totalSampleCount: Int = 0  // since speech started
     private var autoFinishFired: Bool = false
+
+    // ── Continuous mode (Brief #8.2) ──────────────────────────────
+    /// True when this capture session was started via
+    /// ``startContinuous()`` instead of ``start()``. Changes the
+    /// utterance-end behaviour in `handleTapBuffer`: instead of
+    /// finishing the chunk stream, snapshot the utterance bytes,
+    /// invoke ``onUtteranceComplete``, reset VAD, and keep recording.
+    private var continuousMode: Bool = false
+    /// Bytes accumulated for the current utterance in continuous mode.
+    /// Reset to empty at each utterance boundary. The pre-speech ring
+    /// flushes into here on speech-start; subsequent in-speech chunks
+    /// append directly. Snapshotted by-value (`Data` has value
+    /// semantics) when delivered to ``onUtteranceComplete``.
+    private var utteranceBuffer = Data()
+    /// Monotonic 1-based utterance counter for the current continuous
+    /// session. Reset on `startContinuous()`. Logged + passed to the
+    /// callback so consumers can correlate logs.
+    private var utteranceCounter: Int = 0
 
     public var isRunning: Bool {
         stateLock.lock(); defer { stateLock.unlock() }
@@ -213,8 +265,43 @@ public final class CloudMicCapture {
             self?.stop()
         }
 
-        NSLog("[DIAG] CloudMicCapture.start nativeSR=\(nativeFormat?.sampleRate ?? -1) → 16000 mono s16le")
+        NSLog("[DIAG] CloudMicCapture.start nativeSR=\(nativeFormat?.sampleRate ?? -1) → 16000 mono s16le mode=\(continuousMode ? "continuous" : "one_shot")")
         return stream
+    }
+
+    /// Begin **continuous capture** (Brief #8.2, 2026-06-27). Unlike
+    /// ``start()``, the audio bytes are not yielded to a chunk stream
+    /// — instead, the capture buffers s16le internally and invokes
+    /// ``onUtteranceComplete`` once per VAD-detected utterance
+    /// (silence-trail OR max-recording cap), then resets VAD + buffer
+    /// and **keeps recording**. No stop/restart gap between
+    /// utterances; the mic stays hot for the lifetime of the
+    /// session.
+    ///
+    /// Used by ``RaagiModeEngine`` to follow continuous kirtan
+    /// recitation. Callers MUST set ``onUtteranceComplete`` before
+    /// invoking this method (the capture starts firing on the audio
+    /// thread immediately).
+    ///
+    /// Requires Silero VAD to be loaded — without it, utterance
+    /// boundaries can't be detected and continuous mode silently
+    /// drops everything. Logs a warning + returns successfully if
+    /// VAD failed to load; consumers should set audioState to a
+    /// degraded mode in that case.
+    ///
+    /// `stop()` ends the continuous session. The same lifecycle
+    /// path as one-shot mode applies.
+    public func startContinuous() throws {
+        continuousMode = true
+        utteranceBuffer.removeAll(keepingCapacity: true)
+        utteranceCounter = 0
+        // `start()` returns an AsyncStream<Data> that won't yield in
+        // continuous mode (we route through onUtteranceComplete
+        // instead). Discard the stream — `stop()` will finish it.
+        _ = try start()
+        if silero == nil {
+            NSLog("[DIAG] CloudMicCapture.startContinuous WARNING — Silero VAD not loaded. Continuous mode requires VAD to delimit utterances; no utterances will be delivered.")
+        }
     }
 
     /// Best-effort one-shot Silero VAD load. On any failure we log
@@ -253,7 +340,19 @@ public final class CloudMicCapture {
         try? AVAudioSession.sharedInstance().setActive(
             false, options: .notifyOthersOnDeactivation
         )
-        NSLog("[DIAG] CloudMicCapture.stop")
+        // Reset continuous-mode state so the same instance can be
+        // started in one-shot mode next time. We don't clear the
+        // callback — the owner may have its own lifecycle for that.
+        let wasContinuous = continuousMode
+        let utterancesFinished = utteranceCounter
+        continuousMode = false
+        utteranceBuffer.removeAll(keepingCapacity: true)
+        utteranceCounter = 0
+        if wasContinuous {
+            NSLog("[DIAG] CloudMicCapture.stop (continuous mode; utterancesDelivered=\(utterancesFinished))")
+        } else {
+            NSLog("[DIAG] CloudMicCapture.stop")
+        }
     }
 
     // MARK: - Audio session
@@ -553,22 +652,31 @@ public final class CloudMicCapture {
                 // First speech detected → transition to speech-active
                 // and flush the pre-speech ring (which already
                 // contains this chunk's bytes from the append above)
-                // to the consumer as a single concatenated Data.
+                // either to the one-shot consumer or the continuous-
+                // mode internal buffer.
                 hasSpeechStarted = true
                 speechSampleCount = chunkSamples
                 silenceSampleCount = 0
                 totalSampleCount = chunkSamples
                 let flush = preSpeechRing
                 preSpeechRing = Data()
-                NSLog("[DIAG] CloudMicCapture VAD speech-start detected — flushing pre-speech ring bytes=\(flush.count) (includes this chunk's bytes=\(bytes.count))")
-                cont?.yield(flush)
+                NSLog("[DIAG] CloudMicCapture VAD speech-start detected — flushing pre-speech ring bytes=\(flush.count) (includes this chunk's bytes=\(bytes.count)) mode=\(continuousMode ? "continuous" : "one_shot")")
+                if continuousMode {
+                    utteranceBuffer.append(flush)
+                } else {
+                    cont?.yield(flush)
+                }
             }
             // !chunkVADActive: stay waiting; return without yielding.
             return
         }
 
-        // hasSpeechStarted == true: forward chunk to consumer.
-        cont?.yield(bytes)
+        // hasSpeechStarted == true: route the chunk.
+        if continuousMode {
+            utteranceBuffer.append(bytes)
+        } else {
+            cont?.yield(bytes)
+        }
         totalSampleCount += chunkSamples
         if chunkVADActive {
             speechSampleCount += chunkSamples
@@ -589,9 +697,45 @@ public final class CloudMicCapture {
             silenceMs >= Self.silenceTrailMs && speechMs >= Self.minSpeechMs
         let maxDurationStop = totalMs >= Self.maxRecordingMs
 
-        if !autoFinishFired && (trailingSilenceStop || maxDurationStop) {
+        guard trailingSilenceStop || maxDurationStop else { return }
+
+        let reason = trailingSilenceStop ? "silence_trail" : "max_recording"
+
+        if continuousMode {
+            // Continuous mode: snapshot current utterance, deliver to
+            // callback, reset VAD + buffers, and KEEP RECORDING. Mic
+            // stays hot — no stop/restart gap.
+            utteranceCounter += 1
+            let snapshot = utteranceBuffer
+            let snapshotSec = Double(snapshot.count) / (16_000.0 * 2.0)
+            let utteranceNum = utteranceCounter
+            NSLog("[DIAG] CloudMicCapture utterance #\(utteranceNum) snapshot bufferSec=\(String(format: "%.2f", snapshotSec)) bytes=\(snapshot.count) reason=\(reason) silenceMs=\(Int(silenceMs)) speechMs=\(Int(speechMs)) totalMs=\(Int(totalMs)) — continuing capture")
+
+            // Reset utterance state. Mic + tap stay live.
+            utteranceBuffer = Data()
+            hasSpeechStarted = false
+            speechSampleCount = 0
+            silenceSampleCount = 0
+            totalSampleCount = 0
+            autoFinishFired = false
+            preSpeechRing.removeAll(keepingCapacity: true)
+            // Reset Silero LSTM + 64-sample context so utterance #N+1
+            // starts from a clean VAD state. Without this the trailing
+            // silence of utterance #N would bias the start of
+            // utterance #N+1's probability stream.
+            silero?.reset()
+            NSLog("[DIAG] CloudMicCapture VAD reset (continuing capture, utterance #\(utteranceNum + 1) starting)")
+
+            // Fire callback from the audio thread — consumer is
+            // responsible for hopping to its isolation domain.
+            onUtteranceComplete?(snapshot, utteranceNum)
+            return
+        }
+
+        // One-shot mode: existing behaviour. Finish the chunk stream
+        // exactly once and let the provider POST the buffered audio.
+        if !autoFinishFired {
             autoFinishFired = true
-            let reason = trailingSilenceStop ? "silence_trail" : "max_recording"
             NSLog("[DIAG] CloudMicCapture VAD auto-finish (reason=\(reason) silenceMs=\(Int(silenceMs)) speechMs=\(Int(speechMs)) totalMs=\(Int(totalMs)))")
             stateLock.lock()
             let finishCont = chunkContinuation
