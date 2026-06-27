@@ -181,6 +181,18 @@ public final class CloudMicCapture {
     /// session. Reset on `startContinuous()`. Logged + passed to the
     /// callback so consumers can correlate logs.
     private var utteranceCounter: Int = 0
+    /// Retained AsyncStream for continuous mode (Brief #8.2.1, fix
+    /// for #8.2 regression). `startContinuous()` calls `start()`,
+    /// which returns the chunk AsyncStream and installs an
+    /// `onTermination` handler that calls `stop()` when the stream
+    /// deallocates. In continuous mode we don't read the stream
+    /// (utterances flow through `onUtteranceComplete` instead) — if
+    /// we discard it with `_ = try start()`, ARC deallocates it
+    /// immediately, the termination handler fires, and the mic
+    /// stops back-to-back with start. Hold the stream here so it
+    /// lives until `stop()`. Cleared in `stop()` so the same instance
+    /// can re-enter continuous mode in a later session.
+    private var continuousModeStream: AsyncStream<Data>?
 
     public var isRunning: Bool {
         stateLock.lock(); defer { stateLock.unlock() }
@@ -297,8 +309,11 @@ public final class CloudMicCapture {
         utteranceCounter = 0
         // `start()` returns an AsyncStream<Data> that won't yield in
         // continuous mode (we route through onUtteranceComplete
-        // instead). Discard the stream — `stop()` will finish it.
-        _ = try start()
+        // instead). We MUST retain the stream — its
+        // `cont.onTermination` calls `stop()` when the stream
+        // deallocates, so discarding the return value tears the
+        // session down immediately (Brief #8.2.1 fix).
+        continuousModeStream = try start()
         if silero == nil {
             NSLog("[DIAG] CloudMicCapture.startContinuous WARNING — Silero VAD not loaded. Continuous mode requires VAD to delimit utterances; no utterances will be delivered.")
         }
@@ -348,6 +363,10 @@ public final class CloudMicCapture {
         continuousMode = false
         utteranceBuffer.removeAll(keepingCapacity: true)
         utteranceCounter = 0
+        // Release the retained stream — onTermination has already
+        // fired (we just finished its continuation above) so this
+        // is just letting ARC reclaim the AsyncStream wrapper.
+        continuousModeStream = nil
         if wasContinuous {
             NSLog("[DIAG] CloudMicCapture.stop (continuous mode; utterancesDelivered=\(utterancesFinished))")
         } else {
