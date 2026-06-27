@@ -148,6 +148,14 @@ public final class RaagiModeEngine: ObservableObject {
     /// Stays in sync with `cache` because every fetch path inserts
     /// here on success; the cache only grows during a session.
     private var cachedShabadIds: Set<String> = []
+    /// In-flight Tier 3 (full-SGGS) match tasks keyed by utterance
+    /// seqNum. Brief #8.4 — when a newer utterance updates display
+    /// via Tier 1 or Tier 2, any older Tier 3 work for seq < N is
+    /// cancelled to free the iPhone CPU. The `Matcher.match` body
+    /// checks `Task.isCancelled` at stage boundaries and returns
+    /// `[]` early; the engine sees an empty match and skips display
+    /// mutation via the existing stale check.
+    private var inflightTier3Tasks: [Int: Task<[Match], Never>] = [:]
 
     // MARK: - ASR endpoint (mirrors GurbaniLensCloudProvider's init)
 
@@ -204,6 +212,9 @@ public final class RaagiModeEngine: ObservableObject {
         inflightCount = 0
         pendingUtterances.removeAll(keepingCapacity: true)
         cachedShabadIds.removeAll(keepingCapacity: true)
+        // inflightTier3Tasks should already be empty (stop() drained
+        // them on the previous session exit), but be defensive.
+        cancelAllTier3Tasks(reason: "session_start")
         // Sticky display stays as-is if the user re-entered Raagi
         // Mode without an explicit stop. The normal Home→mic flow
         // goes through start AFTER stop, where stop() cleared it.
@@ -260,6 +271,31 @@ public final class RaagiModeEngine: ObservableObject {
         inflightCount = 0
         pendingUtterances.removeAll(keepingCapacity: true)
         cachedShabadIds.removeAll(keepingCapacity: true)
+        cancelAllTier3Tasks(reason: "session_stop")
+    }
+
+    /// Cancel all Tier 3 tasks with seq strictly less than `upToSeq`.
+    /// Called after a successful display update so older Tier 3 work
+    /// stops burning CPU. Brief #8.4 Bug 2.
+    private func cancelStaleTier3Tasks(upToSeq: Int) {
+        let staleKeys = inflightTier3Tasks.keys.filter { $0 < upToSeq }
+        if staleKeys.isEmpty { return }
+        for k in staleKeys.sorted() {
+            NSLog("[DIAG] RaagiModeEngine cancelling stale tier=3 task for utterance #\(k) (newer utterance #\(upToSeq) updated display)")
+            inflightTier3Tasks[k]?.cancel()
+            inflightTier3Tasks.removeValue(forKey: k)
+        }
+    }
+
+    /// Cancel every in-flight Tier 3 task — used on session
+    /// start/stop to leave no orphans. Reason is logged once.
+    private func cancelAllTier3Tasks(reason: String) {
+        if inflightTier3Tasks.isEmpty { return }
+        NSLog("[DIAG] RaagiModeEngine cancelling all \(inflightTier3Tasks.count) tier=3 tasks reason=\(reason)")
+        for task in inflightTier3Tasks.values {
+            task.cancel()
+        }
+        inflightTier3Tasks.removeAll(keepingCapacity: true)
     }
 
     // MARK: - Activity → audioState (called per-tap, ~85 ms cadence)
@@ -453,6 +489,9 @@ public final class RaagiModeEngine: ObservableObject {
             NSLog("[DIAG] RaagiModeEngine display update: first shabad shabadId=\(matchedShabadId) lineId=\(matchedLineId) seqNum=\(seqNum) tier=\(tier)")
         }
         currentDisplaySeq = seqNum
+        // Brief #8.4 Bug 2: cancel any older Tier 3 work that's now
+        // pointless because this seqNum has advanced display.
+        cancelStaleTier3Tasks(upToSeq: seqNum)
         NSLog("[DIAG] RaagiModeEngine match result tier=\(tier) topScore=\(String(format: "%.1f", top.score)) shabadId=\(matchedShabadId) lineId=\(matchedLineId) — used seqNum=\(seqNum)")
         NSLog("[DIAG] RaagiModeEngine.currentShabad sticky shabadId=\(matchedShabadId) lineId=\(matchedLineId) currentDisplaySeq=\(seqNum)")
     }
@@ -557,17 +596,27 @@ public final class RaagiModeEngine: ObservableObject {
             return nil
         }
 
-        // ── Tier 3: full SGGS, async ──────────────────────────────
+        // ── Tier 3: full SGGS, async + cancellable ────────────────
+        // The Task is stored in inflightTier3Tasks under this
+        // utterance's seqNum so a newer utterance's display update
+        // can cancel it via cancelStaleTier3Tasks. `Matcher.match`
+        // checks Task.isCancelled at each stage boundary and returns
+        // [] early — we see an empty match below and the no-confident
+        // path fires.
         let tier3Count = matcher.lines.count
         let tier3Start = Date()
         let matcherRef = matcher
         let q = queryLatin
-        let tier3Matches = await Task.detached(priority: .userInitiated) {
+        let task = Task.detached(priority: .userInitiated) { () -> [Match] in
             matcherRef.match(q, topN: 5)
-        }.value
+        }
+        inflightTier3Tasks[seqNum] = task
+        let tier3Matches = await task.value
+        inflightTier3Tasks.removeValue(forKey: seqNum)
         let tier3Ms = Int(Date().timeIntervalSince(tier3Start) * 1000)
         let tier3Top = tier3Matches.first?.score ?? 0
-        NSLog("[DIAG] RaagiModeEngine scopedMatch tier=3 candidates=\(tier3Count) topScore=\(String(format: "%.1f", tier3Top)) ms=\(tier3Ms)")
+        let wasCancelled = tier3Matches.isEmpty && Task.isCancelled
+        NSLog("[DIAG] RaagiModeEngine scopedMatch tier=3 candidates=\(tier3Count) topScore=\(String(format: "%.1f", tier3Top)) ms=\(tier3Ms) cancelled=\(wasCancelled)")
 
         // Post-Tier-3 stale check: the long one. Most stale drops
         // land here.

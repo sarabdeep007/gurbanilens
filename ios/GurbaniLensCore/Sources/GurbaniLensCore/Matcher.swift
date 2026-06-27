@@ -402,6 +402,16 @@ public final class Matcher: @unchecked Sendable {
         // partial_ratio(qFL, lineFL). For queries with too few first-letters
         // to discriminate (<3 chars), fall back to the full corpus — the
         // original Stage 1 behaviour.
+        // Brief #8.4 Bug 2: cancellation checks at stage boundaries
+        // so RaagiModeEngine can abort an obsolete Tier 3 task whose
+        // result was already superseded by a newer utterance's Tier
+        // 1 / Tier 2 hit. Each check is one read of a thread-local;
+        // costs nothing when not cancelled.
+        if Task.isCancelled {
+            NSLog("[DIAG] Matcher.match aborted due to Task.isCancelled at stage=0_start")
+            return []
+        }
+
         let prefilterStart = Date()
         let candidateIndices: [Int]
         let usedPrefilter: Bool
@@ -418,6 +428,13 @@ public final class Matcher: @unchecked Sendable {
             var scored: [(score: Double, index: Int)] = []
             scored.reserveCapacity(firstLetters.count)
             for (i, lineFL) in firstLetters.enumerated() {
+                // Periodic cancellation check inside the 56K-line
+                // hot loop — the prefilter is the longest single
+                // stage so a fast cancel here saves the most.
+                if i % 5_000 == 0 && Task.isCancelled {
+                    NSLog("[DIAG] Matcher.match aborted due to Task.isCancelled at stage=0_prefilter line=\(i)")
+                    return []
+                }
                 if lineFL.isEmpty { continue }
                 let pr = StringMetrics.partialRatio(qFL, lineFL)
                 let lLen = lineFL.count
@@ -441,18 +458,35 @@ public final class Matcher: @unchecked Sendable {
         }
         let prefilterMs = Int(Date().timeIntervalSince(prefilterStart) * 1000)
 
+        if Task.isCancelled {
+            NSLog("[DIAG] Matcher.match aborted due to Task.isCancelled at stage=1_start")
+            return []
+        }
+
         // Stage 1: top-K candidates by full partial_ratio (over the
         // pre-filtered set, not the full 60K corpus).
         let stage1Start = Date()
         var stage1: [(score: Double, index: Int)] = []
         stage1.reserveCapacity(candidateIndices.count)
-        for i in candidateIndices {
+        for (idx, i) in candidateIndices.enumerated() {
+            // Stage 1 typically iterates 1500 candidates on iPhone —
+            // a single cancellation check every 500 keeps the worst-
+            // case post-cancel runtime under ~50 ms.
+            if idx % 500 == 0 && Task.isCancelled {
+                NSLog("[DIAG] Matcher.match aborted due to Task.isCancelled at stage=1 candidate=\(idx)/\(candidateIndices.count)")
+                return []
+            }
             let pr = StringMetrics.partialRatio(normalised, normalizedTexts[i])
             stage1.append((pr, i))
         }
         stage1.sort { $0.score > $1.score }
         let candidates = stage1.prefix(Self.candidatePool)
         let stage1Ms = Int(Date().timeIntervalSince(stage1Start) * 1000)
+
+        if Task.isCancelled {
+            NSLog("[DIAG] Matcher.match aborted due to Task.isCancelled at stage=2_start")
+            return []
+        }
 
         // Stage 2: rescore by partial_ratio × token_coverage
         let stage2Start = Date()
