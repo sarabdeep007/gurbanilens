@@ -15,15 +15,27 @@ import GurbaniLensCore
 ///   - Reply:  `{ "transcript": String, "language": "pa",
 ///                "model": "indicconformer_pa", "duration_ms": Int }`
 ///
-/// **Streaming approximation.** The server is a stateless REST
-/// endpoint, so "streaming" here is the same chunked approximation
-/// ``GeminiProvider`` uses: ``CloudMicCapture`` produces s16le frames,
-/// we accumulate ``chunkSeconds`` of audio per chunk, wrap in WAV,
-/// POST as multipart, and append the response transcript to a running
-/// concatenated transcript. The UI receives a ``Partial`` per chunk so
-/// the live view updates ~every 2 s (vs Sarvam's sub-second
-/// WebSocket VAD segments). 420 ms round-trip per chunk measured in
-/// prod gives a comfortable ~1 chunk-behind-realtime feel.
+/// **Buffered utterance mode (Brief #7.3, 2026-06-27).** This provider
+/// used to mimic Gemini's chunked-streaming pattern: every ~2 seconds
+/// of audio was POSTed as an independent /transcribe call and the
+/// fragments were concatenated client-side. That worked for
+/// generative-LM providers (Gemini / Sarvam) but produced GIBBERISH
+/// against IndicConformer because IndicConformer is a **one-shot**
+/// model — each 2-second slice was transcribed without sentence
+/// context, so it returned initial-syllable fragments like "ਸ ਤ ਮ"
+/// instead of the full Pangti. Deep's symptoms: "ਅਉਖੀ ਘੜੀ ਨ ਦੇਖਣ ਦੇਈ"
+/// → "ਸ ਸ ਸ ਸ ਅਉ ਰਿਧ ਸਮ ਸ", confidence stuck around topScore=32.
+///
+/// New flow: buffer ALL s16le bytes from `start()` until the audio
+/// stream closes (either via Silero VAD silence-trail auto-finish or
+/// an explicit `stop()`). On close, build a single WAV and POST once.
+/// One transcribe call per utterance, no fragmentation, full
+/// sentence-level context for the model. This matches IndicConformer's
+/// natural mode and aligns with Raagi Mode's one-utterance-per-Pangti
+/// pattern.
+///
+/// VAD + state-machine plumbing is unchanged from Brief #7.2; only
+/// the "what to do with the buffered audio" logic moves.
 ///
 /// **Why self-hosted.** Sarvam is fast and accurate but costs per
 /// search, and free competitors exist for the kirtan-companion use
@@ -34,8 +46,6 @@ import GurbaniLensCore
 /// **Token hygiene.** The bearer token is read once at init and
 /// stored on the actor. Never logged in full — diagnostic NSLog lines
 /// use ``redactToken(_:)`` (first 8 + last 4 chars, joined by `…`).
-/// The `.env` template ships a placeholder; the real token only
-/// reaches the device via build-time PlistBuddy injection.
 public actor GurbaniLensCloudProvider: ASRProvider {
 
     // MARK: - Errors
@@ -78,16 +88,20 @@ public actor GurbaniLensCloudProvider: ASRProvider {
     // MARK: - Config
 
     public static let defaultEndpoint = "https://asr.gurbanilens.com/transcribe"
-    public static let defaultChunkSeconds: Double = 2.0
+    /// Below this many s16le bytes (0.5 s @ 16 kHz) we don't bother
+    /// hitting the server — utterance is too short to transcribe
+    /// meaningfully. Saves a wasted round-trip + bandwidth.
+    public static let minUtteranceBytes: Int = 16_000
+    /// At this many bytes (30 s) we still send but log a warning.
+    /// The server's nginx vhost has a 10 MB upload cap and a 30 s
+    /// proxy timeout, both of which bound utterance length well
+    /// before this fires in practice.
+    public static let warnUtteranceBytes: Int = 960_000
 
     private let endpoint: String
     private let bearerToken: String
-    private let chunkSeconds: Double
 
-    // s16le bytes per chunk = sampleRate * 2 bytes * chunkSeconds
-    private var chunkSizeBytes: Int { Int(16000.0 * 2.0 * chunkSeconds) }
-
-    // MARK: - Streaming state
+    // MARK: - State
 
     private let capture: CloudMicCapture
     private let urlSession: URLSession
@@ -99,9 +113,13 @@ public actor GurbaniLensCloudProvider: ASRProvider {
     }
 
     private var captureTask: Task<Void, Never>?
-    private var inFlightTasks: [Task<Void, Never>] = []
     private var bufferAccumulator = Data()
-    private var transcriptAccumulator = ""
+    /// One-shot guard so a race between Silero's silence-trail
+    /// auto-finish (via handleCaptureEnded) and an explicit `stop()`
+    /// doesn't double-POST. The check + set happens synchronously
+    /// inside `sendUtterance()` before any await; actor isolation
+    /// means re-entry sees the flag already true.
+    private var utteranceSent: Bool = false
 
     private var lastEnergy: Float = 0
     private var lastIsSpeaking: Bool = false
@@ -110,8 +128,7 @@ public actor GurbaniLensCloudProvider: ASRProvider {
 
     public init(
         endpoint: String? = nil,
-        bearerToken: String? = nil,
-        chunkSeconds: Double? = nil
+        bearerToken: String? = nil
     ) {
         let envEndpoint = endpoint
             ?? Bundle.main.object(forInfoDictionaryKey: "GurbaniLensASRURL") as? String
@@ -121,13 +138,11 @@ public actor GurbaniLensCloudProvider: ASRProvider {
             ?? ""
         self.endpoint = envEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
         self.bearerToken = envToken.trimmingCharacters(in: .whitespacesAndNewlines)
-        self.chunkSeconds = chunkSeconds ?? Self.defaultChunkSeconds
         self.capture = CloudMicCapture()
 
-        // 30 s per-request + 60 s total resource — matches Gemini
-        // provider's tuning. The server's nginx vhost has a 30 s
-        // proxy timeout so anything slower than that is a server-side
-        // problem we want to surface promptly.
+        // 30 s per-request + 60 s total resource — matches the
+        // server's nginx vhost proxy timeout. Anything slower than
+        // that is a server-side problem we want to surface promptly.
         let cfg = URLSessionConfiguration.default
         cfg.timeoutIntervalForRequest = 30
         cfg.timeoutIntervalForResource = 60
@@ -136,7 +151,7 @@ public actor GurbaniLensCloudProvider: ASRProvider {
         if self.bearerToken.isEmpty {
             NSLog("[DIAG] GurbaniLensCloud.init no bearer token (will fail at start) — populate GURBANILENS_ASR_TOKEN in .env")
         } else {
-            NSLog("[DIAG] GurbaniLensCloud.init endpoint=\(self.endpoint) chunkSec=\(self.chunkSeconds) token=\(Self.redactToken(self.bearerToken))")
+            NSLog("[DIAG] GurbaniLensCloud.init endpoint=\(self.endpoint) token=\(Self.redactToken(self.bearerToken)) mode=buffered_utterance")
         }
     }
 
@@ -153,7 +168,7 @@ public actor GurbaniLensCloudProvider: ASRProvider {
         self.partialsStream = stream
         self.partialsContinuation = cont
         self.bufferAccumulator.removeAll(keepingCapacity: true)
-        self.transcriptAccumulator = ""
+        self.utteranceSent = false
 
         do {
             let chunkStream = try capture.start()
@@ -166,7 +181,9 @@ public actor GurbaniLensCloudProvider: ASRProvider {
                 for await chunk in chunkStream {
                     await self.appendChunk(chunk)
                 }
-                await self.flushFinalChunk()
+                // Stream closed — either Silero VAD silence-trail
+                // auto-finished it, or stop() called capture.stop().
+                // Either way, time to POST what we have.
                 await self.handleCaptureEnded()
             }
         } catch {
@@ -174,7 +191,7 @@ public actor GurbaniLensCloudProvider: ASRProvider {
             throw GLCloudError.captureFailed(underlying: error)
         }
 
-        NSLog("[DIAG] GurbaniLensCloud.start streaming begun (chunkBytes=\(chunkSizeBytes))")
+        NSLog("[DIAG] GurbaniLensCloud.start streaming begun (buffered utterance mode)")
     }
 
     public func stop() async {
@@ -182,8 +199,10 @@ public actor GurbaniLensCloudProvider: ASRProvider {
         captureTask?.cancel()
         captureTask = nil
         capture.stop()
-        for task in inFlightTasks { task.cancel() }
-        inFlightTasks.removeAll(keepingCapacity: false)
+        // Idempotent — handleCaptureEnded may have already sent (and
+        // would have, on Silero auto-finish). The flag inside
+        // sendUtterance gates this.
+        await sendUtterance(reason: "stop")
         partialsContinuation?.finish()
         partialsContinuation = nil
     }
@@ -198,7 +217,6 @@ public actor GurbaniLensCloudProvider: ASRProvider {
         // `.listening(bufferEnergy: 0)` forever because the only
         // Partials this provider yields are full transcript responses
         // — and those never arrive while VAD gates the whole stream.
-        // Mirrors SarvamProvider.recordActivity.
         lastEnergy = rms
         lastIsSpeaking = vadActive
         partialsContinuation?.yield(Partial(
@@ -210,69 +228,64 @@ public actor GurbaniLensCloudProvider: ASRProvider {
         ))
     }
 
-    private func appendChunk(_ chunk: Data) async {
+    private func appendChunk(_ chunk: Data) {
+        // Buffered-utterance mode: just append. No per-chunk dispatch.
         bufferAccumulator.append(chunk)
-        while bufferAccumulator.count >= chunkSizeBytes {
-            let pcmSlice = bufferAccumulator.prefix(chunkSizeBytes)
-            bufferAccumulator.removeFirst(chunkSizeBytes)
-            await dispatchChunkRequest(pcm: Data(pcmSlice))
-        }
     }
 
-    private func flushFinalChunk() async {
-        guard !bufferAccumulator.isEmpty else { return }
-        let tail = bufferAccumulator
-        bufferAccumulator.removeAll(keepingCapacity: false)
-        // Skip < 0.3 s tail — too short to transcribe and a wasted request.
-        if tail.count >= Int(16000.0 * 2.0 * 0.3) {
-            await dispatchChunkRequest(pcm: tail)
-        }
-    }
-
-    private func handleCaptureEnded() {
-        // Mirror GeminiProvider — let stop() finish the stream so in-
-        // flight requests can land. If stop() never comes (silence-VAD
-        // path), trip a deferred finish after a grace window.
-        Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 6_000_000_000)
-            await self?.finishStreamIfStillOpen()
-        }
-    }
-
-    private func finishStreamIfStillOpen() {
+    private func handleCaptureEnded() async {
+        await sendUtterance(reason: "capture_ended")
+        // Give the partial-stream consumer (VoiceSearchSession) a
+        // beat to ingest the final transcript Partial before we
+        // finish the stream and close the for-await loop.
         partialsContinuation?.finish()
         partialsContinuation = nil
     }
 
-    private func dispatchChunkRequest(pcm: Data) async {
-        let snapshotEnergy = lastEnergy
-        let snapshotSpeaking = lastIsSpeaking
-        let task = Task { [weak self] in
-            guard let self else { return }
-            await self.transcribeChunk(
-                pcm: pcm,
-                energy: snapshotEnergy,
-                isSpeaking: snapshotSpeaking
-            )
+    /// Build a single WAV from the accumulated s16le buffer and POST
+    /// it to /transcribe. Idempotent — the `utteranceSent` flag means
+    /// a race between auto-finish + explicit stop won't double-send.
+    private func sendUtterance(reason: String) async {
+        if utteranceSent {
+            NSLog("[DIAG] GurbaniLensCloud sendUtterance skipped (reason=\(reason), already sent)")
+            return
         }
-        inFlightTasks.append(task)
-    }
+        utteranceSent = true
 
-    private func transcribeChunk(pcm: Data, energy: Float, isSpeaking: Bool) async {
-        let chunkSec = Double(pcm.count) / (16000.0 * 2.0)
-        let start = Date()
-        let wav = WavBuilder.wavFromS16LE(pcm: pcm)
+        let bufferedBytes = bufferAccumulator.count
+        let totalSec = Double(bufferedBytes) / (16_000.0 * 2.0)
 
-        guard let url = URL(string: endpoint) else {
-            NSLog("[DIAG] GurbaniLensCloud chunk endpoint unparseable: \(endpoint)")
+        // Too-short utterance: don't waste a round-trip. Yield an
+        // empty final Partial so the consumer's snappy update
+        // doesn't keep the prior text indefinitely.
+        if bufferedBytes < Self.minUtteranceBytes {
+            NSLog("[DIAG] GurbaniLensCloud utterance.bufferedBytes=\(bufferedBytes) totalSec=\(String(format: "%.2f", totalSec)) — below minUtteranceBytes=\(Self.minUtteranceBytes), skipping POST (reason=\(reason))")
+            partialsContinuation?.yield(Self.makePartial(
+                text: "",
+                isSpeaking: false,
+                bufferEnergy: lastEnergy
+            ))
             return
         }
 
+        if bufferedBytes > Self.warnUtteranceBytes {
+            NSLog("[DIAG] GurbaniLensCloud utterance over warnUtteranceBytes (\(bufferedBytes) > \(Self.warnUtteranceBytes)) — sending anyway (reason=\(reason))")
+        }
+
+        guard let url = URL(string: endpoint) else {
+            NSLog("[DIAG] GurbaniLensCloud utterance endpoint unparseable: \(endpoint)")
+            return
+        }
+
+        let start = Date()
+        NSLog("[DIAG] GurbaniLensCloud utterance buffered \(bufferedBytes) bytes (\(String(format: "%.2f", totalSec)) sec) — sending (reason=\(reason))")
+
+        let wav = WavBuilder.wavFromS16LE(pcm: bufferAccumulator)
         let boundary = "----GurbaniLensBoundary\(UUID().uuidString)"
         let body = Self.multipartBody(
             wav: wav,
             fieldName: "audio",
-            filename: "chunk.wav",
+            filename: "utterance.wav",
             boundary: boundary
         )
 
@@ -282,6 +295,12 @@ public actor GurbaniLensCloudProvider: ASRProvider {
         req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
         req.httpBody = body
 
+        // Snapshot energy/speaking BEFORE awaiting the request so the
+        // final Partial reflects the moment the user finished, not
+        // the moment the server replied.
+        let energySnapshot = lastEnergy
+        let speakingSnapshot = lastIsSpeaking
+
         do {
             let (data, response) = try await urlSession.data(for: req)
             let elapsedMs = Int(Date().timeIntervalSince(start) * 1000)
@@ -289,41 +308,44 @@ public actor GurbaniLensCloudProvider: ASRProvider {
 
             if status != 200 {
                 let bodyHead = String(data: data, encoding: .utf8)?.prefix(200) ?? ""
-                // Distinguish the most common server-side rejection
-                // codes so DIAG logs steer the next debug step.
                 let label: String
                 switch status {
                 case 401: label = "auth_failure (check bearer token)"
-                case 413: label = "payload_too_large (chunk > 10 MB upload limit)"
+                case 413: label = "payload_too_large (utterance > 10 MB upload limit)"
                 case 429: label = "rate_limited (server allows 20 req/min)"
                 case 500...599: label = "server_error"
                 default: label = "unexpected_status"
                 }
-                NSLog("[DIAG] GurbaniLensCloud chunk HTTP \(status) [\(label)] elapsedMs=\(elapsedMs) bodyHead=\"\(bodyHead)\"")
+                NSLog("[DIAG] GurbaniLensCloud utterance HTTP \(status) [\(label)] elapsedMs=\(elapsedMs) bodyHead=\"\(bodyHead)\"")
                 return
             }
 
             guard let parsed = Self.parseResponse(data) else {
                 let head = String(data: data, encoding: .utf8)?.prefix(120) ?? ""
-                NSLog("[DIAG] GurbaniLensCloud chunk unparseable elapsedMs=\(elapsedMs) head=\"\(head)\"")
+                NSLog("[DIAG] GurbaniLensCloud utterance unparseable elapsedMs=\(elapsedMs) head=\"\(head)\"")
                 return
             }
             let text = parsed.transcript.trimmingCharacters(in: .whitespacesAndNewlines)
             let head80 = String(text.prefix(80))
-            NSLog("[DIAG] GurbaniLensCloud chunk.sec=\(String(format: "%.2f", chunkSec)) elapsedMs=\(elapsedMs) serverDurMs=\(parsed.durationMs) response.len=\(text.count) response.head80=\"\(head80)\"")
-            if text.isEmpty { return }
+            NSLog("[DIAG] GurbaniLensCloud utterance response elapsedMs=\(elapsedMs) serverDurMs=\(parsed.durationMs) bufferSec=\(String(format: "%.2f", totalSec)) transcript.len=\(text.count) transcript.head80=\"\(head80)\"")
 
-            transcriptAccumulator = Self.joinAccumulator(prev: transcriptAccumulator, next: text)
-            let partial = Self.makePartial(
-                text: transcriptAccumulator,
-                isSpeaking: isSpeaking,
-                bufferEnergy: energy
-            )
-            partialsContinuation?.yield(partial)
+            if text.isEmpty {
+                partialsContinuation?.yield(Self.makePartial(
+                    text: "",
+                    isSpeaking: false,
+                    bufferEnergy: energySnapshot
+                ))
+                return
+            }
+
+            partialsContinuation?.yield(Self.makePartial(
+                text: text,
+                isSpeaking: speakingSnapshot,
+                bufferEnergy: energySnapshot
+            ))
         } catch {
             let elapsedMs = Int(Date().timeIntervalSince(start) * 1000)
-            // Network timeouts / TLS failures / DNS errors land here.
-            NSLog("[DIAG] GurbaniLensCloud chunk threw after \(elapsedMs)ms: \(error.localizedDescription)")
+            NSLog("[DIAG] GurbaniLensCloud utterance threw after \(elapsedMs)ms: \(error.localizedDescription)")
         }
     }
 
@@ -382,15 +404,10 @@ public actor GurbaniLensCloudProvider: ASRProvider {
         return "\(head)…\(tail)"
     }
 
-    /// Same join semantics ``GeminiProvider`` uses — thin wrapper.
-    public nonisolated static func joinAccumulator(prev: String, next: String) -> String {
-        return CloudParsing.joinAccumulator(prev: prev, next: next)
-    }
-
-    /// Build a fully-populated ``Partial`` from a running accumulated
-    /// transcript. IndicConformer outputs Gurmukhi; we still route
-    /// through detectScript defensively in case a future model variant
-    /// emits Devanagari.
+    /// Build a fully-populated ``Partial`` from a transcript string.
+    /// IndicConformer outputs Gurmukhi; we still route through
+    /// detectScript defensively in case a future model variant emits
+    /// Devanagari.
     public nonisolated static func makePartial(
         text: String,
         isSpeaking: Bool,
