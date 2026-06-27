@@ -54,6 +54,7 @@ public final class RaagiModeEngine: ObservableObject {
 
     private let matcher: Matcher
     private let corpus: Corpus
+    private let cache: ShabadCache
     private static let matchConfidenceThreshold: Double = 70.0
 
     private var loopTask: Task<Void, Never>?
@@ -67,6 +68,7 @@ public final class RaagiModeEngine: ObservableObject {
     public init(matcher: Matcher, corpus: Corpus) {
         self.matcher = matcher
         self.corpus = corpus
+        self.cache = ShabadCache(corpus: corpus)
         NSLog("[DIAG] RaagiModeEngine.init")
     }
 
@@ -89,15 +91,19 @@ public final class RaagiModeEngine: ObservableObject {
         }
     }
 
-    /// Stop the loop, tear down the ASR, drop back to `.idle`. Cache
-    /// will be cleared once Commit 2's ShabadCache lands.
+    /// Stop the loop, tear down the ASR, drop back to `.idle`, clear
+    /// the shabad cache so the next session starts fresh.
     public func stop() {
         NSLog("[DIAG] RaagiModeEngine.stop")
         loopTask?.cancel()
         loopTask = nil
         let asrToStop = currentAsr
         currentAsr = nil
-        Task { await asrToStop?.stop() }
+        let cacheRef = cache
+        Task {
+            await asrToStop?.stop()
+            await cacheRef.clear()
+        }
         state = .idle
         bufferEnergy = 0
         jaikaraBanner = nil
@@ -247,15 +253,11 @@ public final class RaagiModeEngine: ObservableObject {
         state = .displaying(shabad: fetched, lineId: matchedLineId)
     }
 
-    /// Brief #8 Commit 1: direct corpus fetch. Commit 2 replaces this
-    /// with a ShabadCache hit.
+    /// Brief #8 Commit 2: routes through ShabadCache. Same shabad
+    /// requested twice in a row → instant cache hit (no DB query on
+    /// the second).
     private func loadShabad(id: String) async throws -> FullShabad {
-        let lines = try corpus.shabadLines(shabadId: id)
-        let filtered = lines.filter { line in
-            let lt = line.lineType?.lowercased() ?? ""
-            return lt == "pankti" || lt == "rahao"
-        }
-        return FullShabad(id: id, lines: filtered)
+        return try await cache.shabad(forId: id)
     }
 
     /// Helper for the "no match / empty transcript / fetch failed"
