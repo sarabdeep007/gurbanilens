@@ -2,44 +2,77 @@ import Foundation
 import SwiftUI
 import GurbaniLensCore
 
-/// **Streaming Raagi Mode engine** (Brief #9-iOS). Server-side
-/// matching alternative to the local-cascade ``RaagiModeEngine``.
+/// **Streaming Raagi Mode engine** — server-side matched, evidence-
+/// driven lock model. Brief #9-iOS (2026-06-27), reshaped in Brief
+/// #9.4-iOS (2026-06-28) into a DISCOVERING / LOCKED state machine.
 ///
-/// Drives the same ``RaagiModeViewModel`` surface that the buffered
-/// engine does — `currentShabad` / `currentLineId` / `audioState` /
-/// `bufferEnergy` / `activeJaikara` — so ``RaagiModeScreen`` renders
-/// it unchanged. The user toggles between the two engines via the
-/// `settings.streamingModeEnabled` AppStorage key.
+/// Drives the same ``RaagiModeViewModel`` surface as the buffered
+/// engine (`currentShabad` / `currentLineId` / `audioState` /
+/// `bufferEnergy` / `activeJaikara`), so ``RaagiModeScreen`` renders
+/// it unchanged. The user toggles between engines via
+/// `settings.streamingModeEnabled`.
 ///
-/// **Architecture.**
+/// ## State machine (Brief #9.4)
+///
+/// ```
+///   ┌──────────────┐    fast lock OR  ┌──────────┐
+///   │ DISCOVERING  │ ───2-match evidence──▶ │  LOCKED  │ ──┐
+///   └──────────────┘                  └──────────┘   │
+///         ▲                                  │       │
+///         │                                  │       │ swap via
+///         │   (no auto-exit; LOCKED is       ▼       │ evidence /
+///         │    sticky; stop() resets)        ┌──────────┐  bypass
+///         └──────────────────────────────────│  LOCKED  │◀─┘
+///                                            │  (new id)│
+///                                            └──────────┘
+/// ```
+///
+/// - **DISCOVERING** is the entry state. `currentShabad` is nil and
+///   the screen shows its "begin reciting" hint. Server-side matches
+///   accumulate as evidence for a single candidate at a time. The
+///   engine locks when EITHER a single match scores ≥
+///   ``discoveryFastLockScore`` (95) OR two same-shabad matches each
+///   ≥ ``discoveryEvidenceFloor`` (80) land within
+///   ``evidenceWindowSeconds`` (5 s).
+///
+/// - **LOCKED** holds the displayed shabad through brief excursions,
+///   simran/jaikara interludes, and tier-3 noise. Different-shabad
+///   matches accumulate as a *challenger* — the engine swaps ONLY
+///   when the challenger clears the evidence-and-margin gates
+///   (2 matches in window, latest ≥ 80, latest ≥ current peak − 15)
+///   OR the candidate scores ≥ ``lockedSwapBypassScore`` (95) on its
+///   own. A same-shabad match clears any in-flight challenger
+///   immediately — it proves the raagi is still on the locked shabad.
+///
+/// ## Why evidence, not hysteresis alone
+///
+/// Brief #9.2/#9.3's peak-only hysteresis (still preserved here as a
+/// secondary defense) gates each match independently against the
+/// current peak. In kirtan, raagis frequently sing 1-2 lines from a
+/// reference shabad before returning to the current one — those
+/// stray matches could clear hysteresis on their own and flicker the
+/// display. The lock model requires *sustained* evidence — two
+/// matches in the same 5-s window — which a brief 1-2-line excursion
+/// won't generate.
+///
+/// ## Architecture
+///
 /// ```
 ///   StreamingMicCapture  ── 100 ms PCM16 chunks ──▶ StreamingProvider
-///                                                        │
-///                          AsyncStream<StreamingEvent> ◀─┘
+///                          AsyncStream<StreamingEvent> ◀┘
 ///                                   │
 ///                                   ▼
-///                        StreamingRaagiModeEngine
-///                          (this class)
+///                        StreamingRaagiModeEngine (this class)
 ///                                   │
+///                                   ▼     state machine: discovery/locked
+///                                   ▼     evidence: pendingCandidate
+///                                   ▼     peak: currentShabadRecentPeakScore
 ///                                   ▼
 ///                          @Published surface
 ///                                   │
 ///                                   ▼
 ///                          RaagiModeScreen UI
 /// ```
-///
-/// **No local matching.** All match decisions happen server-side;
-/// this engine just fetches the matched shabad via ``ShabadCache``
-/// (so the UI has the lines to render) and applies sticky-display
-/// logic identical to the buffered engine's:
-///   - Same shabad → update `currentLineId` only.
-///   - Different shabad → swap.
-///   - First match → set both.
-///   - Out-of-order seqNum → drop as stale.
-///
-/// Jaikara is server-decided too — the server emits a `jaikara`
-/// event with the matched phrase; the engine flashes the same 3-s
-/// banner via ``activeJaikara``.
 @MainActor
 public final class StreamingRaagiModeEngine: ObservableObject {
 
@@ -70,45 +103,74 @@ public final class StreamingRaagiModeEngine: ObservableObject {
     /// stale. Server is the source of truth for monotonic ordering.
     private var currentDisplaySeq: Int = 0
 
-    // MARK: - Sticky hysteresis (Brief #9.2-iOS)
+    // MARK: - Lock state machine (Brief #9.4)
 
-    /// Highest recent match score for the currently-displayed shabad.
-    /// Used together with ``currentShabadRecentPeakTime`` to gate
-    /// different-shabad swaps: if the engine just saw the current
-    /// shabad winning at 85+ within the last 2.5 s, a tier-3 swap to
-    /// some unrelated shabad scoring 50-65 (a typical false-positive
-    /// from full-SGGS noise) is rejected. Reset to 0 on session
-    /// start/stop and when the display swaps to a new shabad.
+    private enum LockState {
+        /// No shabad locked. `currentShabad` is nil. Server matches
+        /// build evidence for a single candidate at a time.
+        case discovering
+        /// A shabad is locked + displayed. Cross-shabad matches
+        /// accumulate as a challenger; same-shabad matches clear it.
+        case locked
+    }
+    private var lockState: LockState = .discovering
+
+    /// Sliding-window evidence for a single candidate shabad. In
+    /// DISCOVERING this is the candidate-to-lock; in LOCKED it's the
+    /// cross-shabad challenger. Single-candidate by design — a new
+    /// shabad replaces the old one.
+    private struct PendingCandidate {
+        let shabadId: String
+        var matches: [(time: Date, score: Double)]
+    }
+    private var pendingCandidate: PendingCandidate?
+
+    // MARK: - Sticky peak (Brief #9.2/#9.3, retained as secondary defense)
+
+    /// High-water-mark for current-shabad confidence. Used by the
+    /// LOCKED challenger threshold (`latest ≥ peak − 15`) to prevent
+    /// swaps to substantially weaker shabads even when challenger
+    /// evidence accumulates. Reset to 0 in DISCOVERING.
     private var currentShabadRecentPeakScore: Double = 0
-    /// Wall-clock timestamp when ``currentShabadRecentPeakScore``
-    /// was last refreshed. nil when no recent peak. Real time (not
-    /// seq-based) because peakAge in seconds is what gates the
-    /// hysteresis window.
+    /// Wall-clock timestamp when `currentShabadRecentPeakScore` was
+    /// last refreshed. Brief #9.3 fix: refreshed on EVERY same-shabad
+    /// match so the anchor stays alive during continuous singing.
     private var currentShabadRecentPeakTime: Date? = nil
 
+    // MARK: - Tunables (Brief #9.4)
+
     private static let jaikaraBannerSeconds: Double = 3.0
-    /// How long after a high-confidence current-shabad match the
-    /// hysteresis still protects against swaps. 2.5 s = ~2 pangti
-    /// durations at typical kirtan tempo — long enough to cover the
-    /// gap between consecutive correct same-shabad matches, short
-    /// enough that a true shabad change doesn't get stuck for long.
-    private static let peakWindowSeconds: TimeInterval = 2.5
-    /// A different-shabad candidate must score this many points
-    /// below the recent peak to be rejected. With peak=95.5,
-    /// requiredMin = 90.5 — a candidate at 57 is clearly noise,
-    /// while one at 91 is plausibly a real swap (handled by the
-    /// bypass below).
-    private static let swapMarginBelow: Double = 5.0
-    /// Hysteresis only engages when the recent peak is at least
-    /// this high. Below 85 we trust the matcher: if the current
-    /// shabad isn't winning strongly, any new same-or-better swap
-    /// candidate should be accepted.
-    private static let highConfidenceFloor: Double = 85.0
-    /// Bypass the hysteresis when the candidate scores at or above
-    /// this. A 90+ tier-3 match is the server expressing strong
-    /// confidence in a new shabad; trust it and swap regardless of
-    /// current-shabad peak.
-    private static let alwaysAllowSwapAbove: Double = 90.0
+
+    /// Single-match lock in DISCOVERING when the matcher is very
+    /// confident. ≥ 95 means the server has effectively no doubt.
+    private static let discoveryFastLockScore: Double = 95.0
+    /// Floor for accumulating evidence in DISCOVERING. Matches below
+    /// this aren't tracked — too noisy to count toward a lock.
+    private static let discoveryEvidenceFloor: Double = 80.0
+    /// Number of in-window matches needed for an evidence-based lock
+    /// in DISCOVERING. (Also reused as the threshold for evidence-
+    /// based swaps in LOCKED.)
+    private static let discoveryEvidenceCount: Int = 2
+
+    /// Single-match swap from LOCKED when the candidate is very
+    /// confident (matches the discovery fast-lock bar).
+    private static let lockedSwapBypassScore: Double = 95.0
+    /// Floor for tracking a challenger in LOCKED. Matches below this
+    /// are ignored entirely — not counted, no challenger created.
+    private static let lockedChallengerScoreFloor: Double = 70.0
+    /// The challenger's LATEST match must clear this score for the
+    /// evidence path to qualify as a transition.
+    private static let lockedChallengerStrongScore: Double = 80.0
+    /// The challenger's latest score must also be within this many
+    /// points of the current shabad's recent peak — protects against
+    /// swapping to a moderately-scoring shabad when the current one
+    /// is dominating at 95+.
+    private static let lockedSwapMarginBelow: Double = 15.0
+
+    /// Sliding window for evidence accumulation, in seconds. Matches
+    /// older than this are pruned from `pendingCandidate.matches`
+    /// before any threshold check.
+    private static let evidenceWindowSeconds: TimeInterval = 5.0
 
     // MARK: - Init
 
@@ -127,17 +189,16 @@ public final class StreamingRaagiModeEngine: ObservableObject {
             NSLog("[DIAG] StreamingRaagiModeEngine.start ignored — already running")
             return
         }
-        NSLog("[DIAG] StreamingRaagiModeEngine.start")
+        NSLog("[DIAG] StreamingRaagiModeEngine.start (state=discovering)")
         setAudioState(.listening)
         bufferEnergy = 0
         activeJaikara = nil
         currentDisplaySeq = 0
         currentShabadRecentPeakScore = 0
         currentShabadRecentPeakTime = nil
+        lockState = .discovering
+        pendingCandidate = nil
         sessionId = UUID().uuidString
-        // Sticky display survives session re-entry if it wasn't
-        // explicitly stop()'ed — defensive parity with the buffered
-        // engine's flow.
 
         mic.onActivity = { [weak self] _, rms, vadActive in
             Task { @MainActor in
@@ -145,7 +206,6 @@ public final class StreamingRaagiModeEngine: ObservableObject {
             }
         }
         mic.onChunk = { [weak self] data, _ in
-            // sendAudio is thread-safe; no hop required.
             self?.provider.sendAudio(data)
         }
 
@@ -159,9 +219,6 @@ public final class StreamingRaagiModeEngine: ObservableObject {
             }
         }
 
-        // Connect + sendInit + start mic. Errors surface via
-        // audioState; the user can recover by exiting and re-entering
-        // Raagi Mode.
         connectTask = Task { [weak self] in
             guard let self else { return }
             do {
@@ -176,7 +233,7 @@ public final class StreamingRaagiModeEngine: ObservableObject {
     }
 
     public func stop() {
-        NSLog("[DIAG] StreamingRaagiModeEngine.stop currentDisplaySeq=\(currentDisplaySeq)")
+        NSLog("[DIAG] StreamingRaagiModeEngine.stop currentDisplaySeq=\(currentDisplaySeq) state=\(lockState)")
         connectTask?.cancel()
         connectTask = nil
         eventTask?.cancel()
@@ -195,6 +252,8 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         currentDisplaySeq = 0
         currentShabadRecentPeakScore = 0
         currentShabadRecentPeakTime = nil
+        lockState = .discovering
+        pendingCandidate = nil
     }
 
     // MARK: - Activity → audioState
@@ -203,8 +262,6 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         if abs(rms - bufferEnergy) > 0.0001 {
             bufferEnergy = rms
         }
-        // Don't override a sticky error — the user can read the
-        // status until they re-enter Raagi Mode.
         if case .error = audioState { return }
         if vadActive {
             setAudioState(.recording)
@@ -213,39 +270,38 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         }
     }
 
-    // MARK: - Event handling
+    // MARK: - Event routing
 
     private func handleEvent(_ event: StreamingEvent) async {
         switch event {
         case .ready(let sid):
             NSLog("[DIAG] StreamingRaagiModeEngine ready session_id=\(sid)")
-            // Clear any disconnect error from a prior reconnect cycle.
             if case .error = audioState {
                 setAudioState(.listening)
             }
 
         case .partial:
-            // v1: ignore partials. Match events are what move the UI.
-            // Future: a `.processing` audioState pulse on isFinal=true.
+            // v1: ignore partials. Match events drive the lock model.
             break
 
         case .match(let seq, let shabadId, let lineId, let score, let tier, _, _):
             await handleMatch(seq: seq, shabadId: shabadId, lineId: lineId, score: score, tier: tier)
 
         case .jaikara(_, let phrase):
+            // Jaikara is a banner overlay; doesn't disturb lock or
+            // challenger. Pass through unchanged (Brief #9.4 constraint).
             showJaikara(phrase)
 
         case .noMatch(let seq, let reason, _):
             NSLog("[DIAG] StreamingRaagiModeEngine no_match seq=\(seq) reason=\(reason)")
-            // No display change. Sticky shabad stays.
 
         case .disconnected(let reason):
             NSLog("[DIAG] StreamingRaagiModeEngine disconnected reason=\(reason)")
-            // Provider auto-reconnects (exponential backoff). Surface
-            // a transient error label; next `.ready` clears it.
             setAudioState(.error("disconnected — reconnecting…"))
         }
     }
+
+    // MARK: - Match handling (state-machine dispatch)
 
     private func handleMatch(
         seq: Int,
@@ -254,120 +310,241 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         score: Double,
         tier: Int
     ) async {
-        // Stale check #1: pre-anything.
+        // Stale check — newer match already won display.
         if seq < currentDisplaySeq {
             NSLog("[DIAG] StreamingRaagiModeEngine match seq=\(seq) currentDisplaySeq=\(currentDisplaySeq) result=stale (pre-fetch)")
             return
         }
 
-        // ── Same-shabad fast path ─────────────────────────────────
-        // Brief #9.2-iOS: same-shabad match refreshes the recent-
-        // peak score (used to gate cross-shabad swaps) and updates
-        // the highlighted lineId. No cache fetch needed — the
-        // shabad is already on screen.
-        if let currentId = currentShabad?.id, currentId == shabadId {
-            refreshCurrentShabadPeak(score: score)
-            let oldLine = currentLineId ?? "nil"
-            currentLineId = lineId
-            currentDisplaySeq = seq
-            NSLog("[DIAG] StreamingRaagiModeEngine display update: same-shabad highlight from=\(oldLine) to=\(lineId) seq=\(seq) tier=\(tier) score=\(String(format: "%.1f", score))")
-            NSLog("[DIAG] StreamingRaagiModeEngine.currentShabad sticky shabadId=\(shabadId) lineId=\(lineId) currentDisplaySeq=\(seq)")
-            return
+        switch lockState {
+        case .discovering:
+            await handleMatchInDiscovery(seq: seq, shabadId: shabadId, lineId: lineId, score: score, tier: tier)
+        case .locked:
+            if let currentId = currentShabad?.id, currentId == shabadId {
+                handleSameShabadMatchInLock(seq: seq, lineId: lineId, score: score, tier: tier)
+            } else {
+                await handleDifferentShabadMatchInLock(seq: seq, shabadId: shabadId, lineId: lineId, score: score, tier: tier)
+            }
         }
-
-        // ── Different-shabad path: hysteresis check FIRST ─────────
-        // Brief #9.2-iOS Bug 1 fix. If the current shabad just
-        // scored 85+ within the peakWindow, reject low-score swaps
-        // BEFORE paying the cache fetch.
-        if shouldRejectSwap(candidateShabadId: shabadId, candidateScore: score, seq: seq) {
-            return
-        }
-
-        // Hysteresis passed. Fetch + apply the swap.
-        let fetched: FullShabad
-        do {
-            fetched = try await cache.shabad(forId: shabadId)
-        } catch {
-            NSLog("[DIAG] StreamingRaagiModeEngine shabad fetch failed shabadId=\(shabadId): \(error.localizedDescription) — keeping sticky display")
-            return
-        }
-        // Stale check #2: post-fetch (cache miss may have hit corpus
-        // on a background queue, giving newer events a chance to win).
-        if seq < currentDisplaySeq {
-            NSLog("[DIAG] StreamingRaagiModeEngine match seq=\(seq) currentDisplaySeq=\(currentDisplaySeq) result=stale (post-fetch)")
-            return
-        }
-
-        if let prev = currentShabad {
-            currentShabad = fetched
-            currentLineId = lineId
-            NSLog("[DIAG] StreamingRaagiModeEngine display update: shabad swap from=\(prev.id) to=\(shabadId) lineId=\(lineId) seq=\(seq) tier=\(tier) score=\(String(format: "%.1f", score))")
-        } else {
-            currentShabad = fetched
-            currentLineId = lineId
-            NSLog("[DIAG] StreamingRaagiModeEngine display update: first shabad shabadId=\(shabadId) lineId=\(lineId) seq=\(seq) tier=\(tier) score=\(String(format: "%.1f", score))")
-        }
-        currentDisplaySeq = seq
-        // Reset peak to the new shabad's score — start a fresh
-        // hysteresis window protecting THIS shabad against the next
-        // round of swaps.
-        currentShabadRecentPeakScore = score
-        currentShabadRecentPeakTime = Date()
-        NSLog("[DIAG] StreamingRaagiModeEngine.currentShabad sticky shabadId=\(shabadId) lineId=\(lineId) currentDisplaySeq=\(seq)")
     }
 
-    /// Refresh the sticky peak for the current shabad. Brief #9.3-iOS
-    /// fix to a #9.2 design mistake.
-    ///
-    /// **Always refresh the time on every same-shabad match.** The
-    /// peakWindow gates *cross-shabad* swaps; it should expire only
-    /// when matches for the current shabad genuinely stop arriving
-    /// (i.e., the user has moved on). The original #9.2 implementation
-    /// only refreshed time when the new score was higher than the
-    /// stored peak — so during continuous singing, when ASR partial
-    /// scores oscillate (e.g., 98, 80, 65, 92, 70, 88), every match
-    /// after the first 98 left the timestamp stale. The 2.5 s window
-    /// then expired ~2.5 s after the first high score even though the
-    /// user was still singing the same shabad, and the next tier-3
-    /// spurious swap got through.
-    ///
-    /// **Peak score uses high-water-mark semantics.** Only raise it
-    /// on a stronger match. The peak is "best observed confidence in
-    /// the current shabad lately," not "latest score."
-    private func refreshCurrentShabadPeak(score: Double) {
+    // ── DISCOVERING ───────────────────────────────────────────────
+
+    private func handleMatchInDiscovery(
+        seq: Int,
+        shabadId: String,
+        lineId: String,
+        score: Double,
+        tier: Int
+    ) async {
+        // Fast lock: single very-confident match commits immediately.
+        if score >= Self.discoveryFastLockScore {
+            await lockTo(shabadId: shabadId, lineId: lineId, peakScore: score, via: "fast", seq: seq, tier: tier)
+            return
+        }
+
+        // Below the evidence floor → noise, don't even track. Stay
+        // in DISCOVERING quietly.
+        if score < Self.discoveryEvidenceFloor {
+            return
+        }
+
+        // Accumulate evidence for this candidate (or replace if a
+        // different shabad).
+        accumulateEvidence(shabadId: shabadId, score: score)
+        pruneEvidenceWindow()
+
+        guard let p = pendingCandidate else { return }
+        if p.matches.count >= Self.discoveryEvidenceCount {
+            let peakOfEvidence = p.matches.map(\.score).max() ?? score
+            await lockTo(shabadId: p.shabadId, lineId: lineId, peakScore: peakOfEvidence, via: "evidence", seq: seq, tier: tier)
+        }
+    }
+
+    // ── LOCKED + same shabad ──────────────────────────────────────
+
+    private func handleSameShabadMatchInLock(
+        seq: Int,
+        lineId: String,
+        score: Double,
+        tier: Int
+    ) {
+        // #9.3 logic: refresh time unconditionally, raise peak score
+        // only when stronger. Anchor stays alive during continuous
+        // singing across oscillating scores.
         currentShabadRecentPeakTime = Date()
         if score > currentShabadRecentPeakScore {
             currentShabadRecentPeakScore = score
         }
+
+        // A same-shabad match is the strongest possible signal that
+        // the raagi is still on the locked shabad — clear any in-
+        // flight challenger immediately so a brief excursion that
+        // had started accumulating evidence loses its slot.
+        if let oldP = pendingCandidate {
+            NSLog("[DIAG] StreamingRaagiModeEngine challenger cleared reason=same_shabad_match previousChallenger=\(oldP.shabadId) matches=\(oldP.matches.count)")
+            pendingCandidate = nil
+        }
+
+        let oldLine = currentLineId ?? "nil"
+        currentLineId = lineId
+        currentDisplaySeq = seq
+        let currentId = currentShabad?.id ?? "nil"
+        NSLog("[DIAG] StreamingRaagiModeEngine display update: same-shabad highlight from=\(oldLine) to=\(lineId) seq=\(seq) tier=\(tier) score=\(String(format: "%.1f", score))")
+        NSLog("[DIAG] StreamingRaagiModeEngine.currentShabad sticky shabadId=\(currentId) lineId=\(lineId) currentDisplaySeq=\(seq)")
     }
 
-    /// Hysteresis gate for cross-shabad swaps. Returns `true` if the
-    /// engine should reject this swap candidate (logs the DIAG line);
-    /// `false` if the swap should proceed. Brief #9.2-iOS.
-    ///
-    /// Logic:
-    ///   - If candidate score is at or above ``alwaysAllowSwapAbove``
-    ///     (90), bypass — the server's very confident, trust it.
-    ///   - Else if the current shabad has a recent (< peakWindow)
-    ///     peak at or above ``highConfidenceFloor`` (85), require
-    ///     the candidate to score at least `peak - swapMarginBelow`
-    ///     (peak - 5). Below that, reject.
-    ///   - Else allow (no recent high-confidence baseline to
-    ///     protect; defer to the matcher).
-    private func shouldRejectSwap(candidateShabadId: String, candidateScore: Double, seq: Int) -> Bool {
-        let peakAge = currentShabadRecentPeakTime.map { Date().timeIntervalSince($0) } ?? .infinity
-        let recentHighConfidence = (currentShabadRecentPeakScore >= Self.highConfidenceFloor)
-            && (peakAge < Self.peakWindowSeconds)
-        let bypassAllowed = candidateScore >= Self.alwaysAllowSwapAbove
-        if recentHighConfidence && !bypassAllowed {
-            let requiredMin = currentShabadRecentPeakScore - Self.swapMarginBelow
-            if candidateScore < requiredMin {
-                let currentId = currentShabad?.id ?? "nil"
-                NSLog("[DIAG] StreamingRaagiModeEngine swap rejected seq=\(seq) candidateShabad=\(candidateShabadId) candidateScore=\(String(format: "%.1f", candidateScore)) currentShabad=\(currentId) peakScore=\(String(format: "%.1f", currentShabadRecentPeakScore)) peakAge=\(String(format: "%.2f", peakAge)) requiredMin=\(String(format: "%.1f", requiredMin))")
-                return true
-            }
+    // ── LOCKED + different shabad ─────────────────────────────────
+
+    private func handleDifferentShabadMatchInLock(
+        seq: Int,
+        shabadId: String,
+        lineId: String,
+        score: Double,
+        tier: Int
+    ) async {
+        // Drop weak challengers entirely — they're noise.
+        if score < Self.lockedChallengerScoreFloor {
+            return
         }
-        return false
+
+        // Bypass: very confident candidate swaps immediately.
+        if score >= Self.lockedSwapBypassScore {
+            await performSwap(shabadId: shabadId, lineId: lineId, score: score, via: "bypass", seq: seq, tier: tier, challengerMatchCount: 0)
+            return
+        }
+
+        // Evidence path: accumulate + check thresholds.
+        accumulateEvidence(shabadId: shabadId, score: score)
+        pruneEvidenceWindow()
+
+        guard let p = pendingCandidate else { return }
+        let latest = p.matches.last?.score ?? score
+        let matchCount = p.matches.count
+        let currentId = currentShabad?.id ?? "nil"
+        NSLog("[DIAG] StreamingRaagiModeEngine challenger shabadId=\(p.shabadId) matches=\(matchCount) latestScore=\(String(format: "%.1f", latest)) currentShabad=\(currentId) currentPeak=\(String(format: "%.1f", currentShabadRecentPeakScore))")
+
+        let enoughMatches = matchCount >= Self.discoveryEvidenceCount
+        let strongEnough = latest >= Self.lockedChallengerStrongScore
+        let nearPeak = latest >= currentShabadRecentPeakScore - Self.lockedSwapMarginBelow
+        if enoughMatches && strongEnough && nearPeak {
+            await performSwap(shabadId: p.shabadId, lineId: lineId, score: latest, via: "evidence", seq: seq, tier: tier, challengerMatchCount: matchCount)
+        }
+    }
+
+    // MARK: - Evidence helpers
+
+    /// Append `(now, score)` to the existing candidate if it matches
+    /// the same shabad, or start a fresh single-candidate slot
+    /// (replacing any prior different-shabad candidate). Brief #9.4:
+    /// single-candidate-at-a-time by design.
+    private func accumulateEvidence(shabadId: String, score: Double) {
+        if var existing = pendingCandidate, existing.shabadId == shabadId {
+            existing.matches.append((Date(), score))
+            pendingCandidate = existing
+        } else {
+            if let oldP = pendingCandidate {
+                NSLog("[DIAG] StreamingRaagiModeEngine challenger cleared reason=new_candidate previousShabad=\(oldP.shabadId) matches=\(oldP.matches.count) newShabad=\(shabadId)")
+            }
+            pendingCandidate = PendingCandidate(shabadId: shabadId, matches: [(Date(), score)])
+        }
+    }
+
+    /// Drop matches older than `evidenceWindowSeconds`. If the
+    /// candidate ends up with no in-window matches, clear it
+    /// entirely.
+    private func pruneEvidenceWindow() {
+        guard var existing = pendingCandidate else { return }
+        let now = Date()
+        let beforeCount = existing.matches.count
+        existing.matches.removeAll { now.timeIntervalSince($0.time) > Self.evidenceWindowSeconds }
+        if existing.matches.isEmpty {
+            pendingCandidate = nil
+            if beforeCount > 0 {
+                NSLog("[DIAG] StreamingRaagiModeEngine challenger cleared reason=evidence_window_aged_out shabadId=\(existing.shabadId) prunedMatches=\(beforeCount)")
+            }
+        } else {
+            pendingCandidate = existing
+        }
+    }
+
+    // MARK: - Lock / swap transitions
+
+    /// DISCOVERING → LOCKED transition. Fetches the shabad, sets
+    /// display, primes peak tracking, transitions state.
+    private func lockTo(
+        shabadId: String,
+        lineId: String,
+        peakScore: Double,
+        via: String,
+        seq: Int,
+        tier: Int
+    ) async {
+        let fetched: FullShabad
+        do {
+            fetched = try await cache.shabad(forId: shabadId)
+        } catch {
+            NSLog("[DIAG] StreamingRaagiModeEngine lock fetch failed shabadId=\(shabadId): \(error.localizedDescription) — staying in DISCOVERING")
+            return
+        }
+        if seq < currentDisplaySeq {
+            NSLog("[DIAG] StreamingRaagiModeEngine match seq=\(seq) currentDisplaySeq=\(currentDisplaySeq) result=stale (post-fetch-lock)")
+            return
+        }
+
+        currentShabad = fetched
+        currentLineId = lineId
+        currentShabadRecentPeakScore = peakScore
+        currentShabadRecentPeakTime = Date()
+        currentDisplaySeq = seq
+        pendingCandidate = nil
+        lockState = .locked
+
+        NSLog("[DIAG] StreamingRaagiModeEngine LOCK shabadId=\(shabadId) via=\(via) score=\(String(format: "%.1f", peakScore))")
+        NSLog("[DIAG] StreamingRaagiModeEngine display update: first shabad shabadId=\(shabadId) lineId=\(lineId) seq=\(seq) tier=\(tier) score=\(String(format: "%.1f", peakScore))")
+        NSLog("[DIAG] StreamingRaagiModeEngine.currentShabad sticky shabadId=\(shabadId) lineId=\(lineId) currentDisplaySeq=\(seq)")
+    }
+
+    /// LOCKED → LOCKED transition with a new shabadId. Used by both
+    /// the bypass (score ≥ 95) and evidence (challenger passes the
+    /// gate) paths.
+    private func performSwap(
+        shabadId: String,
+        lineId: String,
+        score: Double,
+        via: String,
+        seq: Int,
+        tier: Int,
+        challengerMatchCount: Int
+    ) async {
+        let fetched: FullShabad
+        do {
+            fetched = try await cache.shabad(forId: shabadId)
+        } catch {
+            NSLog("[DIAG] StreamingRaagiModeEngine swap fetch failed shabadId=\(shabadId): \(error.localizedDescription) — keeping sticky display")
+            return
+        }
+        if seq < currentDisplaySeq {
+            NSLog("[DIAG] StreamingRaagiModeEngine match seq=\(seq) currentDisplaySeq=\(currentDisplaySeq) result=stale (post-fetch-swap)")
+            return
+        }
+
+        let prevId = currentShabad?.id ?? "nil"
+        currentShabad = fetched
+        currentLineId = lineId
+        currentShabadRecentPeakScore = score
+        currentShabadRecentPeakTime = Date()
+        currentDisplaySeq = seq
+        pendingCandidate = nil
+        // lockState stays .locked
+
+        if via == "evidence" {
+            NSLog("[DIAG] StreamingRaagiModeEngine SWAP from=\(prevId) to=\(shabadId) via=evidence challengerMatches=\(challengerMatchCount) latestScore=\(String(format: "%.1f", score))")
+        } else {
+            NSLog("[DIAG] StreamingRaagiModeEngine SWAP from=\(prevId) to=\(shabadId) via=\(via) score=\(String(format: "%.1f", score))")
+        }
+        NSLog("[DIAG] StreamingRaagiModeEngine display update: shabad swap from=\(prevId) to=\(shabadId) lineId=\(lineId) seq=\(seq) tier=\(tier) score=\(String(format: "%.1f", score))")
+        NSLog("[DIAG] StreamingRaagiModeEngine.currentShabad sticky shabadId=\(shabadId) lineId=\(lineId) currentDisplaySeq=\(seq)")
     }
 
     // MARK: - Jaikara
