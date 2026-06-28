@@ -186,11 +186,21 @@ public final class StreamingMicCapture {
         guard wasRunning else { return }
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
+        // Brief #9.5: explicit reset() so the engine's cached audio-
+        // unit graph is cleared before the next session's start().
+        // Without this, the same AVAudioEngine instance can carry
+        // stale render state across sessions — one of the suspects
+        // in the format-mismatch crash on re-entry.
+        engine.reset()
         unregisterObservers()
+        // Drop converter + nativeFormat so the next session's lazy
+        // init is unambiguous about needing to rebuild.
+        converter = nil
+        nativeFormat = nil
         try? AVAudioSession.sharedInstance().setActive(
             false, options: .notifyOthersOnDeactivation
         )
-        NSLog("[DIAG] StreamingMicCapture.stop chunksEmitted=\(chunkCounter)")
+        NSLog("[DIAG] StreamingMicCapture.stop chunksEmitted=\(chunkCounter) engineRunning=\(engine.isRunning)")
     }
 
     // MARK: - Audio session
@@ -448,6 +458,20 @@ public final class StreamingMicCapture {
                 self?.handleInterruption(note)
             }
         )
+        // Brief #9.5: route change observer (DIAG only for v1). A
+        // mid-session route swap (Bluetooth handoff, AirPods plug,
+        // hardware sample-rate flip) likely needs a tap reinstall to
+        // resume audio cleanly; v1 just logs so the trace shows the
+        // event. Restart-on-route-change is a follow-up brief.
+        notificationObservers.append(
+            center.addObserver(
+                forName: AVAudioSession.routeChangeNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] note in
+                self?.handleRouteChange(note)
+            }
+        )
     }
 
     private func unregisterObservers() {
@@ -475,6 +499,26 @@ public final class StreamingMicCapture {
         @unknown default:
             break
         }
+    }
+
+    /// Brief #9.5: log route changes mid-session. A reason of
+    /// `newDeviceAvailable` / `oldDeviceUnavailable` / `categoryChange`
+    /// typically means the hardware bus is going to renegotiate
+    /// sample rate or channel count — capture may stop delivering
+    /// audio until the user exits + re-enters Raagi Mode. v2 will
+    /// auto-restart; v1 just makes the event visible.
+    private func handleRouteChange(_ note: Notification) {
+        guard
+            let info = note.userInfo,
+            let reasonRaw = info[AVAudioSessionRouteChangeReasonKey] as? UInt,
+            let reason = AVAudioSession.RouteChangeReason(rawValue: reasonRaw)
+        else { return }
+        let session = AVAudioSession.sharedInstance()
+        let inputs = session.currentRoute.inputs
+            .map { "\($0.portName)/\($0.portType.rawValue)" }
+            .joined(separator: ",")
+        let inputFormat = engine.inputNode.inputFormat(forBus: 0)
+        NSLog("[DIAG] StreamingMicCapture routeChange reason=\(reason.rawValue) sessionSR=\(session.sampleRate) inputNodeSR=\(inputFormat.sampleRate) inputs=[\(inputs)] (v1 does not auto-restart — user may need to exit/re-enter Raagi Mode)")
     }
 
     deinit {
