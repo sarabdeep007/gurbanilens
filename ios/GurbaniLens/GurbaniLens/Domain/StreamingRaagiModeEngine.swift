@@ -70,7 +70,45 @@ public final class StreamingRaagiModeEngine: ObservableObject {
     /// stale. Server is the source of truth for monotonic ordering.
     private var currentDisplaySeq: Int = 0
 
+    // MARK: - Sticky hysteresis (Brief #9.2-iOS)
+
+    /// Highest recent match score for the currently-displayed shabad.
+    /// Used together with ``currentShabadRecentPeakTime`` to gate
+    /// different-shabad swaps: if the engine just saw the current
+    /// shabad winning at 85+ within the last 2.5 s, a tier-3 swap to
+    /// some unrelated shabad scoring 50-65 (a typical false-positive
+    /// from full-SGGS noise) is rejected. Reset to 0 on session
+    /// start/stop and when the display swaps to a new shabad.
+    private var currentShabadRecentPeakScore: Double = 0
+    /// Wall-clock timestamp when ``currentShabadRecentPeakScore``
+    /// was last refreshed. nil when no recent peak. Real time (not
+    /// seq-based) because peakAge in seconds is what gates the
+    /// hysteresis window.
+    private var currentShabadRecentPeakTime: Date? = nil
+
     private static let jaikaraBannerSeconds: Double = 3.0
+    /// How long after a high-confidence current-shabad match the
+    /// hysteresis still protects against swaps. 2.5 s = ~2 pangti
+    /// durations at typical kirtan tempo — long enough to cover the
+    /// gap between consecutive correct same-shabad matches, short
+    /// enough that a true shabad change doesn't get stuck for long.
+    private static let peakWindowSeconds: TimeInterval = 2.5
+    /// A different-shabad candidate must score this many points
+    /// below the recent peak to be rejected. With peak=95.5,
+    /// requiredMin = 90.5 — a candidate at 57 is clearly noise,
+    /// while one at 91 is plausibly a real swap (handled by the
+    /// bypass below).
+    private static let swapMarginBelow: Double = 5.0
+    /// Hysteresis only engages when the recent peak is at least
+    /// this high. Below 85 we trust the matcher: if the current
+    /// shabad isn't winning strongly, any new same-or-better swap
+    /// candidate should be accepted.
+    private static let highConfidenceFloor: Double = 85.0
+    /// Bypass the hysteresis when the candidate scores at or above
+    /// this. A 90+ tier-3 match is the server expressing strong
+    /// confidence in a new shabad; trust it and swap regardless of
+    /// current-shabad peak.
+    private static let alwaysAllowSwapAbove: Double = 90.0
 
     // MARK: - Init
 
@@ -94,6 +132,8 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         bufferEnergy = 0
         activeJaikara = nil
         currentDisplaySeq = 0
+        currentShabadRecentPeakScore = 0
+        currentShabadRecentPeakTime = nil
         sessionId = UUID().uuidString
         // Sticky display survives session re-entry if it wasn't
         // explicitly stop()'ed — defensive parity with the buffered
@@ -153,6 +193,8 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         currentShabad = nil
         currentLineId = nil
         currentDisplaySeq = 0
+        currentShabadRecentPeakScore = 0
+        currentShabadRecentPeakTime = nil
     }
 
     // MARK: - Activity → audioState
@@ -212,11 +254,36 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         score: Double,
         tier: Int
     ) async {
-        // Stale check #1: pre-fetch.
+        // Stale check #1: pre-anything.
         if seq < currentDisplaySeq {
             NSLog("[DIAG] StreamingRaagiModeEngine match seq=\(seq) currentDisplaySeq=\(currentDisplaySeq) result=stale (pre-fetch)")
             return
         }
+
+        // ── Same-shabad fast path ─────────────────────────────────
+        // Brief #9.2-iOS: same-shabad match refreshes the recent-
+        // peak score (used to gate cross-shabad swaps) and updates
+        // the highlighted lineId. No cache fetch needed — the
+        // shabad is already on screen.
+        if let currentId = currentShabad?.id, currentId == shabadId {
+            refreshCurrentShabadPeak(score: score)
+            let oldLine = currentLineId ?? "nil"
+            currentLineId = lineId
+            currentDisplaySeq = seq
+            NSLog("[DIAG] StreamingRaagiModeEngine display update: same-shabad highlight from=\(oldLine) to=\(lineId) seq=\(seq) tier=\(tier) score=\(String(format: "%.1f", score))")
+            NSLog("[DIAG] StreamingRaagiModeEngine.currentShabad sticky shabadId=\(shabadId) lineId=\(lineId) currentDisplaySeq=\(seq)")
+            return
+        }
+
+        // ── Different-shabad path: hysteresis check FIRST ─────────
+        // Brief #9.2-iOS Bug 1 fix. If the current shabad just
+        // scored 85+ within the peakWindow, reject low-score swaps
+        // BEFORE paying the cache fetch.
+        if shouldRejectSwap(candidateShabadId: shabadId, candidateScore: score, seq: seq) {
+            return
+        }
+
+        // Hysteresis passed. Fetch + apply the swap.
         let fetched: FullShabad
         do {
             fetched = try await cache.shabad(forId: shabadId)
@@ -231,14 +298,7 @@ public final class StreamingRaagiModeEngine: ObservableObject {
             return
         }
 
-        // Sticky-display update (parity with RaagiModeEngine's
-        // Brief #8.1 logic). THIS is the only place currentShabad /
-        // currentLineId mutate during a streaming session.
-        if currentShabad?.id == shabadId {
-            let oldLine = currentLineId ?? "nil"
-            currentLineId = lineId
-            NSLog("[DIAG] StreamingRaagiModeEngine display update: same-shabad highlight from=\(oldLine) to=\(lineId) seq=\(seq) tier=\(tier) score=\(String(format: "%.1f", score))")
-        } else if let prev = currentShabad {
+        if let prev = currentShabad {
             currentShabad = fetched
             currentLineId = lineId
             NSLog("[DIAG] StreamingRaagiModeEngine display update: shabad swap from=\(prev.id) to=\(shabadId) lineId=\(lineId) seq=\(seq) tier=\(tier) score=\(String(format: "%.1f", score))")
@@ -248,7 +308,56 @@ public final class StreamingRaagiModeEngine: ObservableObject {
             NSLog("[DIAG] StreamingRaagiModeEngine display update: first shabad shabadId=\(shabadId) lineId=\(lineId) seq=\(seq) tier=\(tier) score=\(String(format: "%.1f", score))")
         }
         currentDisplaySeq = seq
+        // Reset peak to the new shabad's score — start a fresh
+        // hysteresis window protecting THIS shabad against the next
+        // round of swaps.
+        currentShabadRecentPeakScore = score
+        currentShabadRecentPeakTime = Date()
         NSLog("[DIAG] StreamingRaagiModeEngine.currentShabad sticky shabadId=\(shabadId) lineId=\(lineId) currentDisplaySeq=\(seq)")
+    }
+
+    /// Refresh the sticky peak for the current shabad. Brief #9.2-iOS.
+    /// Update if EITHER the incoming score is higher than the stored
+    /// peak, OR the stored peak has aged out of the peakWindow. The
+    /// second case lets the peak track downwards over time — if the
+    /// user is now getting moderate scores instead of high ones, the
+    /// peak shouldn't stay artificially elevated forever and keep
+    /// blocking legitimate swaps.
+    private func refreshCurrentShabadPeak(score: Double) {
+        let peakAge = currentShabadRecentPeakTime.map { Date().timeIntervalSince($0) } ?? .infinity
+        if score > currentShabadRecentPeakScore || peakAge > Self.peakWindowSeconds {
+            currentShabadRecentPeakScore = score
+            currentShabadRecentPeakTime = Date()
+        }
+    }
+
+    /// Hysteresis gate for cross-shabad swaps. Returns `true` if the
+    /// engine should reject this swap candidate (logs the DIAG line);
+    /// `false` if the swap should proceed. Brief #9.2-iOS.
+    ///
+    /// Logic:
+    ///   - If candidate score is at or above ``alwaysAllowSwapAbove``
+    ///     (90), bypass — the server's very confident, trust it.
+    ///   - Else if the current shabad has a recent (< peakWindow)
+    ///     peak at or above ``highConfidenceFloor`` (85), require
+    ///     the candidate to score at least `peak - swapMarginBelow`
+    ///     (peak - 5). Below that, reject.
+    ///   - Else allow (no recent high-confidence baseline to
+    ///     protect; defer to the matcher).
+    private func shouldRejectSwap(candidateShabadId: String, candidateScore: Double, seq: Int) -> Bool {
+        let peakAge = currentShabadRecentPeakTime.map { Date().timeIntervalSince($0) } ?? .infinity
+        let recentHighConfidence = (currentShabadRecentPeakScore >= Self.highConfidenceFloor)
+            && (peakAge < Self.peakWindowSeconds)
+        let bypassAllowed = candidateScore >= Self.alwaysAllowSwapAbove
+        if recentHighConfidence && !bypassAllowed {
+            let requiredMin = currentShabadRecentPeakScore - Self.swapMarginBelow
+            if candidateScore < requiredMin {
+                let currentId = currentShabad?.id ?? "nil"
+                NSLog("[DIAG] StreamingRaagiModeEngine swap rejected seq=\(seq) candidateShabad=\(candidateShabadId) candidateScore=\(String(format: "%.1f", candidateScore)) currentShabad=\(currentId) peakScore=\(String(format: "%.1f", currentShabadRecentPeakScore)) peakAge=\(String(format: "%.2f", peakAge)) requiredMin=\(String(format: "%.1f", requiredMin))")
+                return true
+            }
+        }
+        return false
     }
 
     // MARK: - Jaikara
