@@ -140,6 +140,12 @@ public final class StreamingMicCapture {
         vadWindowBuffer.removeAll(keepingCapacity: true)
         byteAccumulator.removeAll(keepingCapacity: true)
         chunkCounter = 0
+        // Brief #9.5: drop the prior session's converter + cached
+        // native format so the lazy-init path rebuilds them on the
+        // first tap with the current (possibly different) hardware
+        // format.
+        converter = nil
+        nativeFormat = nil
 
         installTap()
 
@@ -229,34 +235,76 @@ public final class StreamingMicCapture {
 
     private func installTap() {
         let inputNode = engine.inputNode
-        let nf = inputNode.outputFormat(forBus: 0)
-        self.nativeFormat = nf
+        // Brief #9.5: log both formats to diagnose route-change /
+        // sample-rate drift. inputFormat is what the hardware delivers
+        // INTO the node; outputFormat is what the tap sees coming OUT.
+        // They can differ if the node has internal conversion.
+        let preInput = inputNode.inputFormat(forBus: 0)
+        let preOutput = inputNode.outputFormat(forBus: 0)
+        NSLog("[DIAG] StreamingMicCapture.installTap PRE inputFormat sampleRate=\(preInput.sampleRate) channels=\(preInput.channelCount) outputFormat sampleRate=\(preOutput.sampleRate) channels=\(preOutput.channelCount)")
 
-        guard let monoNative = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
-            sampleRate: nf.sampleRate,
-            channels: 1,
-            interleaved: false
-        ) else { return }
-        self.converter = AVAudioConverter(from: monoNative, to: outputFormatF32)
-
-        NSLog("[DIAG] StreamingMicCapture.installTap native sampleRate=\(nf.sampleRate) channels=\(nf.channelCount)")
-
+        // Brief #9.5 FIX: pass `format: nil` so AVFoundation uses
+        // whatever the bus is ACTUALLY committed to at install time.
+        // Previously this was `format: nf` where nf was queried a
+        // moment earlier — between query and install the bus format
+        // could change (route swap, Bluetooth handoff, hardware
+        // sample-rate flip), and AVFoundation would either crash
+        // (Run 2: 48 kHz client format vs 24 kHz hardware) or
+        // silently drop buffers (Run 1: zero chunks emitted despite
+        // start() succeeding). With nil, the tap always matches.
         let tapBufferSize: AVAudioFrameCount = 4096
         inputNode.installTap(
             onBus: 0,
             bufferSize: tapBufferSize,
-            format: nf
+            format: nil
         ) { [weak self] buffer, _ in
             self?.handleTapBuffer(buffer)
         }
+
+        // After install, the bus is committed to a specific format.
+        // Query it for the install-time log; the per-buffer
+        // `buf.format` is the truth used by the lazy converter init.
+        let postFormat = inputNode.outputFormat(forBus: 0)
+        self.nativeFormat = postFormat
+        NSLog("[DIAG] StreamingMicCapture.installTap POST committed sampleRate=\(postFormat.sampleRate) channels=\(postFormat.channelCount)")
+        // Note: converter is built lazily on the first tap buffer
+        // (handleTapBuffer) from `buf.format` — that's the
+        // ground-truth format and survives any race between install
+        // time and first delivery.
     }
 
     private func handleTapBuffer(_ buf: AVAudioPCMBuffer) {
         Self.tapCallCount += 1
+        let tapNum = Self.tapCallCount
+
+        // Brief #9.5: lazy-build the converter on the first tap so
+        // its source format ALWAYS matches what AVFoundation is
+        // actually delivering. Avoids the stale-format mismatch that
+        // caused Run 1 (silent drop) and Run 2 (crash). The buf.format
+        // is the ground truth — whatever the bus committed to on
+        // install, regardless of what we predicted earlier.
+        if converter == nil {
+            guard let monoNative = AVAudioFormat(
+                commonFormat: .pcmFormatFloat32,
+                sampleRate: buf.format.sampleRate,
+                channels: 1,
+                interleaved: false
+            ),
+            let conv = AVAudioConverter(from: monoNative, to: outputFormatF32) else {
+                NSLog("[DIAG] StreamingMicCapture first-tap converter init FAILED — buf.format sampleRate=\(buf.format.sampleRate) channels=\(buf.format.channelCount) — dropping tap")
+                return
+            }
+            self.converter = conv
+            self.nativeFormat = buf.format
+            NSLog("[DIAG] StreamingMicCapture first tap delivered — sampleRate=\(buf.format.sampleRate) channels=\(buf.format.channelCount) frames=\(buf.frameLength) converter built ratio=\(String(format: "%.4f", outputFormatF32.sampleRate / buf.format.sampleRate))")
+        }
+
         guard buf.format.commonFormat == .pcmFormatFloat32,
               let chanData = buf.floatChannelData,
               let nf = nativeFormat else {
+            if tapNum <= 5 {
+                NSLog("[DIAG] StreamingMicCapture tap #\(tapNum) early-return: commonFormat=\(buf.format.commonFormat.rawValue) hasChanData=\(buf.floatChannelData != nil) hasNF=\(nativeFormat != nil)")
+            }
             return
         }
         let nch = Int(buf.format.channelCount)
