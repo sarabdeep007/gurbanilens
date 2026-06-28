@@ -316,18 +316,28 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         NSLog("[DIAG] StreamingRaagiModeEngine.currentShabad sticky shabadId=\(shabadId) lineId=\(lineId) currentDisplaySeq=\(seq)")
     }
 
-    /// Refresh the sticky peak for the current shabad. Brief #9.2-iOS.
-    /// Update if EITHER the incoming score is higher than the stored
-    /// peak, OR the stored peak has aged out of the peakWindow. The
-    /// second case lets the peak track downwards over time — if the
-    /// user is now getting moderate scores instead of high ones, the
-    /// peak shouldn't stay artificially elevated forever and keep
-    /// blocking legitimate swaps.
+    /// Refresh the sticky peak for the current shabad. Brief #9.3-iOS
+    /// fix to a #9.2 design mistake.
+    ///
+    /// **Always refresh the time on every same-shabad match.** The
+    /// peakWindow gates *cross-shabad* swaps; it should expire only
+    /// when matches for the current shabad genuinely stop arriving
+    /// (i.e., the user has moved on). The original #9.2 implementation
+    /// only refreshed time when the new score was higher than the
+    /// stored peak — so during continuous singing, when ASR partial
+    /// scores oscillate (e.g., 98, 80, 65, 92, 70, 88), every match
+    /// after the first 98 left the timestamp stale. The 2.5 s window
+    /// then expired ~2.5 s after the first high score even though the
+    /// user was still singing the same shabad, and the next tier-3
+    /// spurious swap got through.
+    ///
+    /// **Peak score uses high-water-mark semantics.** Only raise it
+    /// on a stronger match. The peak is "best observed confidence in
+    /// the current shabad lately," not "latest score."
     private func refreshCurrentShabadPeak(score: Double) {
-        let peakAge = currentShabadRecentPeakTime.map { Date().timeIntervalSince($0) } ?? .infinity
-        if score > currentShabadRecentPeakScore || peakAge > Self.peakWindowSeconds {
+        currentShabadRecentPeakTime = Date()
+        if score > currentShabadRecentPeakScore {
             currentShabadRecentPeakScore = score
-            currentShabadRecentPeakTime = Date()
         }
     }
 
