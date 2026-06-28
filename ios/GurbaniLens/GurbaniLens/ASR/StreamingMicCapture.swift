@@ -135,6 +135,15 @@ public final class StreamingMicCapture {
         try configureSession()
         try requestPermissionIfNeeded()
 
+        // Brief #9.5: log AVAudioSession state right after configure
+        // so silent-failure root causes (mode mismatch, sample rate
+        // negotiation, route on entry) are visible in every session
+        // trace.
+        let session = AVAudioSession.sharedInstance()
+        let routeIn = session.currentRoute.inputs.map { "\($0.portName)/\($0.portType.rawValue)" }
+            .joined(separator: ",")
+        NSLog("[DIAG] StreamingMicCapture.start session category=\(session.category.rawValue) mode=\(session.mode.rawValue) sampleRate=\(session.sampleRate) preferredSampleRate=\(session.preferredSampleRate) inputs=[\(routeIn)]")
+
         ensureSilero()
         silero?.reset()
         vadWindowBuffer.removeAll(keepingCapacity: true)
@@ -151,8 +160,13 @@ public final class StreamingMicCapture {
 
         do {
             try engine.start()
-        } catch {
-            throw CaptureError.engineStartFailed(underlying: error)
+            NSLog("[DIAG] StreamingMicCapture engine.start() OK — engine.isRunning=\(engine.isRunning)")
+        } catch let err as NSError {
+            NSLog("[DIAG] StreamingMicCapture engine.start() FAILED domain=\(err.domain) code=\(err.code) localizedDescription=\(err.localizedDescription) userInfo=\(err.userInfo)")
+            // Clean up the tap so the engine isn't left in a
+            // half-initialized state for the next attempt.
+            engine.inputNode.removeTap(onBus: 0)
+            throw CaptureError.engineStartFailed(underlying: err)
         }
 
         stateLock.lock()
@@ -161,7 +175,7 @@ public final class StreamingMicCapture {
 
         registerInterruptionObservers()
 
-        NSLog("[DIAG] StreamingMicCapture.start nativeSR=\(nativeFormat?.sampleRate ?? -1) → 16000 mono s16le chunkBytes=\(Self.chunkBytes)")
+        NSLog("[DIAG] StreamingMicCapture.start nativeSR=\(nativeFormat?.sampleRate ?? -1) → 16000 mono s16le chunkBytes=\(Self.chunkBytes) engineRunning=\(engine.isRunning)")
     }
 
     public func stop() {
