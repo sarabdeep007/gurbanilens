@@ -159,25 +159,12 @@ targets:
     # approach was intermittently failing across Xcode versions +
     # sandbox modes; the codegen approach has none of those failure
     # modes — if the file compiles, the values are there.
-    #
-    # The OLD postBuildScripts entry is preserved temporarily as a
-    # safety net during the migration (Brief #9.8 commits 1+2). It
-    # is removed entirely in commit 3 once providers have migrated to
-    # EnvConfig. Both systems coexist harmlessly during the migration
-    # — EnvConfig is generated but unused, Info.plist is populated as
-    # before.
     preBuildScripts:
       - name: Generate EnvConfig.swift from .env
         runOnlyWhenInstalling: false
         showEnvVars: false
         script: |
           "$SRCROOT/../../scripts/inject_env_to_swift.sh"
-    postBuildScripts:
-      - name: Inject .env keys into Info.plist (LEGACY — to be removed in #9.8 commit 3)
-        runOnlyWhenInstalling: false
-        showEnvVars: false
-        script: |
-          "$SRCROOT/../../scripts/inject_env_to_plist.sh"
     settings:
       base:
         TARGETED_DEVICE_FAMILY: "1,2"  # iPhone + iPad
