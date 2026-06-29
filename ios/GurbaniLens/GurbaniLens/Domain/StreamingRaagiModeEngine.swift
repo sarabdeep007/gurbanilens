@@ -37,12 +37,17 @@ import GurbaniLensCore
 ///
 /// - **LOCKED** holds the displayed shabad through brief excursions,
 ///   simran/jaikara interludes, and tier-3 noise. Different-shabad
-///   matches accumulate as a *challenger* — the engine swaps ONLY
-///   when the challenger clears the evidence-and-margin gates
-///   (2 matches in window, latest ≥ 80, latest ≥ current peak − 15)
-///   OR the candidate scores ≥ ``lockedSwapBypassScore`` (95) on its
-///   own. A same-shabad match clears any in-flight challenger
-///   immediately — it proves the raagi is still on the locked shabad.
+///   matches accumulate as *challengers* in a multi-slot dict (Brief
+///   #9.6) — up to ``maxChallengerSlots`` distinct shabads tracked
+///   simultaneously, LRU-evicted at capacity. The engine swaps ONLY
+///   when a challenger clears the evidence-and-margin gates (2
+///   matches in 8-s window, latest ≥ 75, latest ≥ current peak − 15)
+///   OR scores ≥ ``lockedSwapBypassScore`` (92) on a single match.
+///   Tier-3 cross-shabad matches are filtered out entirely — they're
+///   full-SGGS noise and never become challengers. Same-shabad
+///   matches do NOT clear challengers (Brief #9.6 design change from
+///   #9.4) so legitimate cross-shabad evidence can persist through
+///   simran returns to the current shabad.
 ///
 /// ## Why evidence, not hysteresis alone
 ///
@@ -115,15 +120,38 @@ public final class StreamingRaagiModeEngine: ObservableObject {
     }
     private var lockState: LockState = .discovering
 
-    /// Sliding-window evidence for a single candidate shabad. In
-    /// DISCOVERING this is the candidate-to-lock; in LOCKED it's the
-    /// cross-shabad challenger. Single-candidate by design — a new
-    /// shabad replaces the old one.
+    /// Sliding-window evidence for a single candidate shabad. Used
+    /// ONLY by DISCOVERING (single-slot lock-candidate accumulation).
+    /// LOCKED-state cross-shabad challengers live in
+    /// ``challengers`` — see Brief #9.6.
     private struct PendingCandidate {
         let shabadId: String
         var matches: [(time: Date, score: Double)]
     }
     private var pendingCandidate: PendingCandidate?
+
+    /// **Multi-slot challenger evidence** for LOCKED-state shabad-
+    /// swap consideration (Brief #9.6). Replaces the single
+    /// `pendingCandidate` slot that #9.4 used in LOCKED — a single
+    /// slot got demolished by every tier-3 noise hit, so legitimate
+    /// evidence couldn't accumulate to 2 in the 5-s window. Now up
+    /// to ``maxChallengerSlots`` (3) different shabads can be in
+    /// flight simultaneously; tier-3 matches are filtered out
+    /// entirely so they can't churn the dict.
+    private struct ChallengerEvidence {
+        let shabadId: String
+        var matchCount: Int
+        var latestScore: Double
+        /// Line.id of the challenger's most recent match. Used as
+        /// the highlight target when this challenger wins a swap —
+        /// the user is presumed to be on whatever line they were
+        /// last observed singing.
+        var latestLineId: String
+        var peakScore: Double
+        let firstSeenAt: Date
+        var latestSeenAt: Date
+    }
+    private var challengers: [String: ChallengerEvidence] = [:]
 
     // MARK: - Sticky peak (Brief #9.2/#9.3, retained as secondary defense)
 
@@ -143,6 +171,9 @@ public final class StreamingRaagiModeEngine: ObservableObject {
 
     /// Single-match lock in DISCOVERING when the matcher is very
     /// confident. ≥ 95 means the server has effectively no doubt.
+    /// Distinct from `lockedSwapBypassScore` (92, lower) since
+    /// DISCOVERING has nothing to compare against — a single high-
+    /// score commit there should be the strongest signal we accept.
     private static let discoveryFastLockScore: Double = 95.0
     /// Floor for accumulating evidence in DISCOVERING. Matches below
     /// this aren't tracked — too noisy to count toward a lock.
@@ -153,24 +184,40 @@ public final class StreamingRaagiModeEngine: ObservableObject {
     private static let discoveryEvidenceCount: Int = 2
 
     /// Single-match swap from LOCKED when the candidate is very
-    /// confident (matches the discovery fast-lock bar).
-    private static let lockedSwapBypassScore: Double = 95.0
+    /// confident. Brief #9.6 tune: 95 → 92. Tier-3 matches are
+    /// filtered out before reaching the bypass walk, so the
+    /// bypass-by-single-match is effectively only firing for
+    /// tier 0/1/2 hits at 92+ — a tighter threshold makes sense
+    /// when the candidate is already a high-precision result.
+    private static let lockedSwapBypassScore: Double = 92.0
     /// Floor for tracking a challenger in LOCKED. Matches below this
     /// are ignored entirely — not counted, no challenger created.
     private static let lockedChallengerScoreFloor: Double = 70.0
     /// The challenger's LATEST match must clear this score for the
-    /// evidence path to qualify as a transition.
-    private static let lockedChallengerStrongScore: Double = 80.0
+    /// evidence path to qualify as a transition. Brief #9.6 tune:
+    /// 80 → 75. Matches the loosening that helps the engine swap
+    /// faster on sustained but moderate-confidence evidence.
+    private static let lockedChallengerStrongScore: Double = 75.0
     /// The challenger's latest score must also be within this many
     /// points of the current shabad's recent peak — protects against
     /// swapping to a moderately-scoring shabad when the current one
     /// is dominating at 95+.
     private static let lockedSwapMarginBelow: Double = 15.0
+    /// Maximum number of distinct cross-shabad challengers tracked
+    /// simultaneously in LOCKED. When a 4th distinct shabadId arrives
+    /// the LRU slot (oldest `latestSeenAt`) is evicted. Brief #9.6.
+    /// Cap of 3 covers the typical kirtan case (current shabad +
+    /// brief reference shabad + maybe one transitional shabad).
+    private static let maxChallengerSlots: Int = 3
 
-    /// Sliding window for evidence accumulation, in seconds. Matches
-    /// older than this are pruned from `pendingCandidate.matches`
-    /// before any threshold check.
-    private static let evidenceWindowSeconds: TimeInterval = 5.0
+    /// Sliding window for evidence accumulation, in seconds. Used by
+    /// BOTH the DISCOVERING single-slot logic AND the LOCKED multi-
+    /// slot `challengers` dict (stale slots whose `latestSeenAt` is
+    /// older than this are auto-evicted on the next match). Brief
+    /// #9.6 tune: 5 → 8 to give legitimate excursions enough time
+    /// to accumulate 2 matches even when interleaved with same-
+    /// shabad simran or transient noise.
+    private static let evidenceWindowSeconds: TimeInterval = 8.0
 
     // MARK: - Init
 
@@ -198,6 +245,7 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         currentShabadRecentPeakTime = nil
         lockState = .discovering
         pendingCandidate = nil
+        challengers.removeAll(keepingCapacity: true)
         sessionId = UUID().uuidString
 
         mic.onActivity = { [weak self] _, rms, vadActive in
@@ -254,6 +302,7 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         currentShabadRecentPeakTime = nil
         lockState = .discovering
         pendingCandidate = nil
+        challengers.removeAll(keepingCapacity: true)
     }
 
     // MARK: - Activity → audioState
@@ -316,6 +365,11 @@ public final class StreamingRaagiModeEngine: ObservableObject {
             return
         }
 
+        // Brief #9.6 lazy cleanup — drop any stale challenger slots
+        // before processing this match. Only matters in LOCKED but
+        // costs nothing in DISCOVERING (challengers stays empty).
+        pruneStaleChallengers()
+
         switch lockState {
         case .discovering:
             await handleMatchInDiscovery(seq: seq, shabadId: shabadId, lineId: lineId, score: score, tier: tier)
@@ -377,14 +431,14 @@ public final class StreamingRaagiModeEngine: ObservableObject {
             currentShabadRecentPeakScore = score
         }
 
-        // A same-shabad match is the strongest possible signal that
-        // the raagi is still on the locked shabad — clear any in-
-        // flight challenger immediately so a brief excursion that
-        // had started accumulating evidence loses its slot.
-        if let oldP = pendingCandidate {
-            NSLog("[DIAG] StreamingRaagiModeEngine challenger cleared reason=same_shabad_match previousChallenger=\(oldP.shabadId) matches=\(oldP.matches.count)")
-            pendingCandidate = nil
-        }
+        // Brief #9.6: do NOT clear `challengers` here. The previous
+        // single-slot model wiped pendingCandidate on every same-
+        // shabad match, but that pattern killed legitimate cross-
+        // shabad evidence whenever the raagi briefly returned to
+        // the current shabad mid-transition. Letting challengers
+        // persist (subject to the 8-s stale window) gives a real
+        // transition enough room to clear the 2-match threshold
+        // even when interleaved with same-shabad simran.
 
         let oldLine = currentLineId ?? "nil"
         currentLineId = lineId
@@ -403,33 +457,123 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         score: Double,
         tier: Int
     ) async {
-        // Drop weak challengers entirely — they're noise.
+        // Brief #9.6 REQ 2 — tier filter. Tier-3 matches are
+        // full-SGGS noise during LOCKED; they never become or update
+        // a challenger. Tier-3 matches for the CURRENT shabad still
+        // go through `handleSameShabadMatchInLock` (different code
+        // path); only cross-shabad tier-3 is filtered here.
+        if tier > 2 {
+            NSLog("[DIAG] StreamingRaagiModeEngine challenger ignored shabadId=\(shabadId) tier=\(tier) score=\(String(format: "%.1f", score)) (tier-3 noise)")
+            return
+        }
+
+        // Drop weak challengers entirely — they're noise too.
         if score < Self.lockedChallengerScoreFloor {
             return
         }
 
-        // Bypass: very confident candidate swaps immediately.
-        if score >= Self.lockedSwapBypassScore {
-            await performSwap(shabadId: shabadId, lineId: lineId, score: score, via: "bypass", seq: seq, tier: tier, challengerMatchCount: 0)
-            return
+        // Update existing slot or add a new one (with LRU eviction
+        // when at capacity).
+        let now = Date()
+        if var existing = challengers[shabadId] {
+            existing.matchCount += 1
+            existing.latestScore = score
+            existing.latestLineId = lineId
+            if score > existing.peakScore {
+                existing.peakScore = score
+            }
+            existing.latestSeenAt = now
+            challengers[shabadId] = existing
+        } else {
+            evictLRUChallengerIfNeeded()
+            challengers[shabadId] = ChallengerEvidence(
+                shabadId: shabadId,
+                matchCount: 1,
+                latestScore: score,
+                latestLineId: lineId,
+                peakScore: score,
+                firstSeenAt: now,
+                latestSeenAt: now
+            )
         }
 
-        // Evidence path: accumulate + check thresholds.
-        accumulateEvidence(shabadId: shabadId, score: score)
-        pruneEvidenceWindow()
+        logChallengerSnapshot(updatedShabad: shabadId, tier: tier)
 
-        guard let p = pendingCandidate else { return }
-        let latest = p.matches.last?.score ?? score
-        let matchCount = p.matches.count
+        // Walk all challengers and pick the best swap candidate
+        // (highest latestScore that passes either gate).
+        guard let winner = findBestSwapCandidate() else { return }
+        await performSwap(
+            shabadId: winner.entry.shabadId,
+            lineId: winner.entry.latestLineId,
+            score: winner.entry.latestScore,
+            via: winner.via,
+            seq: seq,
+            tier: tier,
+            challengerMatchCount: winner.entry.matchCount
+        )
+    }
+
+    // MARK: - Challenger helpers (Brief #9.6)
+
+    /// Drop any challenger whose `latestSeenAt` is older than
+    /// `evidenceWindowSeconds`. Called at the top of every match so
+    /// stale slots don't accumulate.
+    private func pruneStaleChallengers() {
+        if challengers.isEmpty { return }
+        let now = Date()
+        let staleKeys: [String] = challengers.compactMap { (k, v) in
+            now.timeIntervalSince(v.latestSeenAt) > Self.evidenceWindowSeconds ? k : nil
+        }
+        for k in staleKeys {
+            let staleSec = now.timeIntervalSince(challengers[k]!.latestSeenAt)
+            NSLog("[DIAG] StreamingRaagiModeEngine challenger evicted shabadId=\(k) reason=stale staleSec=\(String(format: "%.1f", staleSec))")
+            challengers.removeValue(forKey: k)
+        }
+    }
+
+    /// Make room for a new challenger by evicting the LRU slot (the
+    /// one with the oldest `latestSeenAt`). No-op if we're below
+    /// capacity.
+    private func evictLRUChallengerIfNeeded() {
+        if challengers.count < Self.maxChallengerSlots { return }
+        guard let lru = challengers.min(by: { $0.value.latestSeenAt < $1.value.latestSeenAt }) else { return }
+        NSLog("[DIAG] StreamingRaagiModeEngine challenger evicted shabadId=\(lru.key) reason=lru")
+        challengers.removeValue(forKey: lru.key)
+    }
+
+    /// Walk all challengers and return the one most worthy of a swap,
+    /// or nil if none qualify. Brief #9.6 REQ 4 trigger logic:
+    ///   - Evidence: matchCount ≥ 2 AND latestScore ≥ 75 AND
+    ///     latestScore ≥ currentPeak − 15
+    ///   - Bypass: latestScore ≥ 92 (single match)
+    /// Ties broken by highest `latestScore`.
+    private func findBestSwapCandidate() -> (entry: ChallengerEvidence, via: String)? {
+        var best: (ChallengerEvidence, String)?
+        for (_, c) in challengers {
+            let qualifiesEvidence = c.matchCount >= 2
+                && c.latestScore >= Self.lockedChallengerStrongScore
+                && c.latestScore >= currentShabadRecentPeakScore - Self.lockedSwapMarginBelow
+            let qualifiesBypass = c.latestScore >= Self.lockedSwapBypassScore
+            if qualifiesEvidence || qualifiesBypass {
+                if best == nil || c.latestScore > best!.0.latestScore {
+                    // Prefer "bypass" label when the candidate alone
+                    // would have qualified for it — informative for
+                    // the trace.
+                    best = (c, qualifiesBypass ? "bypass" : "evidence")
+                }
+            }
+        }
+        return best
+    }
+
+    private func logChallengerSnapshot(updatedShabad: String, tier: Int) {
+        let entry = challengers[updatedShabad]!
+        let slotsStr = challengers
+            .sorted(by: { $0.value.matchCount > $1.value.matchCount })
+            .map { "\($0.key):\($0.value.matchCount)" }
+            .joined(separator: ",")
         let currentId = currentShabad?.id ?? "nil"
-        NSLog("[DIAG] StreamingRaagiModeEngine challenger shabadId=\(p.shabadId) matches=\(matchCount) latestScore=\(String(format: "%.1f", latest)) currentShabad=\(currentId) currentPeak=\(String(format: "%.1f", currentShabadRecentPeakScore))")
-
-        let enoughMatches = matchCount >= Self.discoveryEvidenceCount
-        let strongEnough = latest >= Self.lockedChallengerStrongScore
-        let nearPeak = latest >= currentShabadRecentPeakScore - Self.lockedSwapMarginBelow
-        if enoughMatches && strongEnough && nearPeak {
-            await performSwap(shabadId: p.shabadId, lineId: lineId, score: latest, via: "evidence", seq: seq, tier: tier, challengerMatchCount: matchCount)
-        }
+        NSLog("[DIAG] StreamingRaagiModeEngine challenger shabadId=\(updatedShabad) matches=\(entry.matchCount) latestScore=\(String(format: "%.1f", entry.latestScore)) peakScore=\(String(format: "%.1f", entry.peakScore)) tier=\(tier) slots=[\(slotsStr)] currentShabad=\(currentId) currentPeak=\(String(format: "%.1f", currentShabadRecentPeakScore))")
     }
 
     // MARK: - Evidence helpers
@@ -498,6 +642,10 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         currentShabadRecentPeakTime = Date()
         currentDisplaySeq = seq
         pendingCandidate = nil
+        // Brief #9.6: defensive — challengers should already be
+        // empty in DISCOVERING (we don't touch the dict there) but
+        // make sure the fresh lock starts with a clean slate.
+        challengers.removeAll(keepingCapacity: true)
         lockState = .locked
 
         NSLog("[DIAG] StreamingRaagiModeEngine LOCK shabadId=\(shabadId) via=\(via) score=\(String(format: "%.1f", peakScore))")
@@ -506,8 +654,8 @@ public final class StreamingRaagiModeEngine: ObservableObject {
     }
 
     /// LOCKED → LOCKED transition with a new shabadId. Used by both
-    /// the bypass (score ≥ 95) and evidence (challenger passes the
-    /// gate) paths.
+    /// the bypass (score ≥ 92, Brief #9.6) and evidence (challenger
+    /// passes the gate) paths.
     private func performSwap(
         shabadId: String,
         lineId: String,
@@ -536,6 +684,11 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         currentShabadRecentPeakTime = Date()
         currentDisplaySeq = seq
         pendingCandidate = nil
+        // Brief #9.6: drop ALL challengers on swap. The winner has
+        // just become the new currentShabad; any remaining
+        // challenger slots are evidence accrued under the OLD
+        // currentShabad context and shouldn't carry over.
+        challengers.removeAll(keepingCapacity: true)
         // lockState stays .locked
 
         if via == "evidence" {
