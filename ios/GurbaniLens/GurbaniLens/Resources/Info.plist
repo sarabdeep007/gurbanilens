@@ -22,6 +22,10 @@
 	<string>1</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>GurbaniLens listens when you tap the microphone, transcribes what you recite, and looks up the matching Shabad. Audio stays on this device — nothing is uploaded.</string>
+	<key>UIAppFonts</key>
+	<array>
+		<string>NotoSerifGurmukhi-Variable.ttf</string>
+	</array>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UISupportedInterfaceOrientations</key>
