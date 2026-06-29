@@ -64,6 +64,19 @@ targets:
       - path: GurbaniLens
         excludes:
           - "**/.DS_Store"
+      # Brief #9.8-iOS (2026-06-29): explicit reference to the
+      # Generated/ directory so the Swift-codegen EnvConfig.swift
+      # (created by `scripts/inject_env_to_swift.sh` on every build)
+      # is reachable from the project even on a fresh checkout where
+      # the directory doesn't exist yet. `optional: true` tells
+      # xcodegen not to fail when the dir is missing at generate
+      # time; `type: group` makes it a yellow group so files inside
+      # are added to Compile Sources.
+      - path: GurbaniLens/Generated
+        excludes:
+          - "**/.DS_Store"
+        type: group
+        optional: true
     resources:
       - path: GurbaniLens/Resources/Assets.xcassets
         optional: true
@@ -137,16 +150,30 @@ targets:
         product: Starscream
       - package: onnxruntime-objc
         product: onnxruntime
-    # Inject SARVAM_API_KEY + GEMINI_API_KEY from repo-root .env into the
-    # built Info.plist so SarvamProvider + GeminiProvider can read them
-    # via Bundle.main.object(forInfoDictionaryKey:). Wired here as a
-    # postBuildScript so it runs after the Info.plist is copied into the
-    # .app and before code signing — the signed bundle includes our
-    # additions. The script is a no-op when .env is missing or the keys
-    # are blank; cloud providers will surface "missing key" at start
-    # time and the user falls back to WhisperKit via Settings.
+    # Brief #9.8-iOS (2026-06-29): replaced the brittle .env → Info.plist
+    # PlistBuddy injection with a .env → Swift codegen step that writes
+    # ios/GurbaniLens/GurbaniLens/Generated/EnvConfig.swift before each
+    # build. Providers read EnvConfig.x directly (compiled into the
+    # binary at compile time) instead of doing
+    # Bundle.main.object(forInfoDictionaryKey:) at runtime. The plist
+    # approach was intermittently failing across Xcode versions +
+    # sandbox modes; the codegen approach has none of those failure
+    # modes — if the file compiles, the values are there.
+    #
+    # The OLD postBuildScripts entry is preserved temporarily as a
+    # safety net during the migration (Brief #9.8 commits 1+2). It
+    # is removed entirely in commit 3 once providers have migrated to
+    # EnvConfig. Both systems coexist harmlessly during the migration
+    # — EnvConfig is generated but unused, Info.plist is populated as
+    # before.
+    preBuildScripts:
+      - name: Generate EnvConfig.swift from .env
+        runOnlyWhenInstalling: false
+        showEnvVars: false
+        script: |
+          "$SRCROOT/../../scripts/inject_env_to_swift.sh"
     postBuildScripts:
-      - name: Inject .env keys into Info.plist
+      - name: Inject .env keys into Info.plist (LEGACY — to be removed in #9.8 commit 3)
         runOnlyWhenInstalling: false
         showEnvVars: false
         script: |

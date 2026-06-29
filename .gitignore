@@ -66,6 +66,11 @@ docs/aeneas_spike_alignment.json
 .env.local
 *.log
 
+# Brief #9.8-iOS: Swift-codegen output of scripts/inject_env_to_swift.sh.
+# Contains real .env values baked into Swift constants; never commit.
+# Always regenerated on every Xcode build.
+ios/GurbaniLens/GurbaniLens/Generated/EnvConfig.swift
+
 # Server
 server/node_modules/
 server/package-lock.json
