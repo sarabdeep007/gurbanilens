@@ -32,6 +32,14 @@ public actor ShabadCache {
 
     private let corpus: Corpus
     private var shabads: [String: FullShabad] = [:]
+    /// Brief #9.7-iOS: per-pangti first-letter signatures, parallel
+    /// to ``shabads``. Outer key is shabadId, inner key is lineId,
+    /// value is the FL signature (one short String per word).
+    /// Populated lazily on the same miss path that fills ``shabads``;
+    /// dropped together in ``clear()``. Memory footprint is
+    /// negligible (~10-50 lines × ~6-10 single-char strings per
+    /// shabad).
+    private var flSignatures: [String: [String: [String]]] = [:]
 
     public init(corpus: Corpus) {
         self.corpus = corpus
@@ -52,16 +60,50 @@ public actor ShabadCache {
         }
         let built = FullShabad(id: id, lines: filtered)
         shabads[id] = built
-        NSLog("[DIAG] ShabadCache MISS id=\(id) fetchedLines=\(raw.count) keptLines=\(filtered.count) cachedCount=\(shabads.count)")
+
+        // Brief #9.7: precompute FL signatures for every pangti.
+        // Prefer the Unicode Gurmukhi field when available (cleaner
+        // for FL extraction); fall back to the Anmol-Lipi-style
+        // `gurmukhi` field otherwise.
+        var sigs: [String: [String]] = [:]
+        sigs.reserveCapacity(filtered.count)
+        for line in filtered {
+            let source = line.gurmukhiUnicode ?? line.gurmukhi
+            sigs[line.id] = FirstLetterSignature.extract(source)
+        }
+        flSignatures[id] = sigs
+        NSLog("[DIAG] ShabadCache MISS id=\(id) fetchedLines=\(raw.count) keptLines=\(filtered.count) flSigsComputed=\(sigs.count) cachedCount=\(shabads.count)")
         return built
+    }
+
+    /// Brief #9.7-iOS: lookup of the precomputed FL signatures for a
+    /// shabad. Returns nil if the shabad hasn't been fetched yet —
+    /// caller (the streaming engine, typically) should call
+    /// ``shabad(forId:)`` first to populate the cache. Cheap: pure
+    /// dict lookup, no recompute.
+    public func flSignatures(forId id: String) -> [String: [String]]? {
+        flSignatures[id]
+    }
+
+    /// Brief #9.7-iOS: convenience that returns both the FullShabad
+    /// and its FL signatures in one actor hop. The streaming engine
+    /// needs both on every lock/swap (the shabad for rendering, the
+    /// signatures for fast pangti highlight); pairing them in one
+    /// call saves a round-trip through the actor.
+    public func shabadWithFLSignatures(forId id: String) throws -> (shabad: FullShabad, signatures: [String: [String]]) {
+        let s = try shabad(forId: id)
+        let sigs = flSignatures[id] ?? [:]
+        return (s, sigs)
     }
 
     /// Drop everything. Called when Raagi Mode is exited so the next
     /// session starts fresh.
     public func clear() {
         let dropped = shabads.count
+        let droppedSigs = flSignatures.count
         shabads.removeAll(keepingCapacity: true)
-        NSLog("[DIAG] ShabadCache cleared (dropped \(dropped) shabads)")
+        flSignatures.removeAll(keepingCapacity: true)
+        NSLog("[DIAG] ShabadCache cleared (dropped \(dropped) shabads, \(droppedSigs) FL sigs)")
     }
 
     /// Diagnostic: number of cached shabads (used for the bottom-of-
