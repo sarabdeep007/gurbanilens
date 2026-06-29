@@ -107,9 +107,8 @@ public actor GeminiProvider: ASRProvider {
         prompt: String? = nil,
         chunkSeconds: Double? = nil
     ) {
-        let envKey = apiKey
-            ?? Bundle.main.object(forInfoDictionaryKey: "GEMINI_API_KEY") as? String
-            ?? ""
+        // Brief #9.8-iOS: env via EnvConfig (Swift codegen).
+        let envKey = apiKey ?? EnvConfig.geminiAPIKey
         self.apiKey = envKey.trimmingCharacters(in: .whitespacesAndNewlines)
         self.endpointBase = endpointBase ?? Self.defaultEndpointBase
         self.prompt = prompt ?? Self.defaultPrompt

@@ -80,12 +80,14 @@ public final class StreamingProvider: @unchecked Sendable {
     // MARK: - Init
 
     public init(endpoint: String? = nil, bearerToken: String? = nil) {
-        let envEndpoint = endpoint
-            ?? Bundle.main.object(forInfoDictionaryKey: "GurbaniLensASRStreamURL") as? String
-            ?? Self.defaultEndpoint
-        let envToken = bearerToken
-            ?? Bundle.main.object(forInfoDictionaryKey: "GurbaniLensASRToken") as? String
-            ?? ""
+        // Brief #9.8-iOS: env via EnvConfig (Swift codegen) instead
+        // of Bundle.main lookups. `GurbaniLensASRStreamURL` was a
+        // speculative Info.plist key never actually injected by the
+        // old script; dropped entirely in favour of the hardcoded
+        // default. Token comes from EnvConfig.gurbanilensASRToken
+        // (same key used by the buffered provider).
+        let envEndpoint = endpoint ?? Self.defaultEndpoint
+        let envToken = bearerToken ?? EnvConfig.gurbanilensASRToken
         // Force-unwrap with a fatal init message if endpoint is
         // malformed — this is a build-time misconfiguration, not a
         // runtime user error.

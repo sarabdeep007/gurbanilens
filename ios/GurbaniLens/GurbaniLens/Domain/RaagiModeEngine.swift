@@ -224,12 +224,12 @@ public final class RaagiModeEngine: ObservableObject {
         self.cache = ShabadCache(corpus: corpus)
         self.jaikaraDetector = JaikaraDetector()
 
-        // Mirror GurbaniLensCloudProvider's Info.plist read pattern.
-        // The bearer token + URL are injected at build time by
-        // scripts/inject_env_to_plist.sh from the repo-root .env.
-        let envEndpoint = (Bundle.main.object(forInfoDictionaryKey: "GurbaniLensASRURL") as? String)
-            ?? GurbaniLensCloudProvider.defaultEndpoint
-        let envToken = (Bundle.main.object(forInfoDictionaryKey: "GurbaniLensASRToken") as? String) ?? ""
+        // Brief #9.8-iOS: env via EnvConfig (Swift codegen from
+        // .env). Replaces the brittle Info.plist injection.
+        let envEndpoint = EnvConfig.gurbanilensASRURL.isEmpty
+            ? GurbaniLensCloudProvider.defaultEndpoint
+            : EnvConfig.gurbanilensASRURL
+        let envToken = EnvConfig.gurbanilensASRToken
         self.asrEndpoint = envEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
         self.asrBearerToken = envToken.trimmingCharacters(in: .whitespacesAndNewlines)
 

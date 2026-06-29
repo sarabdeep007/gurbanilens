@@ -284,8 +284,9 @@ final class CompareSession: ObservableObject {
         let pcmS16LE = Self.float32ToS16LE(samples)
         let wav = WavBuilder.wavFromS16LE(pcm: pcmS16LE)
 
-        let sarvamKey = Bundle.main.object(forInfoDictionaryKey: "SARVAM_API_KEY") as? String ?? ""
-        let geminiKey = Bundle.main.object(forInfoDictionaryKey: "GEMINI_API_KEY") as? String ?? ""
+        // Brief #9.8-iOS: env via EnvConfig (Swift codegen).
+        let sarvamKey = EnvConfig.sarvamAPIKey
+        let geminiKey = EnvConfig.geminiAPIKey
 
         // Start all three independently so a slow one doesn't block the
         // others. Each branch updates its row as soon as it lands.

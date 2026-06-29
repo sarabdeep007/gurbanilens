@@ -94,9 +94,8 @@ public actor SarvamProvider: ASRProvider {
         model: String? = nil,
         language: String? = nil
     ) {
-        let envKey = apiKey
-            ?? Bundle.main.object(forInfoDictionaryKey: "SARVAM_API_KEY") as? String
-            ?? ""
+        // Brief #9.8-iOS: env via EnvConfig (Swift codegen).
+        let envKey = apiKey ?? EnvConfig.sarvamAPIKey
         self.apiKey = envKey.trimmingCharacters(in: .whitespacesAndNewlines)
         self.endpoint = endpoint ?? Self.defaultEndpoint
         self.model = model ?? Self.defaultModel

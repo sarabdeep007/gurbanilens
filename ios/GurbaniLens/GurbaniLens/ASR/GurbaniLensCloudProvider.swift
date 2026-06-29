@@ -6,9 +6,10 @@ import GurbaniLensCore
 ///
 /// Production endpoint (Deep's 2026-06-25 deploy):
 ///   - URL:    https://asr.gurbanilens.com/transcribe
-///   - Auth:   `Authorization: Bearer <token>` (bearer token injected
-///             from .env via scripts/inject_env_to_plist.sh, read at
-///             runtime via Bundle.main.object(forInfoDictionaryKey:))
+///   - Auth:   `Authorization: Bearer <token>` (bearer token baked
+///             in at compile time from .env via
+///             scripts/inject_env_to_swift.sh → EnvConfig.swift,
+///             Brief #9.8-iOS)
 ///   - Body:   multipart/form-data with single field `audio` carrying
 ///             a WAV file (16 kHz mono s16le inside a 44-byte RIFF
 ///             header)
@@ -130,12 +131,14 @@ public actor GurbaniLensCloudProvider: ASRProvider {
         endpoint: String? = nil,
         bearerToken: String? = nil
     ) {
+        // Brief #9.8-iOS: read env via EnvConfig (Swift codegen from
+        // .env) instead of Bundle.main.object(forInfoDictionaryKey:).
+        // The plist injection path was intermittently failing across
+        // Xcode versions + sandbox modes; the codegen path is
+        // compile-time, no runtime lookup.
         let envEndpoint = endpoint
-            ?? Bundle.main.object(forInfoDictionaryKey: "GurbaniLensASRURL") as? String
-            ?? Self.defaultEndpoint
-        let envToken = bearerToken
-            ?? Bundle.main.object(forInfoDictionaryKey: "GurbaniLensASRToken") as? String
-            ?? ""
+            ?? (EnvConfig.gurbanilensASRURL.isEmpty ? Self.defaultEndpoint : EnvConfig.gurbanilensASRURL)
+        let envToken = bearerToken ?? EnvConfig.gurbanilensASRToken
         self.endpoint = envEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
         self.bearerToken = envToken.trimmingCharacters(in: .whitespacesAndNewlines)
         self.capture = CloudMicCapture()
