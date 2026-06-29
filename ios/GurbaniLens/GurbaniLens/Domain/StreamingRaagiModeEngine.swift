@@ -238,17 +238,24 @@ public final class StreamingRaagiModeEngine: ObservableObject {
 
     // ── First-letter local match (Brief #9.7) ─────────────────
     /// Minimum number of first-letters in the query before we attempt
-    /// FL matching. 2 letters disambiguates well in a small shabad
-    /// scope; a single letter would match too many candidates.
-    private static let flMinQueryLength: Int = 2
+    /// FL matching. Brief #9.9 bumped 2 → 3 to match the new
+    /// `flMinMatchLength` floor: we need at least 3 letters in the
+    /// partial to find a 3-letter substring match.
+    private static let flMinQueryLength: Int = 3
     /// Hard cap on query length to keep match cheap. The walk over
     /// the shabad's FL sigs is already O(lines), this just bounds
-    /// the inner prefix comparison.
+    /// the inner substring comparison.
     private static let flMaxQueryLength: Int = 12
     /// Cooldown between FL match attempts to prevent flicker if the
     /// server emits a burst of partials within a short window. 150 ms
     /// is well below the partial cadence (~850 ms) in practice.
     private static let flCooldownMs: Int = 150
+    /// Brief #9.9-iOS: minimum length of the longest-contiguous FL
+    /// substring match before we trust it enough to jump the
+    /// highlight. 3 letters is enough to disambiguate within a
+    /// typical 10-30-line shabad while still picking up on the first
+    /// few sung syllables.
+    private static let flMinMatchLength: Int = 3
 
     // MARK: - Init
 
@@ -611,37 +618,35 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         // match outcome.
         lastFLMatchAttemptTime = Date()
 
-        // Walk the current shabad's FL sigs for prefix matches.
-        var hits: [String] = []
-        hits.reserveCapacity(2)
-        for (lineId, sig) in currentShabadFLSigs {
-            if FirstLetterSignature.prefixMatch(query: queryFL, target: sig) {
-                hits.append(lineId)
-            }
-        }
+        // Walk the current shabad's FL sigs for substring matches.
+        // Best match = longest contiguous run of pangti's FL appearing
+        // anywhere in the partial. Tie-break: most recent (closest to
+        // end of partial). See FirstLetterSignature.findBestPangti.
+        let corpus: [(lineId: String, fl: [String])] = currentShabadFLSigs.map { ($0.key, $0.value) }
+        let result = FirstLetterSignature.findBestPangti(
+            query: queryFL,
+            corpus: corpus,
+            minMatchLength: Self.flMinMatchLength
+        )
 
         let flStr = queryFL.joined(separator: " ")
         let partialHead = String(trimmed.prefix(40)).replacingOccurrences(of: "\n", with: " ")
         let currentId = currentShabad?.id ?? "nil"
 
-        if hits.count == 1 {
-            let matchedLineId = hits[0]
-            let oldLine = currentLineId ?? "nil"
-            if matchedLineId == oldLine {
-                // Already on this pangti — server-confirmed or
-                // FL-confirmed earlier. No display mutation needed;
-                // log compactly so the trace shows the FL path was
-                // alive but quiescent.
-                return
-            }
-            currentLineId = matchedLineId
-            currentLineIdSetByFL = true
-            NSLog("[DIAG] StreamingRaagiModeEngine FL local match shabadId=\(currentId) lineId=\(matchedLineId) partial='\(partialHead)' fl='\(flStr)' (jumped from \(oldLine))")
-        } else if hits.count > 1 {
-            NSLog("[DIAG] StreamingRaagiModeEngine FL ambiguous shabadId=\(currentId) candidates=\(hits.count) partial='\(partialHead)' fl='\(flStr)' (waiting)")
-        } else {
+        guard let match = result else {
             NSLog("[DIAG] StreamingRaagiModeEngine FL no match (current shabad) partial='\(partialHead)' fl='\(flStr)' (server will detect any cross-shabad change)")
+            return
         }
+
+        let oldLine = currentLineId ?? "nil"
+        if match.lineId == oldLine {
+            // Already on this pangti — FL-confirmed, quiescent.
+            NSLog("[DIAG] StreamingRaagiModeEngine FL confirm lineId=\(match.lineId) matchLen=\(match.matchLength) startIdx=\(match.startIndex) partial='\(partialHead)' fl='\(flStr)'")
+            return
+        }
+        currentLineId = match.lineId
+        currentLineIdSetByFL = true
+        NSLog("[DIAG] StreamingRaagiModeEngine FL local match shabadId=\(currentId) lineId=\(match.lineId) matchLen=\(match.matchLength) startIdx=\(match.startIndex) partial='\(partialHead)' fl='\(flStr)' (jumped from \(oldLine))")
     }
 
     // MARK: - Challenger helpers (Brief #9.6)
