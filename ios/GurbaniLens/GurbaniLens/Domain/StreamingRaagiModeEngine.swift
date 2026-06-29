@@ -165,6 +165,23 @@ public final class StreamingRaagiModeEngine: ObservableObject {
     /// match so the anchor stays alive during continuous singing.
     private var currentShabadRecentPeakTime: Date? = nil
 
+    // MARK: - First-letter local match (Brief #9.7)
+
+    /// Precomputed FL signatures for every pangti in the currently-
+    /// locked shabad. Snapshotted on lock/swap so partial-event FL
+    /// matching avoids actor hops into ShabadCache on every
+    /// transcript update. Empty in DISCOVERING; cleared on stop().
+    private var currentShabadFLSigs: [String: [String]] = [:]
+    /// True when ``currentLineId`` was last updated by the local FL
+    /// match (not a server match). Used to detect server-overrides-FL
+    /// reconciliation events for the DIAG trace. Reset to false on
+    /// any server-driven line update.
+    private var currentLineIdSetByFL: Bool = false
+    /// Wall-clock timestamp of the most recent FL match attempt.
+    /// Used to cooldown-throttle the FL path so it doesn't fire more
+    /// than once per ``flCooldownMs`` (anti-flicker for burst partials).
+    private var lastFLMatchAttemptTime: Date? = nil
+
     // MARK: - Tunables (Brief #9.4)
 
     private static let jaikaraBannerSeconds: Double = 3.0
@@ -219,6 +236,20 @@ public final class StreamingRaagiModeEngine: ObservableObject {
     /// shabad simran or transient noise.
     private static let evidenceWindowSeconds: TimeInterval = 8.0
 
+    // ── First-letter local match (Brief #9.7) ─────────────────
+    /// Minimum number of first-letters in the query before we attempt
+    /// FL matching. 2 letters disambiguates well in a small shabad
+    /// scope; a single letter would match too many candidates.
+    private static let flMinQueryLength: Int = 2
+    /// Hard cap on query length to keep match cheap. The walk over
+    /// the shabad's FL sigs is already O(lines), this just bounds
+    /// the inner prefix comparison.
+    private static let flMaxQueryLength: Int = 12
+    /// Cooldown between FL match attempts to prevent flicker if the
+    /// server emits a burst of partials within a short window. 150 ms
+    /// is well below the partial cadence (~850 ms) in practice.
+    private static let flCooldownMs: Int = 150
+
     // MARK: - Init
 
     public init(corpus: Corpus, provider: StreamingProvider) {
@@ -243,6 +274,9 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         currentDisplaySeq = 0
         currentShabadRecentPeakScore = 0
         currentShabadRecentPeakTime = nil
+        currentShabadFLSigs.removeAll(keepingCapacity: true)
+        currentLineIdSetByFL = false
+        lastFLMatchAttemptTime = nil
         lockState = .discovering
         pendingCandidate = nil
         challengers.removeAll(keepingCapacity: true)
@@ -300,6 +334,9 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         currentDisplaySeq = 0
         currentShabadRecentPeakScore = 0
         currentShabadRecentPeakTime = nil
+        currentShabadFLSigs.removeAll(keepingCapacity: true)
+        currentLineIdSetByFL = false
+        lastFLMatchAttemptTime = nil
         lockState = .discovering
         pendingCandidate = nil
         challengers.removeAll(keepingCapacity: true)
@@ -329,9 +366,12 @@ public final class StreamingRaagiModeEngine: ObservableObject {
                 setAudioState(.listening)
             }
 
-        case .partial:
-            // v1: ignore partials. Match events drive the lock model.
-            break
+        case .partial(_, let transcript, _):
+            // Brief #9.7-iOS: partials drive the local FL match for
+            // fast within-shabad pangti highlight. Match events
+            // (server) still drive the lock state machine and any
+            // cross-shabad swap detection.
+            handlePartialForFLMatch(transcript: transcript)
 
         case .match(let seq, let shabadId, let lineId, let score, let tier, _, _):
             await handleMatch(seq: seq, shabadId: shabadId, lineId: lineId, score: score, tier: tier)
@@ -441,9 +481,17 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         // even when interleaved with same-shabad simran.
 
         let oldLine = currentLineId ?? "nil"
-        currentLineId = lineId
-        currentDisplaySeq = seq
         let currentId = currentShabad?.id ?? "nil"
+        // Brief #9.7: if FL had set the current lineId and the
+        // server now disagrees, log the reconcile event. Server wins
+        // unconditionally — FL is the local pre-server guess, the
+        // server's full-fuzzy match is the source of truth.
+        if currentLineIdSetByFL && oldLine != lineId {
+            NSLog("[DIAG] StreamingRaagiModeEngine FL reconcile shabadId=\(currentId) flLineId=\(oldLine) serverLineId=\(lineId) (server wins)")
+        }
+        currentLineId = lineId
+        currentLineIdSetByFL = false  // server-driven now
+        currentDisplaySeq = seq
         NSLog("[DIAG] StreamingRaagiModeEngine display update: same-shabad highlight from=\(oldLine) to=\(lineId) seq=\(seq) tier=\(tier) score=\(String(format: "%.1f", score))")
         NSLog("[DIAG] StreamingRaagiModeEngine.currentShabad sticky shabadId=\(currentId) lineId=\(lineId) currentDisplaySeq=\(seq)")
     }
@@ -511,6 +559,89 @@ public final class StreamingRaagiModeEngine: ObservableObject {
             tier: tier,
             challengerMatchCount: winner.entry.matchCount
         )
+    }
+
+    // MARK: - First-letter local match (Brief #9.7)
+
+    /// Run a local first-letter match against the currently-locked
+    /// shabad's pre-computed FL signatures and, if exactly one pangti
+    /// matches, jump `currentLineId` to it immediately. This fires
+    /// on every server partial event — typically 100s of ms BEFORE
+    /// the corresponding `match` event arrives — so the highlight
+    /// tracks the raagi's voice with sub-100 ms felt latency.
+    ///
+    /// **CRITICAL: FL match NEVER swaps shabads.** It only adjusts
+    /// `currentLineId` within the currently-locked shabad. Cross-
+    /// shabad swap detection stays exclusively server-driven through
+    /// the #9.6 challenger logic. If the user starts singing a
+    /// different shabad, FL may briefly jump to a wrong pangti in
+    /// the current shabad (acceptable false positive); the server's
+    /// match event for the new shabad arrives ~1 s later and
+    /// challenger evidence accumulates as usual.
+    ///
+    /// **Sync, not async.** No actor hops, no await — all state
+    /// (`currentShabadFLSigs`, `currentLineId`, `lastFLMatchAttemptTime`)
+    /// lives on this @MainActor class. The FL match itself is a
+    /// linear walk over ~10-50 short string arrays; trivially fast.
+    private func handlePartialForFLMatch(transcript: String) {
+        // Gate: LOCKED state only. DISCOVERING uses single-slot
+        // pendingCandidate accumulation, not FL — the brief is
+        // explicit about FL never affecting discovery.
+        guard case .locked = lockState else { return }
+        guard !currentShabadFLSigs.isEmpty else { return }
+        if case .error = audioState { return }
+
+        // Cooldown — anti-flicker for burst partials.
+        if let last = lastFLMatchAttemptTime,
+           Date().timeIntervalSince(last) * 1000 < Double(Self.flCooldownMs) {
+            return
+        }
+
+        let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return }
+
+        var queryFL = FirstLetterSignature.extract(trimmed)
+        if queryFL.count < Self.flMinQueryLength { return }
+        if queryFL.count > Self.flMaxQueryLength {
+            queryFL = Array(queryFL.prefix(Self.flMaxQueryLength))
+        }
+
+        // Stamp the attempt timestamp BEFORE the walk so the
+        // cooldown gates the very next partial regardless of
+        // match outcome.
+        lastFLMatchAttemptTime = Date()
+
+        // Walk the current shabad's FL sigs for prefix matches.
+        var hits: [String] = []
+        hits.reserveCapacity(2)
+        for (lineId, sig) in currentShabadFLSigs {
+            if FirstLetterSignature.prefixMatch(query: queryFL, target: sig) {
+                hits.append(lineId)
+            }
+        }
+
+        let flStr = queryFL.joined(separator: " ")
+        let partialHead = String(trimmed.prefix(40)).replacingOccurrences(of: "\n", with: " ")
+        let currentId = currentShabad?.id ?? "nil"
+
+        if hits.count == 1 {
+            let matchedLineId = hits[0]
+            let oldLine = currentLineId ?? "nil"
+            if matchedLineId == oldLine {
+                // Already on this pangti — server-confirmed or
+                // FL-confirmed earlier. No display mutation needed;
+                // log compactly so the trace shows the FL path was
+                // alive but quiescent.
+                return
+            }
+            currentLineId = matchedLineId
+            currentLineIdSetByFL = true
+            NSLog("[DIAG] StreamingRaagiModeEngine FL local match shabadId=\(currentId) lineId=\(matchedLineId) partial='\(partialHead)' fl='\(flStr)' (jumped from \(oldLine))")
+        } else if hits.count > 1 {
+            NSLog("[DIAG] StreamingRaagiModeEngine FL ambiguous shabadId=\(currentId) candidates=\(hits.count) partial='\(partialHead)' fl='\(flStr)' (waiting)")
+        } else {
+            NSLog("[DIAG] StreamingRaagiModeEngine FL no match (current shabad) partial='\(partialHead)' fl='\(flStr)' (server will detect any cross-shabad change)")
+        }
     }
 
     // MARK: - Challenger helpers (Brief #9.6)
@@ -624,9 +755,13 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         seq: Int,
         tier: Int
     ) async {
+        // Brief #9.7: fetch shabad + FL sigs in a single actor call.
         let fetched: FullShabad
+        let sigs: [String: [String]]
         do {
-            fetched = try await cache.shabad(forId: shabadId)
+            let result = try await cache.shabadWithFLSignatures(forId: shabadId)
+            fetched = result.shabad
+            sigs = result.signatures
         } catch {
             NSLog("[DIAG] StreamingRaagiModeEngine lock fetch failed shabadId=\(shabadId): \(error.localizedDescription) — staying in DISCOVERING")
             return
@@ -638,6 +773,8 @@ public final class StreamingRaagiModeEngine: ObservableObject {
 
         currentShabad = fetched
         currentLineId = lineId
+        currentLineIdSetByFL = false  // server-driven, not FL
+        currentShabadFLSigs = sigs
         currentShabadRecentPeakScore = peakScore
         currentShabadRecentPeakTime = Date()
         currentDisplaySeq = seq
@@ -647,6 +784,7 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         // make sure the fresh lock starts with a clean slate.
         challengers.removeAll(keepingCapacity: true)
         lockState = .locked
+        NSLog("[DIAG] StreamingRaagiModeEngine FL snapshot shabadId=\(shabadId) sigsCount=\(sigs.count)")
 
         NSLog("[DIAG] StreamingRaagiModeEngine LOCK shabadId=\(shabadId) via=\(via) score=\(String(format: "%.1f", peakScore))")
         NSLog("[DIAG] StreamingRaagiModeEngine display update: first shabad shabadId=\(shabadId) lineId=\(lineId) seq=\(seq) tier=\(tier) score=\(String(format: "%.1f", peakScore))")
@@ -665,9 +803,14 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         tier: Int,
         challengerMatchCount: Int
     ) async {
+        // Brief #9.7: fetch shabad + FL sigs together for the new
+        // currentShabad.
         let fetched: FullShabad
+        let sigs: [String: [String]]
         do {
-            fetched = try await cache.shabad(forId: shabadId)
+            let result = try await cache.shabadWithFLSignatures(forId: shabadId)
+            fetched = result.shabad
+            sigs = result.signatures
         } catch {
             NSLog("[DIAG] StreamingRaagiModeEngine swap fetch failed shabadId=\(shabadId): \(error.localizedDescription) — keeping sticky display")
             return
@@ -680,6 +823,8 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         let prevId = currentShabad?.id ?? "nil"
         currentShabad = fetched
         currentLineId = lineId
+        currentLineIdSetByFL = false  // server-driven swap
+        currentShabadFLSigs = sigs
         currentShabadRecentPeakScore = score
         currentShabadRecentPeakTime = Date()
         currentDisplaySeq = seq
@@ -690,6 +835,7 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         // currentShabad context and shouldn't carry over.
         challengers.removeAll(keepingCapacity: true)
         // lockState stays .locked
+        NSLog("[DIAG] StreamingRaagiModeEngine FL snapshot shabadId=\(shabadId) sigsCount=\(sigs.count) (post-swap)")
 
         if via == "evidence" {
             NSLog("[DIAG] StreamingRaagiModeEngine SWAP from=\(prevId) to=\(shabadId) via=evidence challengerMatches=\(challengerMatchCount) latestScore=\(String(format: "%.1f", score))")
