@@ -41,34 +41,72 @@ public enum FirstLetterSignature {
             .filter { !$0.isEmpty }
     }
 
-    /// Prefix match: returns `true` iff `query` is a prefix of
-    /// `target`, element-wise. The brief allows the ASR to drop
-    /// trailing words (query shorter than target), so we require
-    /// `target.count >= query.count` and equality on the first
-    /// `query.count` entries.
-    public static func prefixMatch(query: [String], target: [String]) -> Bool {
-        if query.isEmpty { return false }
-        if target.count < query.count { return false }
-        for i in 0..<query.count {
-            if query[i] != target[i] { return false }
-        }
-        return true
-    }
-
-    /// Indices of every corpus entry whose FL signature has `query`
-    /// as a prefix. Caller decides what counts as "unique" /
-    /// "ambiguous" / "no match" based on the count of returned
-    /// indices.
-    public static func findCandidates(query: [String], corpus: [[String]]) -> [Int] {
-        if query.isEmpty { return [] }
-        var hits: [Int] = []
-        hits.reserveCapacity(4)
-        for (i, sig) in corpus.enumerated() {
-            if prefixMatch(query: query, target: sig) {
-                hits.append(i)
+    /// Longest contiguous run of `target` matching inside `query` at any
+    /// position. Returns (matchLength, startIndex) where startIndex is
+    /// the position in `query` where the match begins. Returns (0, -1)
+    /// if no match of length >= 1.
+    ///
+    /// Brief #9.9-iOS replacement for the broken `prefixMatch` (which
+    /// assumed query was a prefix of target — wrong direction for ASR
+    /// sliding-window partials where the partial FL is LONGER than any
+    /// pangti FL and the recent pangti's letters sit near the END of the
+    /// partial, not the start).
+    public static func longestSubstringMatch(query: [String], target: [String]) -> (length: Int, startIndex: Int) {
+        if query.isEmpty || target.isEmpty { return (0, -1) }
+        var bestLen = 0
+        var bestStart = -1
+        let maxStart = query.count - 1  // can start match at any position; match length capped by min(target.count, query.count - i)
+        for i in 0...maxStart {
+            let cap = min(target.count, query.count - i)
+            if cap <= bestLen { continue }  // can't improve from here
+            var matchLen = 0
+            while matchLen < cap && query[i + matchLen] == target[matchLen] {
+                matchLen += 1
+            }
+            if matchLen > bestLen {
+                bestLen = matchLen
+                bestStart = i
             }
         }
-        return hits
+        return (bestLen, bestStart)
+    }
+
+    /// Pick the best-matching pangti from a corpus of (lineId, FL) tuples.
+    /// Returns the lineId with the longest contiguous FL match in the partial.
+    /// Tie-break: prefer match closest to END of partial (most recently sung).
+    /// Returns nil if best match length < minMatchLength or if there's a
+    /// genuine tie (same matchLen at same endIndex across multiple pangtis).
+    public static func findBestPangti(query: [String], corpus: [(lineId: String, fl: [String])], minMatchLength: Int) -> (lineId: String, matchLength: Int, startIndex: Int)? {
+        if query.isEmpty || corpus.isEmpty { return nil }
+        var bestLineId: String? = nil
+        var bestLen = 0
+        var bestStart = -1
+        var tiedAtBest = false
+        for (lineId, fl) in corpus {
+            let (len, start) = longestSubstringMatch(query: query, target: fl)
+            if len < minMatchLength { continue }
+            // Compute "endIndex" = start + len; higher endIndex = more recent in partial.
+            let endIndex = start + len
+            let bestEndIndex = bestStart + bestLen
+            if len > bestLen {
+                bestLineId = lineId
+                bestLen = len
+                bestStart = start
+                tiedAtBest = false
+            } else if len == bestLen {
+                // Tie-break on recency (later endIndex wins).
+                if endIndex > bestEndIndex {
+                    bestLineId = lineId
+                    bestStart = start
+                    tiedAtBest = false
+                } else if endIndex == bestEndIndex {
+                    tiedAtBest = true
+                }
+            }
+        }
+        if tiedAtBest { return nil }  // ambiguous — don't pick
+        guard let id = bestLineId, bestLen >= minMatchLength else { return nil }
+        return (id, bestLen, bestStart)
     }
 
     // MARK: - Per-word extraction
