@@ -41,6 +41,51 @@ public enum FirstLetterSignature {
             .filter { !$0.isEmpty }
     }
 
+    /// Like ``extract``, but treats input as AnmolLipi / GurbaniAkhar
+    /// ASCII-encoded Gurmukhi. For each whitespace-delimited word,
+    /// looks up the first character in the canonical anvaad-js
+    /// AnmolLipi → Unicode mapping (defined in `AnmolLipi.mapping`,
+    /// same module), then keeps only single Gurmukhi base letters
+    /// (consonants + independent vowel carriers). Words whose first
+    /// char has no mapping or whose mapping yields no base letter
+    /// are skipped. Output shape is identical to ``extract``
+    /// (single-codepoint strings).
+    ///
+    /// Brief #9.11-iOS: BaniDB v4 stores AnmolLipi in `gurmukhi`; no
+    /// `_unicode` column yet. ShabadCache falls back here when
+    /// `gurmukhiUnicode` is nil so FL signatures live in the same
+    /// Unicode plane as the ASR partials (which is what the matcher
+    /// expects).
+    public static func extractFromAnmolLipi(_ text: String) -> [String] {
+        var out: [String] = []
+        out.reserveCapacity(16)
+        for word in text.split(whereSeparator: { $0.isWhitespace }) {
+            guard let first = word.first else { continue }
+            // Anvaad-js mapping lives on the existing internal
+            // `AnmolLipi` enum (same module). Its `mapping` is the
+            // canonical Khalsa Foundation port — using it directly
+            // avoids a hand-rolled fork that could disagree on
+            // edge cases (e.g. `a` → ੳ carrier vs ਅ vowel).
+            guard let mapped = AnmolLipi.mapping[first] else { continue }
+            // Some mappings produce multi-scalar outputs for
+            // combining marks (e.g. H → ੍ਹ, ƒ → ਨੂੰ). For FL
+            // purposes pick the FIRST Gurmukhi base scalar from the
+            // mapped value. Word-initial chars almost always yield
+            // a single base directly; this is defensive.
+            var letter: String = ""
+            for scalar in mapped.unicodeScalars {
+                if isGurmukhiBaseLetter(scalar) {
+                    letter = String(scalar)
+                    break
+                }
+            }
+            if !letter.isEmpty {
+                out.append(letter)
+            }
+        }
+        return out
+    }
+
     /// Longest contiguous run of matching first-letters between query and
     /// target, allowing the match to start at ANY position in EITHER array.
     /// Returns (matchLength, queryStart, targetStart).
