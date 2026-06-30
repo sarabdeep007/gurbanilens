@@ -682,10 +682,24 @@ public final class StreamingRaagiModeEngine: ObservableObject {
             NSLog("[DIAG] StreamingRaagiModeEngine FL confirm lineId=\(match.lineId) matchLen=\(match.matchLength) qStart=\(match.queryStart) tStart=\(match.targetStart) runnerUp=\(runnerStr) partialFL='\(flStr)'")
             return
         }
-        currentLineId = match.lineId
-        currentLineIdSetByFL = true
-        lastFLMatchLen = match.matchLength
-        NSLog("[DIAG] StreamingRaagiModeEngine FL local match shabadId=\(currentId) lineId=\(match.lineId) matchLen=\(match.matchLength) qStart=\(match.queryStart) tStart=\(match.targetStart) runnerUp=\(runnerStr) partialFL='\(flStr)' (jumped from \(oldLine))")
+        if match.matchLength >= Self.flWinsOverServerMatchLen {
+            // Brief #9.13: Only commit and claim FL ownership when match is
+            // strong enough to defend against the next server partial.
+            // Weak commits cause UI flicker because reconcile reverts them
+            // ~100ms later.
+            currentLineId = match.lineId
+            currentLineIdSetByFL = true
+            lastFLMatchLen = match.matchLength
+            NSLog("[DIAG] StreamingRaagiModeEngine FL local match committed shabadId=\(currentId) lineId=\(match.lineId) matchLen=\(match.matchLength) qStart=\(match.queryStart) tStart=\(match.targetStart) runnerUp=\(runnerStr) partialFL='\(flStr)' (jumped from \(oldLine))")
+        } else {
+            // Brief #9.13: Weak FL jump; advisory only. Don't change
+            // currentLineId/currentLineIdSetByFL — leaves UI on whatever
+            // line server most recently confirmed. Still update
+            // lastFLMatchLen so a strong server hold gate sees the new
+            // (low) FL strength.
+            lastFLMatchLen = match.matchLength
+            NSLog("[DIAG] StreamingRaagiModeEngine FL local match advisory shabadId=\(currentId) lineId=\(match.lineId) matchLen=\(match.matchLength) qStart=\(match.queryStart) tStart=\(match.targetStart) runnerUp=\(runnerStr) partialFL='\(flStr)' (would-jump from \(oldLine); below commit threshold \(Self.flWinsOverServerMatchLen))")
+        }
     }
 
     // MARK: - Challenger helpers (Brief #9.6)
