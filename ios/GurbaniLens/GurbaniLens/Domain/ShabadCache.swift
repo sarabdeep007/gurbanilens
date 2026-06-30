@@ -62,14 +62,22 @@ public actor ShabadCache {
         shabads[id] = built
 
         // Brief #9.7: precompute FL signatures for every pangti.
-        // Prefer the Unicode Gurmukhi field when available (cleaner
-        // for FL extraction); fall back to the Anmol-Lipi-style
-        // `gurmukhi` field otherwise.
+        // Brief #9.11: when `gurmukhiUnicode` is nil (BaniDB v4 has
+        // no `_unicode` column yet, so this is the common case), the
+        // raw `gurmukhi` is AnmolLipi/GurbaniAkhar ASCII — converting
+        // first letters to Unicode via the anvaad-js mapping is
+        // required so FL sigs live in the same Unicode plane as the
+        // ASR partials.
         var sigs: [String: [String]] = [:]
         sigs.reserveCapacity(filtered.count)
         for line in filtered {
-            let source = line.gurmukhiUnicode ?? line.gurmukhi
-            sigs[line.id] = FirstLetterSignature.extract(source)
+            let extracted: [String]
+            if let uni = line.gurmukhiUnicode, !uni.isEmpty {
+                extracted = FirstLetterSignature.extract(uni)
+            } else {
+                extracted = FirstLetterSignature.extractFromAnmolLipi(line.gurmukhi)
+            }
+            sigs[line.id] = extracted
         }
         flSignatures[id] = sigs
         NSLog("[DIAG] ShabadCache MISS id=\(id) fetchedLines=\(raw.count) keptLines=\(filtered.count) flSigsComputed=\(sigs.count) cachedCount=\(shabads.count)")
