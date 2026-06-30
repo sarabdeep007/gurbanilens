@@ -57,33 +57,14 @@ public enum FirstLetterSignature {
     /// Unicode plane as the ASR partials (which is what the matcher
     /// expects).
     public static func extractFromAnmolLipi(_ text: String) -> [String] {
-        var out: [String] = []
-        out.reserveCapacity(16)
-        for word in text.split(whereSeparator: { $0.isWhitespace }) {
-            guard let first = word.first else { continue }
-            // Anvaad-js mapping lives on the existing internal
-            // `AnmolLipi` enum (same module). Its `mapping` is the
-            // canonical Khalsa Foundation port — using it directly
-            // avoids a hand-rolled fork that could disagree on
-            // edge cases (e.g. `a` → ੳ carrier vs ਅ vowel).
-            guard let mapped = AnmolLipi.mapping[first] else { continue }
-            // Some mappings produce multi-scalar outputs for
-            // combining marks (e.g. H → ੍ਹ, ƒ → ਨੂੰ). For FL
-            // purposes pick the FIRST Gurmukhi base scalar from the
-            // mapped value. Word-initial chars almost always yield
-            // a single base directly; this is defensive.
-            var letter: String = ""
-            for scalar in mapped.unicodeScalars {
-                if isGurmukhiBaseLetter(scalar) {
-                    letter = String(scalar)
-                    break
-                }
-            }
-            if !letter.isEmpty {
-                out.append(letter)
-            }
-        }
-        return out
+        // Brief #9.13: Convert AnmolLipi → proper Unicode Gurmukhi
+        // FIRST using the canonical anvaad-js port, then extract first
+        // letters from the Unicode result. The previous single-char-map
+        // approach skipped whole words that start with sihari `i` (e.g.
+        // `iqin` for ਤਿਨਿ) because `i` is not a base letter; this is
+        // the standard AnmolLipi sihari-before-consonant convention.
+        let unicode = Gurmukhi.fromAnmolLipi(text)
+        return extract(unicode)
     }
 
     /// Longest contiguous run of matching first-letters between query and
