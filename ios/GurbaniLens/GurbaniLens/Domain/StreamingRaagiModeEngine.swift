@@ -238,10 +238,10 @@ public final class StreamingRaagiModeEngine: ObservableObject {
 
     // ── First-letter local match (Brief #9.7) ─────────────────
     /// Minimum number of first-letters in the query before we attempt
-    /// FL matching. Brief #9.9 bumped 2 → 3 to match the new
-    /// `flMinMatchLength` floor: we need at least 3 letters in the
-    /// partial to find a 3-letter substring match.
-    private static let flMinQueryLength: Int = 3
+    /// FL matching. Brief #9.10 lowered 3 → 2 so the FL path engages
+    /// the moment the partial has 2 letters — enables immediate
+    /// pangti-switch detection on the first two new letters.
+    private static let flMinQueryLength: Int = 2
     /// Hard cap on query length to keep match cheap. The walk over
     /// the shabad's FL sigs is already O(lines), this just bounds
     /// the inner substring comparison.
@@ -250,12 +250,12 @@ public final class StreamingRaagiModeEngine: ObservableObject {
     /// server emits a burst of partials within a short window. 150 ms
     /// is well below the partial cadence (~850 ms) in practice.
     private static let flCooldownMs: Int = 150
-    /// Brief #9.9-iOS: minimum length of the longest-contiguous FL
-    /// substring match before we trust it enough to jump the
-    /// highlight. 3 letters is enough to disambiguate within a
-    /// typical 10-30-line shabad while still picking up on the first
-    /// few sung syllables.
-    private static let flMinMatchLength: Int = 3
+    /// Brief #9.10-iOS: minimum length of the longest-common-substring
+    /// FL match before we trust it enough to jump the highlight.
+    /// Lowered 3 → 2 alongside the new generalized substring matcher
+    /// so the moment 2 new pangti letters appear in the partial, we
+    /// switch.
+    private static let flMinMatchLength: Int = 2
 
     // MARK: - Init
 
@@ -618,10 +618,8 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         // match outcome.
         lastFLMatchAttemptTime = Date()
 
-        // Walk the current shabad's FL sigs for substring matches.
-        // Best match = longest contiguous run of pangti's FL appearing
-        // anywhere in the partial. Tie-break: most recent (closest to
-        // end of partial). See FirstLetterSignature.findBestPangti.
+        // Find longest common substring between partial FL and any pangti
+        // in current shabad. See FirstLetterSignature.findBestPangti.
         let corpus: [(lineId: String, fl: [String])] = currentShabadFLSigs.map { ($0.key, $0.value) }
         let result = FirstLetterSignature.findBestPangti(
             query: queryFL,
@@ -633,20 +631,28 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         let partialHead = String(trimmed.prefix(40)).replacingOccurrences(of: "\n", with: " ")
         let currentId = currentShabad?.id ?? "nil"
 
-        guard let match = result else {
-            NSLog("[DIAG] StreamingRaagiModeEngine FL no match (current shabad) partial='\(partialHead)' fl='\(flStr)' (server will detect any cross-shabad change)")
+        guard let (match, runnerUp) = result else {
+            // Diagnostic: compute per-pangti best matches even when no match passed threshold
+            var perPangti: [String] = []
+            for (lid, fl) in corpus {
+                let (mlen, _, _) = FirstLetterSignature.longestSubstringMatch(query: queryFL, target: fl)
+                perPangti.append("\(lid):\(mlen)/\(fl.count)")
+            }
+            let detail = perPangti.joined(separator: " ")
+            NSLog("[DIAG] StreamingRaagiModeEngine FL no match shabadId=\(currentId) partial='\(partialHead)' partialFL='\(flStr)' bestPerPangti=[\(detail)] (server will detect any cross-shabad change)")
             return
         }
 
         let oldLine = currentLineId ?? "nil"
+        let runnerStr = runnerUp.map { "\($0.lineId):\($0.matchLength)" } ?? "none"
         if match.lineId == oldLine {
-            // Already on this pangti — FL-confirmed, quiescent.
-            NSLog("[DIAG] StreamingRaagiModeEngine FL confirm lineId=\(match.lineId) matchLen=\(match.matchLength) startIdx=\(match.startIndex) partial='\(partialHead)' fl='\(flStr)'")
+            // FL-confirmed quiescent
+            NSLog("[DIAG] StreamingRaagiModeEngine FL confirm lineId=\(match.lineId) matchLen=\(match.matchLength) qStart=\(match.queryStart) tStart=\(match.targetStart) runnerUp=\(runnerStr) partialFL='\(flStr)'")
             return
         }
         currentLineId = match.lineId
         currentLineIdSetByFL = true
-        NSLog("[DIAG] StreamingRaagiModeEngine FL local match shabadId=\(currentId) lineId=\(match.lineId) matchLen=\(match.matchLength) startIdx=\(match.startIndex) partial='\(partialHead)' fl='\(flStr)' (jumped from \(oldLine))")
+        NSLog("[DIAG] StreamingRaagiModeEngine FL local match shabadId=\(currentId) lineId=\(match.lineId) matchLen=\(match.matchLength) qStart=\(match.queryStart) tStart=\(match.targetStart) runnerUp=\(runnerStr) partialFL='\(flStr)' (jumped from \(oldLine))")
     }
 
     // MARK: - Challenger helpers (Brief #9.6)
@@ -790,6 +796,13 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         challengers.removeAll(keepingCapacity: true)
         lockState = .locked
         NSLog("[DIAG] StreamingRaagiModeEngine FL snapshot shabadId=\(shabadId) sigsCount=\(sigs.count)")
+        // Brief #9.10-iOS: dump every pangti's FL signature so traces
+        // show exactly what the matcher is working against — helps
+        // diagnose any remaining FL misses (unexpected normalization,
+        // weird unicode, segmentation differences vs ASR partial).
+        for (lineId, fl) in sigs {
+            NSLog("[DIAG] StreamingRaagiModeEngine FL pangti shabadId=\(shabadId) lineId=\(lineId) fl='\(fl.joined(separator: " "))'")
+        }
 
         NSLog("[DIAG] StreamingRaagiModeEngine LOCK shabadId=\(shabadId) via=\(via) score=\(String(format: "%.1f", peakScore))")
         NSLog("[DIAG] StreamingRaagiModeEngine display update: first shabad shabadId=\(shabadId) lineId=\(lineId) seq=\(seq) tier=\(tier) score=\(String(format: "%.1f", peakScore))")
@@ -841,6 +854,11 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         challengers.removeAll(keepingCapacity: true)
         // lockState stays .locked
         NSLog("[DIAG] StreamingRaagiModeEngine FL snapshot shabadId=\(shabadId) sigsCount=\(sigs.count) (post-swap)")
+        // Brief #9.10-iOS: dump every pangti's FL signature for the
+        // new locked shabad (same diagnostic purpose as the lockTo path).
+        for (lineId, fl) in sigs {
+            NSLog("[DIAG] StreamingRaagiModeEngine FL pangti shabadId=\(shabadId) lineId=\(lineId) fl='\(fl.joined(separator: " "))'")
+        }
 
         if via == "evidence" {
             NSLog("[DIAG] StreamingRaagiModeEngine SWAP from=\(prevId) to=\(shabadId) via=evidence challengerMatches=\(challengerMatchCount) latestScore=\(String(format: "%.1f", score))")
