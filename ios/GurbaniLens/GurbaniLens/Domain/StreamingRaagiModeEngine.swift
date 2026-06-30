@@ -177,6 +177,11 @@ public final class StreamingRaagiModeEngine: ObservableObject {
     /// reconciliation events for the DIAG trace. Reset to false on
     /// any server-driven line update.
     private var currentLineIdSetByFL: Bool = false
+    /// Brief #9.12: Length of the most recent FL local match. Used
+    /// to decide whether FL beats the server's lineId in
+    /// `handleSameShabadMatchInLock`. Reset whenever the line
+    /// changes via server, or on stop/reset.
+    private var lastFLMatchLen: Int = 0
     /// Wall-clock timestamp of the most recent FL match attempt.
     /// Used to cooldown-throttle the FL path so it doesn't fire more
     /// than once per ``flCooldownMs`` (anti-flicker for burst partials).
@@ -256,6 +261,11 @@ public final class StreamingRaagiModeEngine: ObservableObject {
     /// so the moment 2 new pangti letters appear in the partial, we
     /// switch.
     private static let flMinMatchLength: Int = 2
+    /// Brief #9.12: When local FL detects a line jump within the
+    /// locked shabad with at least this much match length, FL's
+    /// lineId wins over the server's per-partial lineId. Below this
+    /// threshold (e.g. matchLen 2-3), FL is noisy and server wins.
+    private static let flWinsOverServerMatchLen: Int = 4
 
     // MARK: - Init
 
@@ -283,6 +293,7 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         currentShabadRecentPeakTime = nil
         currentShabadFLSigs.removeAll(keepingCapacity: true)
         currentLineIdSetByFL = false
+        lastFLMatchLen = 0
         lastFLMatchAttemptTime = nil
         lockState = .discovering
         pendingCandidate = nil
@@ -343,6 +354,7 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         currentShabadRecentPeakTime = nil
         currentShabadFLSigs.removeAll(keepingCapacity: true)
         currentLineIdSetByFL = false
+        lastFLMatchLen = 0
         lastFLMatchAttemptTime = nil
         lockState = .discovering
         pendingCandidate = nil
@@ -489,15 +501,32 @@ public final class StreamingRaagiModeEngine: ObservableObject {
 
         let oldLine = currentLineId ?? "nil"
         let currentId = currentShabad?.id ?? "nil"
-        // Brief #9.7: if FL had set the current lineId and the
-        // server now disagrees, log the reconcile event. Server wins
-        // unconditionally — FL is the local pre-server guess, the
-        // server's full-fuzzy match is the source of truth.
+
+        // Brief #9.12: Within-shabad, when FL has a strong recent local
+        // match (matchLen >= threshold) and server disagrees on lineId,
+        // FL wins. Server's per-partial lineId is laggy because it
+        // matches against cumulative ASR text; FL detects line jumps
+        // faster from its local cache of the locked shabad's FL sigs.
+        if currentLineIdSetByFL
+           && oldLine != lineId
+           && lastFLMatchLen >= Self.flWinsOverServerMatchLen {
+            NSLog("[DIAG] StreamingRaagiModeEngine FL holds over server flLineId=\(oldLine) matchLen=\(lastFLMatchLen) serverLineId=\(lineId) (FL wins, threshold=\(Self.flWinsOverServerMatchLen))")
+            // Keep currentLineId = oldLine. Keep currentLineIdSetByFL = true.
+            // Still update display seq so we don't go backwards.
+            currentDisplaySeq = seq
+            NSLog("[DIAG] StreamingRaagiModeEngine display update: FL-held same-shabad lineId=\(oldLine) seq=\(seq) tier=\(tier) score=\(String(format: "%.1f", score))")
+            NSLog("[DIAG] StreamingRaagiModeEngine.currentShabad sticky shabadId=\(currentId) lineId=\(oldLine) currentDisplaySeq=\(seq)")
+            return
+        }
+
+        // Brief #9.7 / #9.12: below-threshold or no-FL case — server
+        // wins, log the reconcile event when FL had set the line.
         if currentLineIdSetByFL && oldLine != lineId {
-            NSLog("[DIAG] StreamingRaagiModeEngine FL reconcile shabadId=\(currentId) flLineId=\(oldLine) serverLineId=\(lineId) (server wins)")
+            NSLog("[DIAG] StreamingRaagiModeEngine FL reconcile shabadId=\(currentId) flLineId=\(oldLine) serverLineId=\(lineId) matchLen=\(lastFLMatchLen) (server wins, below threshold \(Self.flWinsOverServerMatchLen))")
         }
         currentLineId = lineId
         currentLineIdSetByFL = false  // server-driven now
+        lastFLMatchLen = 0
         currentDisplaySeq = seq
         NSLog("[DIAG] StreamingRaagiModeEngine display update: same-shabad highlight from=\(oldLine) to=\(lineId) seq=\(seq) tier=\(tier) score=\(String(format: "%.1f", score))")
         NSLog("[DIAG] StreamingRaagiModeEngine.currentShabad sticky shabadId=\(currentId) lineId=\(lineId) currentDisplaySeq=\(seq)")
@@ -646,12 +675,16 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         let oldLine = currentLineId ?? "nil"
         let runnerStr = runnerUp.map { "\($0.lineId):\($0.matchLength)" } ?? "none"
         if match.lineId == oldLine {
-            // FL-confirmed quiescent
+            // FL-confirmed quiescent — keep latest match strength so
+            // the FL-wins gate (Brief #9.12) reflects current confidence
+            // rather than the first jump's strength.
+            lastFLMatchLen = match.matchLength
             NSLog("[DIAG] StreamingRaagiModeEngine FL confirm lineId=\(match.lineId) matchLen=\(match.matchLength) qStart=\(match.queryStart) tStart=\(match.targetStart) runnerUp=\(runnerStr) partialFL='\(flStr)'")
             return
         }
         currentLineId = match.lineId
         currentLineIdSetByFL = true
+        lastFLMatchLen = match.matchLength
         NSLog("[DIAG] StreamingRaagiModeEngine FL local match shabadId=\(currentId) lineId=\(match.lineId) matchLen=\(match.matchLength) qStart=\(match.queryStart) tStart=\(match.targetStart) runnerUp=\(runnerStr) partialFL='\(flStr)' (jumped from \(oldLine))")
     }
 
