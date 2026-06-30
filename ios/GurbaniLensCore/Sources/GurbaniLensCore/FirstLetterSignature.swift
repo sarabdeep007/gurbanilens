@@ -41,72 +41,87 @@ public enum FirstLetterSignature {
             .filter { !$0.isEmpty }
     }
 
-    /// Longest contiguous run of `target` matching inside `query` at any
-    /// position. Returns (matchLength, startIndex) where startIndex is
-    /// the position in `query` where the match begins. Returns (0, -1)
-    /// if no match of length >= 1.
+    /// Longest contiguous run of matching first-letters between query and
+    /// target, allowing the match to start at ANY position in EITHER array.
+    /// Returns (matchLength, queryStart, targetStart).
     ///
-    /// Brief #9.9-iOS replacement for the broken `prefixMatch` (which
-    /// assumed query was a prefix of target — wrong direction for ASR
-    /// sliding-window partials where the partial FL is LONGER than any
-    /// pangti FL and the recent pangti's letters sit near the END of the
-    /// partial, not the start).
-    public static func longestSubstringMatch(query: [String], target: [String]) -> (length: Int, startIndex: Int) {
-        if query.isEmpty || target.isEmpty { return (0, -1) }
+    /// Brief #9.10-iOS generalization of #9.9. Previous version anchored the
+    /// match to target[0], so it required the pangti's FIRST letter to
+    /// appear in the partial. ASR sliding-window partials scroll past the
+    /// pangti's head quickly: by mid-pangti, partial FL = e.g. "ਪ ਸ ਚ" but
+    /// pangti FL = "ਤ ਵ ਨ ਲ ਪ ਸ" — the head "ਤ ਵ" is gone and the old
+    /// algorithm returned 0. True longest-common-substring (any qStart,
+    /// any tStart) now matches "ਪ ਸ" inside the pangti's middle.
+    ///
+    /// Examples:
+    ///   query=[ਪ,ਸ,ਚ], target=[ਤ,ਵ,ਨ,ਲ,ਪ,ਸ] → (2, 0, 4)
+    ///   query=[ਚ,ਹ,ਰ,ਕ,ਦ], target=[ਚ,ਹ,ਰ,ਕ] → (4, 0, 0)
+    ///   query=[ਬ,ਪ,ਸ,ਚ], target=[ਪ,ਸ,ਚ,ਹ] → (3, 1, 0)
+    public static func longestSubstringMatch(query: [String], target: [String]) -> (length: Int, queryStart: Int, targetStart: Int) {
+        if query.isEmpty || target.isEmpty { return (0, -1, -1) }
         var bestLen = 0
-        var bestStart = -1
-        let maxStart = query.count - 1  // can start match at any position; match length capped by min(target.count, query.count - i)
-        for i in 0...maxStart {
-            let cap = min(target.count, query.count - i)
-            if cap <= bestLen { continue }  // can't improve from here
-            var matchLen = 0
-            while matchLen < cap && query[i + matchLen] == target[matchLen] {
-                matchLen += 1
-            }
-            if matchLen > bestLen {
-                bestLen = matchLen
-                bestStart = i
-            }
-        }
-        return (bestLen, bestStart)
-    }
-
-    /// Pick the best-matching pangti from a corpus of (lineId, FL) tuples.
-    /// Returns the lineId with the longest contiguous FL match in the partial.
-    /// Tie-break: prefer match closest to END of partial (most recently sung).
-    /// Returns nil if best match length < minMatchLength or if there's a
-    /// genuine tie (same matchLen at same endIndex across multiple pangtis).
-    public static func findBestPangti(query: [String], corpus: [(lineId: String, fl: [String])], minMatchLength: Int) -> (lineId: String, matchLength: Int, startIndex: Int)? {
-        if query.isEmpty || corpus.isEmpty { return nil }
-        var bestLineId: String? = nil
-        var bestLen = 0
-        var bestStart = -1
-        var tiedAtBest = false
-        for (lineId, fl) in corpus {
-            let (len, start) = longestSubstringMatch(query: query, target: fl)
-            if len < minMatchLength { continue }
-            // Compute "endIndex" = start + len; higher endIndex = more recent in partial.
-            let endIndex = start + len
-            let bestEndIndex = bestStart + bestLen
-            if len > bestLen {
-                bestLineId = lineId
-                bestLen = len
-                bestStart = start
-                tiedAtBest = false
-            } else if len == bestLen {
-                // Tie-break on recency (later endIndex wins).
-                if endIndex > bestEndIndex {
-                    bestLineId = lineId
-                    bestStart = start
-                    tiedAtBest = false
-                } else if endIndex == bestEndIndex {
-                    tiedAtBest = true
+        var bestQS = -1
+        var bestTS = -1
+        for qStart in 0..<query.count {
+            for tStart in 0..<target.count {
+                let cap = min(query.count - qStart, target.count - tStart)
+                if cap <= bestLen { continue }
+                var matchLen = 0
+                while matchLen < cap && query[qStart + matchLen] == target[tStart + matchLen] {
+                    matchLen += 1
+                }
+                if matchLen > bestLen {
+                    bestLen = matchLen
+                    bestQS = qStart
+                    bestTS = tStart
                 }
             }
         }
-        if tiedAtBest { return nil }  // ambiguous — don't pick
-        guard let id = bestLineId, bestLen >= minMatchLength else { return nil }
-        return (id, bestLen, bestStart)
+        return (bestLen, bestQS, bestTS)
+    }
+
+    /// One pangti's match against a query, with the position the match
+    /// was found at on each side. Brief #9.10-iOS.
+    public struct PangtiMatchResult {
+        public let lineId: String
+        public let matchLength: Int
+        public let queryStart: Int
+        public let targetStart: Int
+    }
+
+    /// Pick the best-matching pangti from a corpus. Tie-break: prefer match
+    /// closest to END of query (most recently sung). Returns nil if best
+    /// matchLength < minMatchLength OR if there's a genuine tie at the same
+    /// queryEnd across multiple pangtis. ALSO returns the second-best as a
+    /// runner-up for diagnostics.
+    public static func findBestPangti(query: [String], corpus: [(lineId: String, fl: [String])], minMatchLength: Int) -> (best: PangtiMatchResult, runnerUp: PangtiMatchResult?)? {
+        if query.isEmpty || corpus.isEmpty { return nil }
+        // Compute match for every pangti
+        var all: [PangtiMatchResult] = []
+        for (lineId, fl) in corpus {
+            let (len, qs, ts) = longestSubstringMatch(query: query, target: fl)
+            all.append(PangtiMatchResult(lineId: lineId, matchLength: len, queryStart: qs, targetStart: ts))
+        }
+        // Sort: longest match first; tie-break by larger queryStart+matchLength (later in query = more recent)
+        all.sort { a, b in
+            if a.matchLength != b.matchLength { return a.matchLength > b.matchLength }
+            let aEnd = a.queryStart + a.matchLength
+            let bEnd = b.queryStart + b.matchLength
+            return aEnd > bEnd
+        }
+        let best = all[0]
+        guard best.matchLength >= minMatchLength else { return nil }
+        // Check for genuine tie at top: same matchLength AND same queryEnd
+        if all.count >= 2 {
+            let second = all[1]
+            let bestEnd = best.queryStart + best.matchLength
+            let secondEnd = second.queryStart + second.matchLength
+            if second.matchLength == best.matchLength && secondEnd == bestEnd {
+                return nil  // ambiguous
+            }
+            return (best, second)
+        }
+        return (best, nil)
     }
 
     // MARK: - Per-word extraction
