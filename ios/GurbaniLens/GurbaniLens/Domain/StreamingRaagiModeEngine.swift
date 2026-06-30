@@ -668,6 +668,11 @@ public final class StreamingRaagiModeEngine: ObservableObject {
                 perPangti.append("\(lid):\(mlen)/\(fl.count)")
             }
             let detail = perPangti.joined(separator: " ")
+            // Brief #9.13: When FL can't find a match at all, drop FL
+            // ownership so a subsequent strong server signal can take
+            // over without being blocked by stale FL state.
+            currentLineIdSetByFL = false
+            lastFLMatchLen = 0
             NSLog("[DIAG] StreamingRaagiModeEngine FL no match shabadId=\(currentId) partial='\(partialHead)' partialFL='\(flStr)' bestPerPangti=[\(detail)] (server will detect any cross-shabad change)")
             return
         }
@@ -679,7 +684,16 @@ public final class StreamingRaagiModeEngine: ObservableObject {
             // the FL-wins gate (Brief #9.12) reflects current confidence
             // rather than the first jump's strength.
             lastFLMatchLen = match.matchLength
-            NSLog("[DIAG] StreamingRaagiModeEngine FL confirm lineId=\(match.lineId) matchLen=\(match.matchLength) qStart=\(match.queryStart) tStart=\(match.targetStart) runnerUp=\(runnerStr) partialFL='\(flStr)'")
+            if match.matchLength >= Self.flWinsOverServerMatchLen {
+                // Brief #9.13: When FL strongly confirms the current line,
+                // claim FL ownership so the next server disagreement on
+                // same shabad triggers the FL-holds defense in
+                // handleSameShabadMatchInLock. Without this, FL ownership
+                // is only set via the "jumped" path and is reset by every
+                // server confirm — leaving FL strength purely informational.
+                currentLineIdSetByFL = true
+            }
+            NSLog("[DIAG] StreamingRaagiModeEngine FL confirm lineId=\(match.lineId) matchLen=\(match.matchLength) qStart=\(match.queryStart) tStart=\(match.targetStart) runnerUp=\(runnerStr) partialFL='\(flStr)' ownership=\(currentLineIdSetByFL ? "FL" : "server")")
             return
         }
         if match.matchLength >= Self.flWinsOverServerMatchLen {
