@@ -71,6 +71,36 @@ public enum SungModeLockDecision: Equatable {
     )
 }
 
+/// Brief #9.21-iOS: decision returned from
+/// `SungModeAccumulatorStore.processMatchInLocked`. Distinct from
+/// `SungModeLockDecision` because LOCKED-state semantics differ:
+/// same-shabad matches feed the accumulator to refresh the current
+/// shabad's weight, but they can never *decide* to swap. Only a
+/// non-current shabad emerging as the leader (and clearing the
+/// threshold + ratio-vs-current + hits gates) yields `.reLock`.
+public enum SungModeLockedDecision: Equatable {
+    /// Either the current shabad is still the leader, or no
+    /// challenger has met the re-lock thresholds. Caller emits the
+    /// per-brief `sungMode locked-acc …` DIAG line and continues
+    /// normal same-shabad / cross-shabad handling.
+    case noSwap(top3Summary: String, slotCount: Int, currentWeight: Double)
+    /// A non-current shabad's accumulator weight dominates the
+    /// current shabad's decayed weight past all three thresholds.
+    /// Caller should invoke its `lockTo(...)` equivalent with a
+    /// via-tag of "sungReLock".
+    /// - Parameters:
+    ///   - currentWeight: current shabad's decayed weight at the
+    ///     time of the check (diagnostic).
+    case reLock(
+        shabadId: String,
+        peakScore: Double,
+        weight: Double,
+        hitCount: Int,
+        currentWeight: Double,
+        tiers: [Int]
+    )
+}
+
 /// Pure-value store for sung-mode discovery accumulation. Owns the
 /// `[shabadId: SungModeAccumulator]` dict and exposes a single
 /// `processMatch(...)` API that:
@@ -142,11 +172,132 @@ public struct SungModeAccumulatorStore: Equatable {
         tier: Int,
         now: Date = Date()
     ) -> SungModeLockDecision {
-        // 1. Floor-check the incoming hit.
-        guard score >= Self.minScore else {
-            let summary = topSummary(top: 3)
-            return .noLock(top3Summary: summary, slotCount: slots.count)
+        guard ingestMatch(shabadId: shabadId, score: score, tier: tier, now: now) else {
+            return .noLock(top3Summary: topSummary(top: 3), slotCount: slots.count)
         }
+
+        // Find leader + runner-up (by weight).
+        let sorted = slots.sorted { $0.value.totalWeight > $1.value.totalWeight }
+        guard let (topId, topAcc) = sorted.first else {
+            return .noLock(top3Summary: "", slotCount: 0)
+        }
+        let runnerWeight: Double = sorted.dropFirst().first?.value.totalWeight ?? 0.001
+
+        let hasWeight = topAcc.totalWeight >= Self.lockWeightThreshold
+        let hasRatio = topAcc.totalWeight >= runnerWeight * Self.lockRatio
+        let hasHits = topAcc.hitCount >= Self.minHits
+        if hasWeight && hasRatio && hasHits {
+            return .lock(
+                shabadId: topId,
+                peakScore: topAcc.maxScoreSeen,
+                weight: topAcc.totalWeight,
+                hitCount: topAcc.hitCount,
+                runnerUpWeight: runnerWeight,
+                tiers: topAcc.lastTiers
+            )
+        }
+
+        return .noLock(top3Summary: topSummary(top: 3), slotCount: slots.count)
+    }
+
+    /// Brief #9.21-iOS: process a match event while the engine is
+    /// already LOCKED on `currentShabadId`. Same ingest pipeline as
+    /// ``processMatch`` (floor-check → decay → update-or-create →
+    /// stale-evict → LRU-cap). Then routes to either:
+    ///   - `.reLock(...)` when a NON-current shabad is the leader
+    ///     AND clears weight + ratio-vs-current + hits thresholds
+    ///   - `.noSwap(...)` otherwise (including when current is
+    ///     leader, which is the common same-shabad refresh path)
+    ///
+    /// Callers should feed BOTH same-shabad and cross-shabad matches
+    /// into this method while singingModeEnabled == true and state
+    /// == .locked. Same-shabad calls refresh current's weight so it
+    /// doesn't decay unfairly; cross-shabad calls build challenger
+    /// weight that can eventually trigger a re-lock.
+    public mutating func processMatchInLocked(
+        shabadId: String,
+        score: Double,
+        tier: Int,
+        currentShabadId: String,
+        now: Date = Date()
+    ) -> SungModeLockedDecision {
+        guard ingestMatch(shabadId: shabadId, score: score, tier: tier, now: now) else {
+            let currentWeight = slots[currentShabadId]?.totalWeight ?? 0.001
+            return .noSwap(top3Summary: topSummary(top: 3), slotCount: slots.count, currentWeight: currentWeight)
+        }
+
+        // Refresh currentWeight AFTER the ingest — if the incoming
+        // match was for the current shabad, ingest just added to its
+        // weight and we want the post-add value in the decision.
+        let currentWeight = slots[currentShabadId]?.totalWeight ?? 0.001
+
+        let sorted = slots.sorted { $0.value.totalWeight > $1.value.totalWeight }
+        guard let (topId, topAcc) = sorted.first else {
+            return .noSwap(top3Summary: "", slotCount: 0, currentWeight: currentWeight)
+        }
+
+        // Current shabad is (still) the leader → common same-shabad
+        // path. No swap; the log entry is the diagnostic value.
+        if topId == currentShabadId {
+            return .noSwap(top3Summary: topSummary(top: 3), slotCount: slots.count, currentWeight: currentWeight)
+        }
+
+        // Some other shabad is now the leader. Check re-lock condition
+        // against current shabad's decayed weight instead of the raw
+        // runner-up weight — the semantic question is "does this
+        // challenger dominate the CURRENTLY-DISPLAYED shabad", not
+        // "does it dominate the second-place slot".
+        let hasWeight = topAcc.totalWeight >= Self.lockWeightThreshold
+        let hasRatio = topAcc.totalWeight >= currentWeight * Self.lockRatio
+        let hasHits = topAcc.hitCount >= Self.minHits
+        if hasWeight && hasRatio && hasHits {
+            return .reLock(
+                shabadId: topId,
+                peakScore: topAcc.maxScoreSeen,
+                weight: topAcc.totalWeight,
+                hitCount: topAcc.hitCount,
+                currentWeight: currentWeight,
+                tiers: topAcc.lastTiers
+            )
+        }
+        return .noSwap(top3Summary: topSummary(top: 3), slotCount: slots.count, currentWeight: currentWeight)
+    }
+
+    /// Brief #9.21-iOS: cap the given shabad's weight at `cap` (default
+    /// `lockWeightThreshold` = 100). Called by the engine right after
+    /// a fresh LOCK or RE-LOCK so pre-lock overkill weight (e.g. BSJ
+    /// hitting 146) doesn't make subsequent re-locks require an
+    /// impossibly large challenger (146 * 1.5 = 219 vs the natural
+    /// 100 * 1.5 = 150). No-op if the shabad has no slot or its
+    /// current weight is already ≤ cap.
+    public mutating func capWeight(
+        shabadId: String,
+        cap: Double = SungModeAccumulatorStore.lockWeightThreshold
+    ) {
+        guard var acc = slots[shabadId] else { return }
+        if acc.totalWeight > cap {
+            acc.totalWeight = cap
+            slots[shabadId] = acc
+        }
+    }
+
+    // MARK: - Internal ingest pipeline
+
+    /// Common ingest pipeline shared by ``processMatch`` and
+    /// ``processMatchInLocked``: floor-check the incoming score,
+    /// decay every existing slot to `now`, update-or-create the
+    /// target slot, evict stale slots, enforce the LRU cap. Returns
+    /// `true` when the hit was counted (score ≥ minScore), `false`
+    /// when it was rejected as noise — callers use this to short-
+    /// circuit their decision logic.
+    private mutating func ingestMatch(
+        shabadId: String,
+        score: Double,
+        tier: Int,
+        now: Date
+    ) -> Bool {
+        // 1. Floor-check the incoming hit.
+        guard score >= Self.minScore else { return false }
         let tierClamped = max(0, min(tier, Self.tierMultiplier.count - 1))
         let addedWeight = score * Self.tierMultiplier[tierClamped]
 
@@ -195,32 +346,7 @@ public struct SungModeAccumulatorStore: Equatable {
                 slots.removeValue(forKey: id)
             }
         }
-
-        // 6. Find leader + runner-up (by weight).
-        let sorted = slots.sorted { $0.value.totalWeight > $1.value.totalWeight }
-        guard let (topId, topAcc) = sorted.first else {
-            return .noLock(top3Summary: "", slotCount: 0)
-        }
-        let runnerWeight: Double = sorted.dropFirst().first?.value.totalWeight ?? 0.001
-
-        // 7. Lock condition.
-        let hasWeight = topAcc.totalWeight >= Self.lockWeightThreshold
-        let hasRatio = topAcc.totalWeight >= runnerWeight * Self.lockRatio
-        let hasHits = topAcc.hitCount >= Self.minHits
-        if hasWeight && hasRatio && hasHits {
-            return .lock(
-                shabadId: topId,
-                peakScore: topAcc.maxScoreSeen,
-                weight: topAcc.totalWeight,
-                hitCount: topAcc.hitCount,
-                runnerUpWeight: runnerWeight,
-                tiers: topAcc.lastTiers
-            )
-        }
-
-        // 8. No lock yet — return top-3 summary for logging.
-        let summary = topSummary(top: 3)
-        return .noLock(top3Summary: summary, slotCount: slots.count)
+        return true
     }
 
     /// Drop all slots.
