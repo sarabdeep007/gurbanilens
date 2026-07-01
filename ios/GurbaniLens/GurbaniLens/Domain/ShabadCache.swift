@@ -93,7 +93,7 @@ public actor ShabadCache {
         let corpusForUnique: [(lineId: String, fl: [String])] = sigs.map { ($0.key, $0.value) }
         let starters = FirstLetterSignature.safeUniqueStarters(corpus: corpusForUnique)
         safeStarters[id] = starters
-        NSLog("[DIAG] ShabadCache safeUniqueStarters id=\(id) count=\(starters.count) letters=\(starters.keys.sorted().joined(separator: \",\"))")
+        NSLog("[DIAG] ShabadCache safeUniqueStarters id=\(id) count=\(starters.count) letters=\(starters.keys.sorted().joined(separator: ","))")
 
         NSLog("[DIAG] ShabadCache MISS id=\(id) fetchedLines=\(raw.count) keptLines=\(filtered.count) flSigsComputed=\(sigs.count) safeStarters=\(starters.count) cachedCount=\(shabads.count)")
         return built
