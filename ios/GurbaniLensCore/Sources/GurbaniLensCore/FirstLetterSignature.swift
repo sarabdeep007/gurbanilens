@@ -212,6 +212,70 @@ public enum FirstLetterSignature {
         return nil
     }
 
+    // MARK: - Safely-unique starter bigrams (Brief #9.19)
+
+    /// Compute the safely-unique starter-bigram map for a shabad's FL signatures.
+    /// Returns bigramKey → lineId where bigramKey encodes a pair as "L1|L2".
+    /// A bigram (L1, L2) qualifies iff (a) it's some pangti X's first two FL
+    /// letters AND (b) the consecutive pair (L1, L2) does not appear at any
+    /// position in any other pangti's FL. Zero false-positive guarantee analogous
+    /// to safeUniqueStarters. Brief #9.19.
+    public static func safeUniqueBigramStarters(corpus: [(lineId: String, fl: [String])]) -> [String: String] {
+        if corpus.isEmpty { return [:] }
+        // Step 1: count each consecutive bigram across all pangtis, deduped within
+        // a single pangti (a bigram appearing twice in the same pangti counts once).
+        var globalCount: [String: Int] = [:]
+        for (_, fl) in corpus {
+            if fl.count < 2 { continue }
+            var seenInPangti = Set<String>()
+            for i in 0..<(fl.count - 1) {
+                let key = "\(fl[i])|\(fl[i + 1])"
+                if seenInPangti.insert(key).inserted {
+                    globalCount[key, default: 0] += 1
+                }
+            }
+        }
+        // Step 2: for each pangti's starter bigram, check total count == 1.
+        var result: [String: String] = [:]
+        for (lineId, fl) in corpus {
+            guard fl.count >= 2 else { continue }
+            let starterKey = "\(fl[0])|\(fl[1])"
+            if globalCount[starterKey] == 1 {
+                result[starterKey] = lineId
+            }
+        }
+        return result
+    }
+
+    /// Scan trailing N letters of queryFL for any safely-unique starter bigram.
+    /// Checks each consecutive bigram in the trailing slice, RIGHT-TO-LEFT (most
+    /// recent bigram first). Returns the matched (bigram-as-tuple, lineId) for
+    /// the rightmost hit. Returns nil if no trailing bigram is a safe starter.
+    /// Brief #9.19.
+    public static func findTrailingSafeUniqueBigram(
+        queryFL: [String],
+        safeBigrams: [String: String],
+        trailingWindow: Int
+    ) -> (bigram: (String, String), lineId: String)? {
+        if queryFL.count < 2 || safeBigrams.isEmpty { return nil }
+        let windowSize = min(trailingWindow, queryFL.count)
+        // Trailing slice is the last `windowSize` letters. Bigrams in that slice
+        // start at positions [queryFL.count - windowSize ... queryFL.count - 2].
+        let startIdx = queryFL.count - windowSize
+        let lastBigramStart = queryFL.count - 2
+        if lastBigramStart < startIdx { return nil }
+        // Iterate right-to-left over bigram start positions.
+        for i in stride(from: lastBigramStart, through: startIdx, by: -1) {
+            let a = queryFL[i]
+            let b = queryFL[i + 1]
+            let key = "\(a)|\(b)"
+            if let lineId = safeBigrams[key] {
+                return ((a, b), lineId)
+            }
+        }
+        return nil
+    }
+
     // MARK: - Per-word extraction
 
     /// First-letter for a single word. Detects script per-word so

@@ -154,4 +154,162 @@ final class FirstLetterSignatureTests: XCTestCase {
         XCTAssertEqual(hit?.letter, "ਉ")
         XCTAssertEqual(hit?.lineId, "P4")
     }
+
+    // MARK: - safeUniqueBigramStarters (Brief #9.19)
+
+    func testSafeUniqueBigrams_bsjExample() {
+        // Documented BSJ shabad from Deep's data. ALL 6 pangtis should have
+        // safely-unique starter bigrams. Constructed FL arrays such that each
+        // pangti's starter bigram appears nowhere else as a consecutive pair.
+        //   D7PD (ਤ, ਵ) — ਤਾਤੀ ਵਾਉ …
+        //   XLVS (ਚ, ਹ) — ਚਉਗਿਰਦ ਹਮਾਰੈ …
+        //   H0Y2 (ਸ, ਪ) — ਸੁਖਿ ਪਧਾਰੇ …
+        //   90CQ (ਕ, ਨ) — ਕੋਟਿ ਨਾਰਾਇਣ …
+        //   RENR (ਰ, ਨ) — ਰਾਖਨਹਾਰ …
+        //   H942 (ਰ, ਲ) — ਰਖੁ ਲੇਹੁ …
+        // Shared letters (ਰ in RENR and H942; ਲ in D7PD/XLVS/H942) are fine —
+        // the algorithm only cares about consecutive pairs.
+        let corpus: [(lineId: String, fl: [String])] = [
+            ("D7PD", ["ਤ", "ਵ", "ਨ", "ਲ", "ਪ", "ਸ"]),
+            ("XLVS", ["ਚ", "ਹ", "ਰ", "ਕ", "ਦ", "ਲ", "ਨ", "ਬ"]),
+            ("H0Y2", ["ਸ", "ਪ", "ਭ", "ਜ", "ਬ", "ਬ"]),
+            ("90CQ", ["ਕ", "ਨ", "ਪ", "ਹ"]),
+            ("RENR", ["ਰ", "ਨ", "ਖ", "ਮ", "ਦ"]),
+            ("H942", ["ਰ", "ਲ", "ਤ", "ਰ", "ਸ", "ਬ", "ਮ"]),
+        ]
+        let result = FirstLetterSignature.safeUniqueBigramStarters(corpus: corpus)
+        XCTAssertEqual(result.count, 6)
+        XCTAssertEqual(result["ਤ|ਵ"], "D7PD")
+        XCTAssertEqual(result["ਚ|ਹ"], "XLVS")
+        XCTAssertEqual(result["ਸ|ਪ"], "H0Y2")
+        XCTAssertEqual(result["ਕ|ਨ"], "90CQ")
+        XCTAssertEqual(result["ਰ|ਨ"], "RENR")
+        XCTAssertEqual(result["ਰ|ਲ"], "H942")
+    }
+
+    func testSafeUniqueBigrams_sharedStarterBigram() {
+        // Two pangtis both start with (ਸ, ਤ) → neither in map. Third pangti's
+        // starter (ਪ, ਨ) appears nowhere else → safely-unique.
+        let corpus: [(lineId: String, fl: [String])] = [
+            ("P1", ["ਸ", "ਤ", "ਵ"]),
+            ("P2", ["ਸ", "ਤ", "ਹ"]),
+            ("P3", ["ਪ", "ਨ", "ਲ"]),
+        ]
+        let result = FirstLetterSignature.safeUniqueBigramStarters(corpus: corpus)
+        XCTAssertNil(result["ਸ|ਤ"])
+        XCTAssertEqual(result["ਪ|ਨ"], "P3")
+    }
+
+    func testSafeUniqueBigrams_midPositionFails() {
+        // P1 starter is (ਕ, ਤ). P2 has (ਕ, ਤ) as mid-position consecutive pair.
+        // → (ਕ, ਤ) NOT safely-unique for P1. P2's own starter (ਹ, ਕ) is safe.
+        let corpus: [(lineId: String, fl: [String])] = [
+            ("P1", ["ਕ", "ਤ", "ਸ"]),
+            ("P2", ["ਹ", "ਕ", "ਤ", "ਵ"]),
+        ]
+        let result = FirstLetterSignature.safeUniqueBigramStarters(corpus: corpus)
+        XCTAssertNil(result["ਕ|ਤ"])
+        XCTAssertEqual(result["ਹ|ਕ"], "P2")
+    }
+
+    func testSafeUniqueBigrams_repeatedInSamePangtiDoesntPenalize() {
+        // X has (ਕ, ਤ) as starter AND repeats mid-pangti. Dedup-within-pangti
+        // should keep (ਕ, ਤ)'s global count at 1 (only in X) → safely-unique.
+        let corpus: [(lineId: String, fl: [String])] = [
+            ("X", ["ਕ", "ਤ", "ਸ", "ਕ", "ਤ"]),
+            ("Y", ["ਹ", "ਪ", "ਲ"]),
+        ]
+        let result = FirstLetterSignature.safeUniqueBigramStarters(corpus: corpus)
+        XCTAssertEqual(result["ਕ|ਤ"], "X")
+        XCTAssertEqual(result["ਹ|ਪ"], "Y")
+    }
+
+    func testSafeUniqueBigrams_singleLetterPangti() {
+        // Pangti with only 1 FL letter has no starter bigram — excluded.
+        let corpus: [(lineId: String, fl: [String])] = [
+            ("P1", ["ਕ"]),
+            ("P2", ["ਸ", "ਤ", "ਵ"]),
+        ]
+        let result = FirstLetterSignature.safeUniqueBigramStarters(corpus: corpus)
+        XCTAssertEqual(result.count, 1)
+        XCTAssertEqual(result["ਸ|ਤ"], "P2")
+    }
+
+    func testSafeUniqueBigrams_emptyCorpus() {
+        let corpus: [(lineId: String, fl: [String])] = []
+        let result = FirstLetterSignature.safeUniqueBigramStarters(corpus: corpus)
+        XCTAssertTrue(result.isEmpty)
+    }
+
+    // MARK: - findTrailingSafeUniqueBigram (Brief #9.19)
+
+    func testFindTrailingSafeUniqueBigram_basic() {
+        // queryFL = [A, B, ਚ, ਹ]; safe bigram (ਚ, ਹ) → P4.
+        let query = ["A", "B", "ਚ", "ਹ"]
+        let bigrams = ["ਚ|ਹ": "P4"]
+        let hit = FirstLetterSignature.findTrailingSafeUniqueBigram(
+            queryFL: query, safeBigrams: bigrams, trailingWindow: 4
+        )
+        XCTAssertNotNil(hit)
+        XCTAssertEqual(hit?.bigram.0, "ਚ")
+        XCTAssertEqual(hit?.bigram.1, "ਹ")
+        XCTAssertEqual(hit?.lineId, "P4")
+    }
+
+    func testFindTrailingSafeUniqueBigram_recentFirst() {
+        // Two trailing bigram hits — rightmost (most recent) wins.
+        // queryFL = [ਚ, ਹ, ਕ, ਖ, ਬ, ਵ]; safes {ਚ|ਹ: P1, ਬ|ਵ: P2}.
+        // Bigrams checked right-to-left: (ਬ,ਵ) at pos 4 hits first → P2.
+        let query = ["ਚ", "ਹ", "ਕ", "ਖ", "ਬ", "ਵ"]
+        let bigrams = ["ਚ|ਹ": "P1", "ਬ|ਵ": "P2"]
+        let hit = FirstLetterSignature.findTrailingSafeUniqueBigram(
+            queryFL: query, safeBigrams: bigrams, trailingWindow: 6
+        )
+        XCTAssertNotNil(hit)
+        XCTAssertEqual(hit?.bigram.0, "ਬ")
+        XCTAssertEqual(hit?.bigram.1, "ਵ")
+        XCTAssertEqual(hit?.lineId, "P2")
+    }
+
+    func testFindTrailingSafeUniqueBigram_respectsWindow() {
+        // Brief example: queryFL=[X,Y,ਚ,ਹ,Z,W], trailingWindow=3 → trailing
+        // slice is last 3 letters [ਹ, Z, W]. Bigrams within slice have start
+        // positions in [3..4]: (ਹ,Z) and (Z,W). (ਚ,ਹ) starts at position 2 —
+        // OUTSIDE window — even though ਹ itself is in-window. Not checked.
+        let query = ["X", "Y", "ਚ", "ਹ", "Z", "W"]
+        let bigrams = ["ਚ|ਹ": "P1"]
+        let hit = FirstLetterSignature.findTrailingSafeUniqueBigram(
+            queryFL: query, safeBigrams: bigrams, trailingWindow: 3
+        )
+        XCTAssertNil(hit)
+    }
+
+    func testFindTrailingSafeUniqueBigram_shortQuery() {
+        // queryFL.count < 2 — no bigram possible.
+        let query = ["ਚ"]
+        let bigrams = ["ਚ|ਹ": "P1"]
+        let hit = FirstLetterSignature.findTrailingSafeUniqueBigram(
+            queryFL: query, safeBigrams: bigrams, trailingWindow: 3
+        )
+        XCTAssertNil(hit)
+    }
+
+    func testFindTrailingSafeUniqueBigram_emptyBigrams() {
+        let query = ["ਚ", "ਹ", "ਪ"]
+        let bigrams: [String: String] = [:]
+        let hit = FirstLetterSignature.findTrailingSafeUniqueBigram(
+            queryFL: query, safeBigrams: bigrams, trailingWindow: 3
+        )
+        XCTAssertNil(hit)
+    }
+
+    func testFindTrailingSafeUniqueBigram_noMatch() {
+        // Trailing bigrams (ਖ,ਗ), (ਗ,ਘ) — neither in the map.
+        let query = ["ਖ", "ਗ", "ਘ"]
+        let bigrams = ["ਚ|ਹ": "P1"]
+        let hit = FirstLetterSignature.findTrailingSafeUniqueBigram(
+            queryFL: query, safeBigrams: bigrams, trailingWindow: 3
+        )
+        XCTAssertNil(hit)
+    }
 }
