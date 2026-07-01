@@ -561,11 +561,36 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         case .lock(let topId, let peakScore, let weight, let hitCount, let runnerUpWeight, let tiers):
             NSLog("[DIAG] StreamingRaagiModeEngine sungMode LOCK shabadId=\(topId) weight=\(String(format: "%.1f", weight)) hits=\(hitCount) runnerUpWeight=\(String(format: "%.1f", runnerUpWeight)) peakScore=\(String(format: "%.1f", peakScore)) tiers=\(tiers)")
             await lockTo(shabadId: topId, lineId: lineId, peakScore: peakScore, via: "sungAcc", seq: seq, tier: tier)
-            // Lock has taken us out of DISCOVERING — dict is dead
-            // state until stop(). Clear now so the memory doesn't
-            // linger.
-            sungStore.reset()
+            // Brief #9.21: keep the accumulator running post-lock so
+            // cross-shabad matches can build re-lock evidence. Cap
+            // the winner's weight to `lockWeightThreshold` (100) so
+            // pre-lock overkill weight (e.g. 146) doesn't make the
+            // NEXT re-lock require an impossibly-large challenger.
+            sungStore.capWeight(shabadId: topId)
         }
+    }
+
+    /// Brief #9.21: sung-mode cross-shabad re-lock. Called from
+    /// `handleDifferentShabadMatchInLock` when the accumulator
+    /// declares a new leader has crossed all three re-lock gates.
+    /// Clears speech-mode challenger state (built up under the old
+    /// currentShabad and now stale), reuses the existing
+    /// `lockTo(...)` pathway so all downstream side effects (FL
+    /// snapshot swap, `currentShabad`/`currentLineId` reset,
+    /// `currentDisplaySeq`, sticky-display log, UI update) fire
+    /// identically to a fresh discovery lock. Caps the new
+    /// winner's accumulator weight so subsequent re-locks stay
+    /// achievable.
+    private func performSungModeReLock(
+        shabadId: String,
+        lineId: String,
+        peakScore: Double,
+        seq: Int,
+        tier: Int
+    ) async {
+        challengers.removeAll()
+        await lockTo(shabadId: shabadId, lineId: lineId, peakScore: peakScore, via: "sungReLock", seq: seq, tier: tier)
+        sungStore.capWeight(shabadId: shabadId)
     }
 
     // ── LOCKED + same shabad ──────────────────────────────────────
@@ -576,6 +601,20 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         score: Double,
         tier: Int
     ) {
+        // Brief #9.21: refresh sung-mode accumulator with the same-
+        // shabad hit so its weight doesn't decay unfairly against
+        // future cross-shabad challengers. Same-shabad can never
+        // trigger reLock by definition (leader IS current), so we
+        // ignore the decision and just log the diagnostic.
+        if singingModeEnabled, let currentId = currentShabad?.id {
+            let decision = sungStore.processMatchInLocked(
+                shabadId: currentId, score: score, tier: tier, currentShabadId: currentId
+            )
+            if case .noSwap(let top3Summary, let slotCount, let currentWeight) = decision {
+                NSLog("[DIAG] StreamingRaagiModeEngine sungMode locked-acc seq=\(seq) same-shabad \(currentId) tier=\(tier) score=\(String(format: "%.1f", score)) → current:\(String(format: "%.1f", currentWeight)) top3=[\(top3Summary)] slotCount=\(slotCount)")
+            }
+        }
+
         // #9.3 logic: refresh time unconditionally, raise peak score
         // only when stronger. Anchor stays alive during continuous
         // singing across oscillating scores.
@@ -635,6 +674,29 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         score: Double,
         tier: Int
     ) async {
+        // Brief #9.21: sung-mode cross-shabad path. When the flag is
+        // on, feed the incoming match into the LOCKED-state
+        // accumulator. On .noSwap we still fall through to the
+        // speech-mode challenger logic below (harmless — the score
+        // < 70 floor filters out most sung matches; leaves the rare
+        // high-score short-circuit intact). On .reLock we swap
+        // shabads directly and return.
+        if singingModeEnabled, let currentId = currentShabad?.id {
+            let decision = sungStore.processMatchInLocked(
+                shabadId: shabadId, score: score, tier: tier, currentShabadId: currentId
+            )
+            switch decision {
+            case .noSwap(let top3Summary, let slotCount, let currentWeight):
+                NSLog("[DIAG] StreamingRaagiModeEngine sungMode locked-acc seq=\(seq) cross-shabad \(shabadId) tier=\(tier) score=\(String(format: "%.1f", score)) → current:\(String(format: "%.1f", currentWeight)) top3=[\(top3Summary)] slotCount=\(slotCount)")
+                // fall through to speech-mode challenger logic below
+            case .reLock(let topId, let peakScore, let weight, let hitCount, let currentWeight, let tiers):
+                let ratio = currentWeight > 0 ? weight / currentWeight : Double.infinity
+                NSLog("[DIAG] StreamingRaagiModeEngine sungMode RE-LOCK from=\(currentId) to=\(topId) currentWeight=\(String(format: "%.1f", currentWeight)) challengerWeight=\(String(format: "%.1f", weight)) ratio=\(String(format: "%.2f", ratio)) hits=\(hitCount) tiers=\(tiers)")
+                await performSungModeReLock(shabadId: topId, lineId: lineId, peakScore: peakScore, seq: seq, tier: tier)
+                return
+            }
+        }
+
         // Brief #9.6 REQ 2 — tier filter. Tier-3 matches are
         // full-SGGS noise during LOCKED; they never become or update
         // a challenger. Tier-3 matches for the CURRENT shabad still
