@@ -125,6 +125,13 @@ struct SettingsScreen: View {
     /// flips ON for the real-time experience once the server endpoint
     /// is live.
     @AppStorage("settings.streamingModeEnabled") private var streamingModeEnabled: Bool = false
+    /// Brief #9.20-iOS (2026-07-01): Sung Kirtan Mode (Beta) umbrella
+    /// flag. When ON, DISCOVERING in Raagi Mode uses a decaying multi-
+    /// slot accumulator with lower per-match floors instead of the
+    /// speech-optimized single-slot pendingCandidate path. Future
+    /// sung-mode features (voice isolation, fuzzy FL, sung server
+    /// profile) all live behind this same flag until proven.
+    @AppStorage("settings.singingModeEnabled") private var singingModeEnabled: Bool = false
 
     @State private var showResetWhisperToast: Bool = false
 
@@ -171,6 +178,21 @@ struct SettingsScreen: View {
                                 .font(.system(size: 16))
                                 .foregroundColor(Theme.onSurface)
                             Text("Real-time pangti detection. Sends audio continuously to the GurbaniLens server, which streams matches back as you sing — sub-second latency. Requires a good network connection. Default OFF (buffered local matching).")
+                                .font(.system(size: 12))
+                                .foregroundColor(Theme.onSurfaceVariant)
+                        }
+                    }
+                    .tint(Theme.primary)
+                    .padding(.vertical, 4)
+                }
+
+                section("Sung Kirtan Mode (Beta)") {
+                    Toggle(isOn: $singingModeEnabled) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Enable sung-kirtan discovery")
+                                .font(.system(size: 16))
+                                .foregroundColor(Theme.onSurface)
+                            Text("Experimental improvements to make Raagi Mode work with singing (with or without harmonium and tabla). Uses a slower, evidence-accumulating discovery instead of the fast single-hit lock that speech recitation uses. Turn OFF to keep the speech-optimized behavior. Default OFF.")
                                 .font(.system(size: 12))
                                 .foregroundColor(Theme.onSurfaceVariant)
                         }
