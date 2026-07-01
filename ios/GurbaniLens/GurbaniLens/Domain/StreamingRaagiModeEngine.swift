@@ -670,20 +670,27 @@ public final class StreamingRaagiModeEngine: ObservableObject {
                 safeStarters: currentShabadSafeStarters,
                 trailingWindow: Self.safeStarterTrailingWindow
             ) {
-                if hit.lineId != (currentLineId ?? "") {
-                    let oldLine = currentLineId ?? "nil"
-                    currentLineId = hit.lineId
-                    currentLineIdSetByFL = true
-                    // Force FL-wins-over-server gate to trigger on next
-                    // server confirm. #9.12 threshold is 4; 10 leaves
-                    // comfortable headroom.
-                    lastFLMatchLen = 10
+                // Brief #9.18 fix: safe-unique is authoritative by construction
+                // (the letter cannot appear in any other pangti's FL universe).
+                // Always RETURN whether it's a jump to a new line or a confirm
+                // of the current line — do NOT fall through to the substring
+                // matcher. Falling through allowed substring to commit a wrong
+                // JUMP to a different pangti while safe-unique said we're still
+                // on the current line (Deep saw XLVS → 90CQ → XLVS flip-flop
+                // in tati wao shabad, seq=51-53). Setting lastFLMatchLen=10 in
+                // both cases preserves FL-holds-over-server behavior (#9.12
+                // threshold=4, 10 leaves headroom).
+                let oldLine = currentLineId ?? "nil"
+                let isJump = hit.lineId != (currentLineId ?? "")
+                currentLineId = hit.lineId
+                currentLineIdSetByFL = true
+                lastFLMatchLen = 10
+                if isJump {
                     NSLog("[DIAG] StreamingRaagiModeEngine FL unique-starter match shabadId=\(currentShabad?.id ?? "nil") lineId=\(hit.lineId) letter=\(hit.letter) partialFL='\(queryFL.joined(separator: " "))' (jumped from \(oldLine); safe-unique fast path)")
-                    return
+                } else {
+                    NSLog("[DIAG] StreamingRaagiModeEngine FL unique-starter confirm shabadId=\(currentShabad?.id ?? "nil") lineId=\(hit.lineId) letter=\(hit.letter) partialFL='\(queryFL.joined(separator: " "))' (safe-unique fast path, no jump)")
                 }
-                // Already on this line — fall through to the substring
-                // matcher so lastFLMatchLen gets the more nuanced view
-                // for the FL-holds-over-server gate.
+                return
             }
         }
 
