@@ -201,17 +201,17 @@ final class SungModeAccumulatorTests: XCTestCase {
 
     func test_processMatchInLocked_challengerAboveThresholdAndRatio_returnsReLock() {
         // BSJ was locked, capped at 100. Challenger 1HU accumulates
-        // enough weight + hits + ratio to swap.
+        // enough weight + hits + ratio to swap. Brief #9.22 raised
+        // reLockMinHits to 4 (from 3), so feed 4 hits.
         var store = SungModeAccumulatorStore()
-        // Seed BSJ at cap.
         _ = store.processMatch(shabadId: "BSJ", score: 50, tier: 0, now: at(0))  // 100
         store.capWeight(shabadId: "BSJ")
         XCTAssertEqual(store.slots["BSJ"]?.totalWeight ?? 0, 100.0, accuracy: 0.001)
 
-        // Feed 3 fresh 1HU hits at tier 0 (mult 2.0) so weight ramps
-        // fast. 50*2.0=100 per hit, spaced 0.5s apart (small decay).
+        // Feed 4 fresh 1HU hits at tier 0 (mult 2.0). 50*2.0=100 per
+        // hit, spaced 0.5s apart (small decay).
         var lastDecision: SungModeLockedDecision = .noSwap(top3Summary: "", slotCount: 0, currentWeight: 0)
-        for i in 0..<3 {
+        for i in 0..<4 {
             lastDecision = store.processMatchInLocked(
                 shabadId: "1HU", score: 50, tier: 0, currentShabadId: "BSJ",
                 now: at(1.0 + Double(i) * 0.5)
@@ -219,11 +219,11 @@ final class SungModeAccumulatorTests: XCTestCase {
             if case .reLock = lastDecision { break }
         }
         guard case .reLock(let toId, _, let weight, let hits, let currentWeight, _) = lastDecision else {
-            XCTFail("Expected .reLock after 3 challenger hits, got \(lastDecision)"); return
+            XCTFail("Expected .reLock after 4 challenger hits, got \(lastDecision)"); return
         }
         XCTAssertEqual(toId, "1HU")
         XCTAssertGreaterThanOrEqual(weight, SungModeAccumulatorStore.lockWeightThreshold)
-        XCTAssertGreaterThanOrEqual(hits, SungModeAccumulatorStore.minHits)
+        XCTAssertGreaterThanOrEqual(hits, SungModeAccumulatorStore.reLockMinHits)
         XCTAssertGreaterThanOrEqual(weight, currentWeight * SungModeAccumulatorStore.lockRatio)
     }
 
@@ -370,4 +370,205 @@ final class SungModeAccumulatorTests: XCTestCase {
         XCTAssertEqual(toId, "1HU")
         XCTAssertGreaterThanOrEqual(hits, 3)
     }
+
+    // MARK: - Brief #9.22 stability fixes
+
+    func test_processMatchInLocked_currentShabadSlot_survivesStaleWindow() {
+        // Brief #9.22 Fix 1: currentShabadId slot must NOT be evicted
+        // by stale-window filter even after > windowSeconds elapsed.
+        // Its weight decays normally; only the slot's existence is
+        // protected so currentWeight lookups don't collapse to 0.001
+        // and give bogus infinite ratios.
+        var store = SungModeAccumulatorStore()
+        _ = store.processMatch(shabadId: "BSJ", score: 50, tier: 0, now: at(0))
+        store.capWeight(shabadId: "BSJ")
+        XCTAssertEqual(store.slots["BSJ"]?.totalWeight ?? 0, 100.0, accuracy: 0.001)
+
+        // Advance well past stale window. Different-shabad hit
+        // triggers ingest + stale eviction pass.
+        let farFuture = SungModeAccumulatorStore.windowSeconds + 5.0
+        _ = store.processMatchInLocked(
+            shabadId: "OTHER", score: 50, tier: 0,
+            currentShabadId: "BSJ", now: at(farFuture)
+        )
+
+        // BSJ still in slots, weight decayed but non-zero.
+        XCTAssertNotNil(store.slots["BSJ"], "BSJ slot must survive stale eviction as protected currentShabadId")
+        let bsjWeight = store.slots["BSJ"]?.totalWeight ?? 0
+        XCTAssertGreaterThan(bsjWeight, 0.0)
+        XCTAssertLessThan(bsjWeight, 100.0, "BSJ weight should be decayed from its seeded value")
+    }
+
+    func test_processMatchInLocked_reLock_requiresMinFourHits() {
+        // Brief #9.22 Fix 2 gate 1 (hits): challenger must have
+        // reLockMinHits=4 hits. 3 tier-1 hits at score=80 build
+        // weight fast but stay 1 hit short → noSwap. 4th hit fires
+        // reLock (all other gates already met at that point).
+        var store = SungModeAccumulatorStore()
+        _ = store.processMatch(shabadId: "BSJ", score: 50, tier: 0, now: at(0))
+        store.capWeight(shabadId: "BSJ")
+
+        // 3 challenger hits at tier=1 score=80 (weight=120 per hit,
+        // spaced 0.3s apart).
+        var lastDecision: SungModeLockedDecision = .noSwap(top3Summary: "", slotCount: 0, currentWeight: 0)
+        for i in 0..<3 {
+            lastDecision = store.processMatchInLocked(
+                shabadId: "1HU", score: 80, tier: 1,
+                currentShabadId: "BSJ", now: at(1.0 + Double(i) * 0.3)
+            )
+        }
+        if case .reLock = lastDecision {
+            XCTFail("Should NOT reLock after only 3 challenger hits; got \(lastDecision)")
+        }
+
+        // 4th hit lands right on the threshold.
+        lastDecision = store.processMatchInLocked(
+            shabadId: "1HU", score: 80, tier: 1,
+            currentShabadId: "BSJ", now: at(1.9)
+        )
+        guard case .reLock(let toId, _, _, let hits, _, _) = lastDecision else {
+            XCTFail("Expected .reLock on 4th hit, got \(lastDecision)"); return
+        }
+        XCTAssertEqual(toId, "1HU")
+        XCTAssertEqual(hits, 4)
+    }
+
+    func test_processMatchInLocked_reLock_requiresRecentHit() {
+        // Brief #9.22 Fix 2 gate 2 (recency): challenger's lastSeenAt
+        // must be within reLockMinRecencySeconds (3s) of `now`.
+        //
+        // Setup: 4 challenger hits packed between t=0.5 and t=1.4
+        // (the last one triggers .reLock mid-loop as all gates are
+        // met right then; we discard that intermediate decision —
+        // the engine's real caller would act on it, but this test
+        // isolates the STORE's state and recomputes later). Then
+        // fast-forward past the recency window and issue a BSJ
+        // (current) hit — at that point 1HU is still the top slot
+        // by weight, but its recency gate fails and .reLock is
+        // suppressed.
+        var store = SungModeAccumulatorStore()
+        _ = store.processMatch(shabadId: "BSJ", score: 50, tier: 0, now: at(0))
+        store.capWeight(shabadId: "BSJ")
+
+        for i in 0..<4 {
+            _ = store.processMatchInLocked(
+                shabadId: "1HU", score: 80, tier: 1,
+                currentShabadId: "BSJ", now: at(0.5 + Double(i) * 0.3)
+            )
+        }
+        // Fast-forward past the recency window. BSJ same-shabad
+        // refresh — this is what "user pauses 1HU and stays on BSJ"
+        // looks like from the store's perspective.
+        let lateT = 1.4 + SungModeAccumulatorStore.reLockMinRecencySeconds + 0.5
+        let decision = store.processMatchInLocked(
+            shabadId: "BSJ", score: 50, tier: 0,
+            currentShabadId: "BSJ", now: at(lateT)
+        )
+        if case .reLock = decision {
+            XCTFail("Should NOT reLock — challenger's lastSeenAt is stale; got \(decision)")
+        }
+    }
+
+    func test_processMatchInLocked_reLock_requiresGoodTier() {
+        // Brief #9.22 Fix 2 gate 3 (tier quality): challenger's
+        // lastTiers ring must contain at least one tier ≤ 1. Pure
+        // tier-2 accumulation should not swap. Then a single tier-1
+        // hit unlocks the swap.
+        var store = SungModeAccumulatorStore()
+        _ = store.processMatch(shabadId: "BSJ", score: 50, tier: 0, now: at(0))
+        store.capWeight(shabadId: "BSJ")
+
+        // 4 tier-2 hits at score=80 (weight=80 per hit).
+        var lastDecision: SungModeLockedDecision = .noSwap(top3Summary: "", slotCount: 0, currentWeight: 0)
+        for i in 0..<4 {
+            lastDecision = store.processMatchInLocked(
+                shabadId: "1HU", score: 80, tier: 2,
+                currentShabadId: "BSJ", now: at(1.0 + Double(i) * 0.3)
+            )
+        }
+        if case .reLock = lastDecision {
+            XCTFail("Should NOT reLock on pure tier-2 evidence, got \(lastDecision)")
+        }
+
+        // One tier-1 hit is the missing ingredient.
+        lastDecision = store.processMatchInLocked(
+            shabadId: "1HU", score: 80, tier: 1,
+            currentShabadId: "BSJ", now: at(2.5)
+        )
+        guard case .reLock(let toId, _, _, _, _, _) = lastDecision else {
+            XCTFail("Expected .reLock after tier-1 hit lands, got \(lastDecision)"); return
+        }
+        XCTAssertEqual(toId, "1HU")
+    }
+
+    func test_processMatchInLocked_reLock_allGatesMet_swaps() {
+        // Happy path — all 5 re-lock gates cleared. BSJ capped, then
+        // 4 recent tier-0 challenger hits with weight far exceeding
+        // BSJ's decayed weight.
+        var store = SungModeAccumulatorStore()
+        _ = store.processMatch(shabadId: "BSJ", score: 50, tier: 0, now: at(0))
+        store.capWeight(shabadId: "BSJ")
+
+        var lastDecision: SungModeLockedDecision = .noSwap(top3Summary: "", slotCount: 0, currentWeight: 0)
+        for i in 0..<4 {
+            lastDecision = store.processMatchInLocked(
+                shabadId: "1HU", score: 60, tier: 0,
+                currentShabadId: "BSJ", now: at(1.0 + Double(i) * 0.3)
+            )
+        }
+        guard case .reLock(let toId, _, let weight, let hits, let currentWeight, let tiers) = lastDecision else {
+            XCTFail("Expected .reLock happy path, got \(lastDecision)"); return
+        }
+        XCTAssertEqual(toId, "1HU")
+        XCTAssertGreaterThanOrEqual(hits, SungModeAccumulatorStore.reLockMinHits)
+        XCTAssertGreaterThanOrEqual(weight, SungModeAccumulatorStore.lockWeightThreshold)
+        XCTAssertGreaterThanOrEqual(weight, currentWeight * SungModeAccumulatorStore.lockRatio)
+        XCTAssertTrue(tiers.contains(where: { $0 <= 1 }))
+    }
+
+    func test_realWorld921Scenario_pauseThenNewShabad_noFalseSwap() {
+        // Replay the #9.21 iPhone bug directly: BSJ locked, capped
+        // at 100. Deep pauses ~30s (heavy decay, BSJ ~3). Then he
+        // starts a new shabad (3 tier-1 hits at score=60). Because
+        // the currentShabad slot is protected (Fix 1), BSJ still
+        // shows a decayed-but-nonzero weight — ratio comparisons
+        // remain meaningful, and the hits=4 gate (Fix 2) still
+        // blocks the premature swap. Adding a 4th hit puts all
+        // gates over the line.
+        var store = SungModeAccumulatorStore()
+        _ = store.processMatch(shabadId: "BSJ", score: 50, tier: 0, now: at(0))
+        store.capWeight(shabadId: "BSJ")
+        XCTAssertEqual(store.slots["BSJ"]?.totalWeight ?? 0, 100.0, accuracy: 0.001)
+
+        // 30s pause.
+        let pauseEnd = 30.0
+        // 3 challenger hits after the pause (tier=1 score=60 →
+        // 90 weight/hit). Spaced 0.4s.
+        var lastDecision: SungModeLockedDecision = .noSwap(top3Summary: "", slotCount: 0, currentWeight: 0)
+        for i in 0..<3 {
+            lastDecision = store.processMatchInLocked(
+                shabadId: "NEW", score: 60, tier: 1,
+                currentShabadId: "BSJ", now: at(pauseEnd + Double(i) * 0.4)
+            )
+        }
+        if case .reLock = lastDecision {
+            XCTFail("Should NOT reLock on 3 hits after pause — Fix 2 hits gate should block")
+        }
+        // BSJ slot still present with decayed weight (Fix 1).
+        XCTAssertNotNil(store.slots["BSJ"], "BSJ slot must survive stale eviction")
+        XCTAssertGreaterThan(store.slots["BSJ"]?.totalWeight ?? 0, 0.0)
+
+        // 4th hit puts hits gate over, all others (weight/ratio/
+        // recency/tier) already satisfied.
+        lastDecision = store.processMatchInLocked(
+            shabadId: "NEW", score: 60, tier: 1,
+            currentShabadId: "BSJ", now: at(pauseEnd + 1.2)
+        )
+        guard case .reLock(let toId, _, _, let hits, _, _) = lastDecision else {
+            XCTFail("Expected .reLock on 4th hit, got \(lastDecision)"); return
+        }
+        XCTAssertEqual(toId, "NEW")
+        XCTAssertEqual(hits, 4)
+    }
 }
+

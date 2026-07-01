@@ -146,6 +146,14 @@ public struct SungModeAccumulatorStore: Equatable {
     public static let tierMultiplier: [Double] = [2.0, 1.5, 1.0, 0.5]
     /// Cap on the `lastTiers` diagnostic ring per slot.
     public static let lastTiersCap: Int = 8
+    /// Brief #9.22: challenger must have this many distinct match events
+    /// to trigger re-lock. Higher than `minHits` (3) — post-lock swap
+    /// overrides a user-visible shabad and deserves more evidence.
+    public static let reLockMinHits: Int = 4
+    /// Brief #9.22: challenger's most recent match must be within this
+    /// many seconds of `now`. Prevents a briefly-touched-then-abandoned
+    /// shabad from later winning after decay + one coincidental hit.
+    public static let reLockMinRecencySeconds: TimeInterval = 3.0
 
     // MARK: - State
 
@@ -221,7 +229,13 @@ public struct SungModeAccumulatorStore: Equatable {
         currentShabadId: String,
         now: Date = Date()
     ) -> SungModeLockedDecision {
-        guard ingestMatch(shabadId: shabadId, score: score, tier: tier, now: now) else {
+        guard ingestMatch(
+            shabadId: shabadId,
+            score: score,
+            tier: tier,
+            now: now,
+            protectedShabadId: currentShabadId
+        ) else {
             let currentWeight = slots[currentShabadId]?.totalWeight ?? 0.001
             return .noSwap(top3Summary: topSummary(top: 3), slotCount: slots.count, currentWeight: currentWeight)
         }
@@ -242,15 +256,26 @@ public struct SungModeAccumulatorStore: Equatable {
             return .noSwap(top3Summary: topSummary(top: 3), slotCount: slots.count, currentWeight: currentWeight)
         }
 
-        // Some other shabad is now the leader. Check re-lock condition
-        // against current shabad's decayed weight instead of the raw
-        // runner-up weight — the semantic question is "does this
-        // challenger dominate the CURRENTLY-DISPLAYED shabad", not
-        // "does it dominate the second-place slot".
+        // Some other shabad is now the leader. Brief #9.22: re-lock
+        // requires FIVE gates (up from three), because a post-lock
+        // swap overrides a user-visible shabad and deserves stronger
+        // evidence than initial discovery:
+        //   1. hasWeight   — challenger weight ≥ 100 (unchanged)
+        //   2. hasRatio    — challenger ≥ 1.5 × currentShabad weight
+        //   3. hasHits     — challenger has ≥ reLockMinHits (4) hits
+        //   4. isRecent    — challenger's latest match within
+        //                    reLockMinRecencySeconds (3s) of now,
+        //                    blocking briefly-touched-then-abandoned
+        //                    shabads from later winning via decay
+        //   5. hasGoodTier — challenger has at least one tier-0/1
+        //                    hit in its lastTiers ring, blocking
+        //                    pure tier-2 accumulation
         let hasWeight = topAcc.totalWeight >= Self.lockWeightThreshold
         let hasRatio = topAcc.totalWeight >= currentWeight * Self.lockRatio
-        let hasHits = topAcc.hitCount >= Self.minHits
-        if hasWeight && hasRatio && hasHits {
+        let hasHits = topAcc.hitCount >= Self.reLockMinHits
+        let isRecent = now.timeIntervalSince(topAcc.lastSeenAt) <= Self.reLockMinRecencySeconds
+        let hasGoodTier = topAcc.lastTiers.contains(where: { $0 <= 1 })
+        if hasWeight && hasRatio && hasHits && isRecent && hasGoodTier {
             return .reLock(
                 shabadId: topId,
                 peakScore: topAcc.maxScoreSeen,
@@ -290,11 +315,21 @@ public struct SungModeAccumulatorStore: Equatable {
     /// `true` when the hit was counted (score ≥ minScore), `false`
     /// when it was rejected as noise — callers use this to short-
     /// circuit their decision logic.
+    ///
+    /// - Parameter protectedShabadId: Brief #9.22 — when non-nil,
+    ///   this shabad's slot is exempt from stale-window eviction.
+    ///   Its weight still decays through step 2 (so it can still
+    ///   lose weight-comparisons), but the slot itself stays in
+    ///   `slots` so `currentWeight` lookups in the LOCKED path
+    ///   never fall through to the 0.001 floor and give a bogus
+    ///   infinite ratio. Discovery path passes nil → speech-mode-
+    ///   compatible byte-for-byte behavior.
     private mutating func ingestMatch(
         shabadId: String,
         score: Double,
         tier: Int,
-        now: Date
+        now: Date,
+        protectedShabadId: String? = nil
     ) -> Bool {
         // 1. Floor-check the incoming hit.
         guard score >= Self.minScore else { return false }
@@ -334,9 +369,16 @@ public struct SungModeAccumulatorStore: Equatable {
             )
         }
 
-        // 4. Evict stale slots older than the window horizon.
+        // 4. Evict stale slots older than the window horizon. Brief
+        // #9.22: exempt the protected shabad (currentShabadId when
+        // called from LOCKED). Its weight still decayed in step 2 —
+        // we just don't let its slot disappear, so `currentWeight`
+        // stays a meaningful (small but nonzero) ratio denominator.
         let staleCutoff = now.addingTimeInterval(-Self.windowSeconds)
-        slots = slots.filter { $0.value.lastSeenAt >= staleCutoff }
+        slots = slots.filter { key, value in
+            if key == protectedShabadId { return true }
+            return value.lastSeenAt >= staleCutoff
+        }
 
         // 5. Enforce LRU cap.
         if slots.count > Self.maxSlots {
