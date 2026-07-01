@@ -150,6 +150,68 @@ public enum FirstLetterSignature {
         return (best, nil)
     }
 
+    // MARK: - Safely-unique starters (Brief #9.16)
+
+    /// Compute the safely-unique starter map for a shabad's FL signatures.
+    /// Returns letter → lineId for letters that are some pangti's first FL letter
+    /// AND appear nowhere else in any other pangti's FL signature. Brief #9.16.
+    ///
+    /// A letter L qualifies as pangti X's safely-unique starter iff:
+    ///   1. `fl_X[0] == L` (L is X's first letter), AND
+    ///   2. L does NOT appear at ANY position in any other `fl_j` (j != X)
+    ///
+    /// By construction, seeing L in the ASR partial FL is proof the raagi is
+    /// singing X — zero false-positive risk.
+    public static func safeUniqueStarters(corpus: [(lineId: String, fl: [String])]) -> [String: String] {
+        if corpus.isEmpty { return [:] }
+        // Step 1: count all letter occurrences across all pangtis (any position).
+        // Deduplicate within a single pangti so repeated letters in the same
+        // pangti don't inflate the count.
+        var globalCount: [String: Int] = [:]
+        for (_, fl) in corpus {
+            let uniqueInPangti = Set(fl)
+            for letter in uniqueInPangti {
+                globalCount[letter, default: 0] += 1
+            }
+        }
+        // Step 2: for each pangti's starter, check if it occurs exactly once
+        // in globalCount — i.e. it appears only in this one pangti (and by
+        // construction here, at position 0).
+        var result: [String: String] = [:]
+        for (lineId, fl) in corpus {
+            guard let starter = fl.first else { continue }
+            if globalCount[starter] == 1 {
+                result[starter] = lineId
+            }
+        }
+        return result
+    }
+
+    /// Scan trailing N letters of queryFL for any safely-unique starter.
+    /// Returns the matched (letter, lineId) for the LATEST trailing letter
+    /// that hits. Returns nil if no trailing letter matches. Brief #9.16.
+    ///
+    /// "Latest wins" biases toward the raagi's most recent word — the safe-
+    /// unique letter is proof they're singing that pangti NOW, not that they
+    /// mentioned it a moment ago.
+    public static func findTrailingSafeUniqueStarter(
+        queryFL: [String],
+        safeStarters: [String: String],
+        trailingWindow: Int
+    ) -> (letter: String, lineId: String)? {
+        if queryFL.isEmpty || safeStarters.isEmpty { return nil }
+        let windowSize = min(trailingWindow, queryFL.count)
+        let startIdx = queryFL.count - windowSize
+        // Iterate trailing → recent first (rightmost is most recent).
+        for i in stride(from: queryFL.count - 1, through: startIdx, by: -1) {
+            let letter = queryFL[i]
+            if let lineId = safeStarters[letter] {
+                return (letter, lineId)
+            }
+        }
+        return nil
+    }
+
     // MARK: - Per-word extraction
 
     /// First-letter for a single word. Detects script per-word so
