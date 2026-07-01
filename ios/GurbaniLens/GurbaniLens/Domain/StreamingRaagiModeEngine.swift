@@ -172,6 +172,11 @@ public final class StreamingRaagiModeEngine: ObservableObject {
     /// matching avoids actor hops into ShabadCache on every
     /// transcript update. Empty in DISCOVERING; cleared on stop().
     private var currentShabadFLSigs: [String: [String]] = [:]
+    /// Brief #9.16-iOS: safely-unique starter map for the currently-
+    /// locked shabad (letter → lineId). Populated at lock time from
+    /// ShabadCache alongside `currentShabadFLSigs`. Empty in
+    /// DISCOVERING; cleared on stop().
+    private var currentShabadSafeStarters: [String: String] = [:]
     /// True when ``currentLineId`` was last updated by the local FL
     /// match (not a server match). Used to detect server-overrides-FL
     /// reconciliation events for the DIAG trace. Reset to false on
@@ -266,6 +271,11 @@ public final class StreamingRaagiModeEngine: ObservableObject {
     /// lineId wins over the server's per-partial lineId. Below this
     /// threshold (e.g. matchLen 2-3), FL is noisy and server wins.
     private static let flWinsOverServerMatchLen: Int = 4
+    /// Brief #9.16-iOS: trailing window size for safe-unique starter scan.
+    /// 3 letters covers ~1 second of speech at typical kirtan pace;
+    /// long enough to catch a new pangti starter but short enough to
+    /// avoid stale matches from earlier in the partial.
+    static let safeStarterTrailingWindow: Int = 3
 
     // MARK: - Init
 
@@ -292,6 +302,7 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         currentShabadRecentPeakScore = 0
         currentShabadRecentPeakTime = nil
         currentShabadFLSigs.removeAll(keepingCapacity: true)
+        currentShabadSafeStarters.removeAll(keepingCapacity: true)
         currentLineIdSetByFL = false
         lastFLMatchLen = 0
         lastFLMatchAttemptTime = nil
@@ -353,6 +364,7 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         currentShabadRecentPeakScore = 0
         currentShabadRecentPeakTime = nil
         currentShabadFLSigs.removeAll(keepingCapacity: true)
+        currentShabadSafeStarters.removeAll(keepingCapacity: true)
         currentLineIdSetByFL = false
         lastFLMatchLen = 0
         lastFLMatchAttemptTime = nil
@@ -647,6 +659,34 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         // match outcome.
         lastFLMatchAttemptTime = Date()
 
+        // Brief #9.16: Tier A — safely-unique starter fast path. If any
+        // trailing letter in queryFL maps to a starter that's unique to
+        // one pangti within this shabad, commit immediately. Zero false-
+        // positive risk by construction (the letter doesn't appear
+        // anywhere else in the shabad's FL universe).
+        if !currentShabadSafeStarters.isEmpty {
+            if let hit = FirstLetterSignature.findTrailingSafeUniqueStarter(
+                queryFL: queryFL,
+                safeStarters: currentShabadSafeStarters,
+                trailingWindow: Self.safeStarterTrailingWindow
+            ) {
+                if hit.lineId != (currentLineId ?? "") {
+                    let oldLine = currentLineId ?? "nil"
+                    currentLineId = hit.lineId
+                    currentLineIdSetByFL = true
+                    // Force FL-wins-over-server gate to trigger on next
+                    // server confirm. #9.12 threshold is 4; 10 leaves
+                    // comfortable headroom.
+                    lastFLMatchLen = 10
+                    NSLog("[DIAG] StreamingRaagiModeEngine FL unique-starter match shabadId=\(currentShabad?.id ?? "nil") lineId=\(hit.lineId) letter=\(hit.letter) partialFL='\(queryFL.joined(separator: " "))' (jumped from \(oldLine); safe-unique fast path)")
+                    return
+                }
+                // Already on this line — fall through to the substring
+                // matcher so lastFLMatchLen gets the more nuanced view
+                // for the FL-holds-over-server gate.
+            }
+        }
+
         // Find longest common substring between partial FL and any pangti
         // in current shabad. See FirstLetterSignature.findBestPangti.
         let corpus: [(lineId: String, fl: [String])] = currentShabadFLSigs.map { ($0.key, $0.value) }
@@ -828,12 +868,16 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         tier: Int
     ) async {
         // Brief #9.7: fetch shabad + FL sigs in a single actor call.
+        // Brief #9.16: same call now also returns the safely-unique
+        // starter map for the LOCKED-state fast path.
         let fetched: FullShabad
         let sigs: [String: [String]]
+        let starters: [String: String]
         do {
             let result = try await cache.shabadWithFLSignatures(forId: shabadId)
             fetched = result.shabad
             sigs = result.signatures
+            starters = result.safeStarters
         } catch {
             NSLog("[DIAG] StreamingRaagiModeEngine lock fetch failed shabadId=\(shabadId): \(error.localizedDescription) — staying in DISCOVERING")
             return
@@ -847,6 +891,7 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         currentLineId = lineId
         currentLineIdSetByFL = false  // server-driven, not FL
         currentShabadFLSigs = sigs
+        currentShabadSafeStarters = starters
         currentShabadRecentPeakScore = peakScore
         currentShabadRecentPeakTime = Date()
         currentDisplaySeq = seq
@@ -883,13 +928,16 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         challengerMatchCount: Int
     ) async {
         // Brief #9.7: fetch shabad + FL sigs together for the new
-        // currentShabad.
+        // currentShabad. Brief #9.16: also picks up the safely-
+        // unique starter map for the new shabad.
         let fetched: FullShabad
         let sigs: [String: [String]]
+        let starters: [String: String]
         do {
             let result = try await cache.shabadWithFLSignatures(forId: shabadId)
             fetched = result.shabad
             sigs = result.signatures
+            starters = result.safeStarters
         } catch {
             NSLog("[DIAG] StreamingRaagiModeEngine swap fetch failed shabadId=\(shabadId): \(error.localizedDescription) — keeping sticky display")
             return
@@ -904,6 +952,7 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         currentLineId = lineId
         currentLineIdSetByFL = false  // server-driven swap
         currentShabadFLSigs = sigs
+        currentShabadSafeStarters = starters
         currentShabadRecentPeakScore = score
         currentShabadRecentPeakTime = Date()
         currentDisplaySeq = seq
