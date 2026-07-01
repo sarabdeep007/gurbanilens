@@ -548,6 +548,17 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         tier: Int,
         seq: Int
     ) async {
+        // Brief #9.22 Fix 3: skip tier-3 hits in sung-mode DISCOVERY.
+        // Tier-3 is full-SGGS regex noise; during noisy sung audio it
+        // scatters across many candidates and delays lock (Deep saw
+        // first shabad take 55 s / 126 partials before crossing the
+        // weight threshold). Post-lock (`handleSameShabadMatchInLock`
+        // + `handleDifferentShabadMatchInLock`) still consumes tier-3
+        // for current-shabad weight refresh during quieter passages.
+        if tier > 2 {
+            NSLog("[DIAG] StreamingRaagiModeEngine sungMode discovery tier-3 skip seq=\(seq) shabadId=\(shabadId) score=\(String(format: "%.1f", score))")
+            return
+        }
         let decision = sungStore.processMatch(shabadId: shabadId, score: score, tier: tier)
         // Diagnostic: computed weight contribution for this event.
         // Matches the brief's suggested log format.
