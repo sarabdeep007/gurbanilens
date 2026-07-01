@@ -290,12 +290,26 @@ public final class StreamingRaagiModeEngine: ObservableObject {
 
     // MARK: - Init
 
+    /// Brief #9.20: Sung Kirtan Mode (Beta) flag, read at init from
+    /// UserDefaults. When true, DISCOVERING uses a decaying multi-slot
+    /// accumulator instead of the single-slot pendingCandidate path.
+    /// LOCKED-state behavior is unchanged. Read once at init — a
+    /// mid-session toggle takes effect at the NEXT raagi-mode start
+    /// (matches the streaming/raagi flag pattern).
+    private let singingModeEnabled: Bool
+    /// Brief #9.20: sung-mode discovery accumulator. Empty in speech
+    /// mode and always empty in LOCKED. Reset on stop() and on
+    /// successful lock.
+    private var sungStore: SungModeAccumulatorStore
+
     public init(corpus: Corpus, provider: StreamingProvider) {
         self.corpus = corpus
         self.cache = ShabadCache(corpus: corpus)
         self.provider = provider
         self.mic = StreamingMicCapture()
-        NSLog("[DIAG] StreamingRaagiModeEngine.init")
+        self.singingModeEnabled = UserDefaults.standard.bool(forKey: "settings.singingModeEnabled")
+        self.sungStore = SungModeAccumulatorStore()
+        NSLog("[DIAG] StreamingRaagiModeEngine.init singingMode=\(self.singingModeEnabled)")
     }
 
     // MARK: - Public lifecycle
@@ -306,6 +320,7 @@ public final class StreamingRaagiModeEngine: ObservableObject {
             return
         }
         NSLog("[DIAG] StreamingRaagiModeEngine.start (state=discovering)")
+        NSLog("[DIAG] StreamingRaagiModeEngine sungMode=\(singingModeEnabled) at start")
         setAudioState(.listening)
         bufferEnergy = 0
         activeJaikara = nil
@@ -318,6 +333,7 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         currentLineIdSetByFL = false
         lastFLMatchLen = 0
         lastFLMatchAttemptTime = nil
+        sungStore.reset()
         lockState = .discovering
         pendingCandidate = nil
         challengers.removeAll(keepingCapacity: true)
@@ -384,6 +400,7 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         lockState = .discovering
         pendingCandidate = nil
         challengers.removeAll(keepingCapacity: true)
+        sungStore.reset()
     }
 
     // MARK: - Activity → audioState
@@ -475,6 +492,22 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         score: Double,
         tier: Int
     ) async {
+        // Brief #9.20: sung-mode discovery path. When the flag is on,
+        // route the match through the decaying multi-slot accumulator
+        // and skip the speech-mode pendingCandidate path entirely.
+        // Perfect isolation between the two modes — speech behavior is
+        // byte-for-byte unchanged when singingModeEnabled is false.
+        if singingModeEnabled {
+            await handleSungModeDiscoveringMatch(
+                shabadId: shabadId,
+                lineId: lineId,
+                score: score,
+                tier: tier,
+                seq: seq
+            )
+            return
+        }
+
         // Fast lock: single very-confident match commits immediately.
         if score >= Self.discoveryFastLockScore {
             await lockTo(shabadId: shabadId, lineId: lineId, peakScore: score, via: "fast", seq: seq, tier: tier)
@@ -496,6 +529,42 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         if p.matches.count >= Self.discoveryEvidenceCount {
             let peakOfEvidence = p.matches.map(\.score).max() ?? score
             await lockTo(shabadId: p.shabadId, lineId: lineId, peakScore: peakOfEvidence, via: "evidence", seq: seq, tier: tier)
+        }
+    }
+
+    /// Brief #9.20: sung-mode DISCOVERING match handler. Thin wrapper
+    /// over `SungModeAccumulatorStore.processMatch(...)`. Routes the
+    /// event to the accumulator, logs the outcome, and if the store
+    /// declares a lock, invokes the same `lockTo(...)` path as the
+    /// speech-mode fast/evidence branches.
+    ///
+    /// Precondition: caller has verified `singingModeEnabled == true`
+    /// and state == .discovering. Score/tier come from the server
+    /// event.
+    private func handleSungModeDiscoveringMatch(
+        shabadId: String,
+        lineId: String,
+        score: Double,
+        tier: Int,
+        seq: Int
+    ) async {
+        let decision = sungStore.processMatch(shabadId: shabadId, score: score, tier: tier)
+        // Diagnostic: computed weight contribution for this event.
+        // Matches the brief's suggested log format.
+        let tierClamped = max(0, min(tier, SungModeAccumulatorStore.tierMultiplier.count - 1))
+        let addedWeight = score >= SungModeAccumulatorStore.minScore
+            ? score * SungModeAccumulatorStore.tierMultiplier[tierClamped]
+            : 0
+        switch decision {
+        case .noLock(let top3Summary, let slotCount):
+            NSLog("[DIAG] StreamingRaagiModeEngine sungMode accumulator seq=\(seq) added \(shabadId) tier=\(tierClamped) score=\(String(format: "%.1f", score)) weight+=\(String(format: "%.1f", addedWeight)) → top3=[\(top3Summary)] slotCount=\(slotCount)")
+        case .lock(let topId, let peakScore, let weight, let hitCount, let runnerUpWeight, let tiers):
+            NSLog("[DIAG] StreamingRaagiModeEngine sungMode LOCK shabadId=\(topId) weight=\(String(format: "%.1f", weight)) hits=\(hitCount) runnerUpWeight=\(String(format: "%.1f", runnerUpWeight)) peakScore=\(String(format: "%.1f", peakScore)) tiers=\(tiers)")
+            await lockTo(shabadId: topId, lineId: lineId, peakScore: peakScore, via: "sungAcc", seq: seq, tier: tier)
+            // Lock has taken us out of DISCOVERING — dict is dead
+            // state until stop(). Clear now so the memory doesn't
+            // linger.
+            sungStore.reset()
         }
     }
 
