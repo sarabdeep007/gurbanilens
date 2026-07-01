@@ -96,12 +96,17 @@ Pivoted from "continuous-listen Paath companion" on **2026-06-17**. Original Pha
 
 ## What's In Flight
 
-- 🟢 **Sung Kirtan Mode (Beta) — Briefs #9.20 + #9.21.** New Settings toggle `settings.singingModeEnabled` (default OFF) gates a decaying multi-slot accumulator for DISCOVERING (#9.20) plus a cross-shabad **re-lock** path from LOCKED (#9.21). Existing speech-optimized behavior is byte-identical when toggle is OFF. Test recipe on iPhone with toggle ON:
-  1. Sing shabad A (e.g. Tati Wao) → expect `sungMode LOCK shabadId=… weight=… hits=… peakScore=…` DIAG within ~10 s. Screen switches to shabad A view.
+- 🟢 **Sung Kirtan Mode (Beta) — Briefs #9.20 + #9.21 + #9.22.** New Settings toggle `settings.singingModeEnabled` (default OFF) gates a decaying multi-slot accumulator for DISCOVERING (#9.20), a cross-shabad **re-lock** path from LOCKED (#9.21), and three surgical stability fixes (#9.22). Existing speech-optimized behavior is byte-identical when toggle is OFF. Brief #9.22 fixes Deep's iPhone regression where 5 rapid re-locks fired with `currentWeight=0.0` (ratios in the 100000+ range) because the locked shabad's slot was ageing out during natural pauses:
+  1. **Fix 1** — currentShabadId slot is now exempt from stale-window eviction in `processMatchInLocked`. Weight still decays; only the slot itself is protected so `currentWeight` stays a meaningful ratio denominator.
+  2. **Fix 2** — re-lock now requires FIVE gates: weight ≥ 100, ratio ≥ 1.5 × current, hits ≥ 4 (up from 3, distinct from initial-discovery `minHits`), lastSeenAt within 3 s, and at least one tier-0/1 hit in `lastTiers`.
+  3. **Fix 3** — sung-mode DISCOVERY skips tier-3 hits (full-SGGS regex noise). Deep's session had first-shabad lock take 55 s (seq=126) due to tier-3 scatter; skipping them targets ~15-25 s lock latency. Post-lock still consumes tier-3 for current-shabad refresh.
+  Test recipe on iPhone with toggle ON:
+  1. Sing shabad A (e.g. Tati Wao) → expect `sungMode LOCK shabadId=… weight=… hits=… peakScore=…` DIAG within ~15-25 s (down from 55 s pre-#9.22). Screen switches to shabad A view. Console shows `sungMode discovery tier-3 skip …` for filtered noise.
   2. Continue same shabad — expect `sungMode locked-acc … same-shabad` per partial; **no** re-lock. FL fast paths (#9.16/#9.19) drive pangti transitions.
-  3. Switch to shabad B (e.g. Aukhi Gharri) → expect challenger weight to build over ~3-5 s of singing, then `sungMode RE-LOCK from=A to=B currentWeight=… challengerWeight=… ratio=… hits=…` fires + screen swaps. FL fast paths for B take over pangti tracking.
-  4. **Regression check** — same test flow with toggle OFF should be unchanged from prior release (single-slot pendingCandidate discovery + speech-mode challenger for cross-shabad).
-  Reference logs: `swift test` in `ios/GurbaniLensCore/` covers the pure accumulator (17 XCTest cases including a real-world Aukhi Gharri replay). Deep validates on Mac then iPhone.
+  3. Pause 30 s between shabads (natural kirtan cadence) — pre-#9.22 this ejected the current shabad's slot; now BSJ (or whichever) stays with decayed-but-nonzero weight.
+  4. Switch to shabad B (e.g. Aukhi Gharri) → expect challenger to build across ~4+ recent tier-0/1 hits, then `sungMode RE-LOCK from=A to=B currentWeight=… challengerWeight=… ratio=… hits=…` fires + screen swaps. FL fast paths for B take over pangti tracking. Pre-#9.22 this would swap on any 3-hit challenger meeting weight; now the extra gates block false swaps.
+  5. **Regression check** — same test flow with toggle OFF should be unchanged from prior release (single-slot pendingCandidate discovery + speech-mode challenger for cross-shabad).
+  Reference logs: `swift test` in `ios/GurbaniLensCore/` covers the pure accumulator (24 XCTest cases including a real-world Aukhi Gharri replay AND a #9.22 30 s-pause-then-new-shabad no-false-swap replay). Deep validates on Mac then iPhone.
 
 - 🟢 **Deep — iOS v1 voice-search on device.** Xcode install + `bash scripts/fetch_ios_deps.sh` + `xcodegen generate` + run on iPhone with free Apple ID. See [docs/PHASE_2A_IOS_SETUP.md](./docs/PHASE_2A_IOS_SETUP.md). Independent of Android track.
 - 🟢 **Phase 2B Kirtan dataset gathering** (separate agent track) — continues feeding v2.
