@@ -40,6 +40,12 @@ public actor ShabadCache {
     /// negligible (~10-50 lines × ~6-10 single-char strings per
     /// shabad).
     private var flSignatures: [String: [String: [String]]] = [:]
+    /// Brief #9.16-iOS: per-shabad safely-unique starter map
+    /// (letter → lineId). Populated on the same MISS path that fills
+    /// `flSignatures`; dropped in ``clear()``. Powers the LOCKED-
+    /// state fast path in StreamingRaagiModeEngine that commits on
+    /// matchLen=1 when the letter is unambiguous within the shabad.
+    private var safeStarters: [String: [String: String]] = [:]
 
     public init(corpus: Corpus) {
         self.corpus = corpus
@@ -80,7 +86,16 @@ public actor ShabadCache {
             sigs[line.id] = extracted
         }
         flSignatures[id] = sigs
-        NSLog("[DIAG] ShabadCache MISS id=\(id) fetchedLines=\(raw.count) keptLines=\(filtered.count) flSigsComputed=\(sigs.count) cachedCount=\(shabads.count)")
+
+        // Brief #9.16-iOS: precompute the safely-unique starter map
+        // alongside the FL sigs. Same MISS path so the two stay in
+        // lock-step for lifetime / clear().
+        let corpusForUnique: [(lineId: String, fl: [String])] = sigs.map { ($0.key, $0.value) }
+        let starters = FirstLetterSignature.safeUniqueStarters(corpus: corpusForUnique)
+        safeStarters[id] = starters
+        NSLog("[DIAG] ShabadCache safeUniqueStarters id=\(id) count=\(starters.count) letters=\(starters.keys.sorted().joined(separator: \",\"))")
+
+        NSLog("[DIAG] ShabadCache MISS id=\(id) fetchedLines=\(raw.count) keptLines=\(filtered.count) flSigsComputed=\(sigs.count) safeStarters=\(starters.count) cachedCount=\(shabads.count)")
         return built
     }
 
@@ -93,15 +108,26 @@ public actor ShabadCache {
         flSignatures[id]
     }
 
-    /// Brief #9.7-iOS: convenience that returns both the FullShabad
-    /// and its FL signatures in one actor hop. The streaming engine
-    /// needs both on every lock/swap (the shabad for rendering, the
+    /// Brief #9.16-iOS: lookup of the precomputed safely-unique
+    /// starter map for a shabad. Returns nil if the shabad hasn't
+    /// been fetched yet.
+    public func safeUniqueStarters(forId id: String) -> [String: String]? {
+        safeStarters[id]
+    }
+
+    /// Brief #9.7-iOS: convenience that returns the FullShabad + its
+    /// FL signatures in one actor hop. The streaming engine needs
+    /// both on every lock/swap (the shabad for rendering, the
     /// signatures for fast pangti highlight); pairing them in one
     /// call saves a round-trip through the actor.
-    public func shabadWithFLSignatures(forId id: String) throws -> (shabad: FullShabad, signatures: [String: [String]]) {
+    ///
+    /// Brief #9.16-iOS: extended to also return the safely-unique
+    /// starter map for the LOCKED-state fast path in the engine.
+    public func shabadWithFLSignatures(forId id: String) throws -> (shabad: FullShabad, signatures: [String: [String]], safeStarters: [String: String]) {
         let s = try shabad(forId: id)
         let sigs = flSignatures[id] ?? [:]
-        return (s, sigs)
+        let starters = safeStarters[id] ?? [:]
+        return (s, sigs, starters)
     }
 
     /// Drop everything. Called when Raagi Mode is exited so the next
@@ -109,9 +135,11 @@ public actor ShabadCache {
     public func clear() {
         let dropped = shabads.count
         let droppedSigs = flSignatures.count
+        let droppedStarters = safeStarters.count
         shabads.removeAll(keepingCapacity: true)
         flSignatures.removeAll(keepingCapacity: true)
-        NSLog("[DIAG] ShabadCache cleared (dropped \(dropped) shabads, \(droppedSigs) FL sigs)")
+        safeStarters.removeAll(keepingCapacity: true)
+        NSLog("[DIAG] ShabadCache cleared (dropped \(dropped) shabads, \(droppedSigs) FL sigs, \(droppedStarters) safe-starter maps)")
     }
 
     /// Diagnostic: number of cached shabads (used for the bottom-of-
