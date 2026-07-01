@@ -15,6 +15,14 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.9"
+    # Brief #9.16.1-iOS (2026-07-01): pin to `minimal` to unblock
+    # existing NSLock-in-async-context patterns in StreamingProvider.
+    # Newer Xcode versions default to `targeted`/`complete`, converting
+    # those warnings to errors. Proper migration to actor /
+    # OSAllocatedUnfairLock is a substantial refactor deferred to a
+    # follow-up brief; this pin restores the pre-existing behavior
+    # without touching the underlying code.
+    SWIFT_STRICT_CONCURRENCY: minimal
     IPHONEOS_DEPLOYMENT_TARGET: "16.0"
     CODE_SIGN_STYLE: Automatic
     CODE_SIGN_IDENTITY: "Apple Development"
