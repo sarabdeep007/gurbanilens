@@ -96,6 +96,13 @@ Pivoted from "continuous-listen Paath companion" on **2026-06-17**. Original Pha
 
 ## What's In Flight
 
+- 🟢 **Sung Kirtan Mode (Beta) — Briefs #9.20 + #9.21.** New Settings toggle `settings.singingModeEnabled` (default OFF) gates a decaying multi-slot accumulator for DISCOVERING (#9.20) plus a cross-shabad **re-lock** path from LOCKED (#9.21). Existing speech-optimized behavior is byte-identical when toggle is OFF. Test recipe on iPhone with toggle ON:
+  1. Sing shabad A (e.g. Tati Wao) → expect `sungMode LOCK shabadId=… weight=… hits=… peakScore=…` DIAG within ~10 s. Screen switches to shabad A view.
+  2. Continue same shabad — expect `sungMode locked-acc … same-shabad` per partial; **no** re-lock. FL fast paths (#9.16/#9.19) drive pangti transitions.
+  3. Switch to shabad B (e.g. Aukhi Gharri) → expect challenger weight to build over ~3-5 s of singing, then `sungMode RE-LOCK from=A to=B currentWeight=… challengerWeight=… ratio=… hits=…` fires + screen swaps. FL fast paths for B take over pangti tracking.
+  4. **Regression check** — same test flow with toggle OFF should be unchanged from prior release (single-slot pendingCandidate discovery + speech-mode challenger for cross-shabad).
+  Reference logs: `swift test` in `ios/GurbaniLensCore/` covers the pure accumulator (17 XCTest cases including a real-world Aukhi Gharri replay). Deep validates on Mac then iPhone.
+
 - 🟢 **Deep — iOS v1 voice-search on device.** Xcode install + `bash scripts/fetch_ios_deps.sh` + `xcodegen generate` + run on iPhone with free Apple ID. See [docs/PHASE_2A_IOS_SETUP.md](./docs/PHASE_2A_IOS_SETUP.md). Independent of Android track.
 - 🟢 **Phase 2B Kirtan dataset gathering** (separate agent track) — continues feeding v2.
 - 🟡 **Phase 2A v2 Phase B polish** (next dispatch — gated on Deep's on-device confirmation that Phase A streams cleanly). Scope: sticky animated transcript header with confirmed-white / unconfirmed-saffron-60% split, VU underline driven by `bufferEnergy`, LazyVStack with `.transition` + `.animation` for list-diff animations as live matches refresh, Settings silence-threshold slider, mic-permission prompt verification under WhisperKit's AudioProcessor path, localised "you said:" header, Day-4 polish items from the spec.
