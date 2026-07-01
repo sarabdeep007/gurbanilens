@@ -46,6 +46,13 @@ public actor ShabadCache {
     /// state fast path in StreamingRaagiModeEngine that commits on
     /// matchLen=1 when the letter is unambiguous within the shabad.
     private var safeStarters: [String: [String: String]] = [:]
+    /// Brief #9.19-iOS: per-shabad safely-unique starter-bigram map
+    /// (bigramKey → lineId). Populated on the same MISS path that
+    /// fills `flSignatures` and `safeStarters`. Powers the Tier B
+    /// fast path in StreamingRaagiModeEngine that commits on
+    /// matchLen=2 for pangtis whose starter letter pair is unique
+    /// within the shabad's consecutive-bigram universe.
+    private var safeBigrams: [String: [String: String]] = [:]
 
     public init(corpus: Corpus) {
         self.corpus = corpus
@@ -95,7 +102,14 @@ public actor ShabadCache {
         safeStarters[id] = starters
         NSLog("[DIAG] ShabadCache safeUniqueStarters id=\(id) count=\(starters.count) letters=\(starters.keys.sorted().joined(separator: ","))")
 
-        NSLog("[DIAG] ShabadCache MISS id=\(id) fetchedLines=\(raw.count) keptLines=\(filtered.count) flSigsComputed=\(sigs.count) safeStarters=\(starters.count) cachedCount=\(shabads.count)")
+        // Brief #9.19-iOS: precompute the safely-unique starter-bigram
+        // map alongside the unigram map. Same MISS path; both stay
+        // in lock-step for lifetime / clear().
+        let bigrams = FirstLetterSignature.safeUniqueBigramStarters(corpus: corpusForUnique)
+        safeBigrams[id] = bigrams
+        NSLog("[DIAG] ShabadCache safeUniqueBigramStarters id=\(id) count=\(bigrams.count) keys=\(bigrams.keys.sorted().joined(separator: ","))")
+
+        NSLog("[DIAG] ShabadCache MISS id=\(id) fetchedLines=\(raw.count) keptLines=\(filtered.count) flSigsComputed=\(sigs.count) safeStarters=\(starters.count) safeBigrams=\(bigrams.count) cachedCount=\(shabads.count)")
         return built
     }
 
@@ -115,6 +129,13 @@ public actor ShabadCache {
         safeStarters[id]
     }
 
+    /// Brief #9.19-iOS: lookup of the precomputed safely-unique
+    /// starter-bigram map for a shabad. Returns nil if the shabad
+    /// hasn't been fetched yet.
+    public func safeUniqueBigramStarters(forId id: String) -> [String: String]? {
+        safeBigrams[id]
+    }
+
     /// Brief #9.7-iOS: convenience that returns the FullShabad + its
     /// FL signatures in one actor hop. The streaming engine needs
     /// both on every lock/swap (the shabad for rendering, the
@@ -123,11 +144,20 @@ public actor ShabadCache {
     ///
     /// Brief #9.16-iOS: extended to also return the safely-unique
     /// starter map for the LOCKED-state fast path in the engine.
-    public func shabadWithFLSignatures(forId id: String) throws -> (shabad: FullShabad, signatures: [String: [String]], safeStarters: [String: String]) {
+    ///
+    /// Brief #9.19-iOS: extended again to include the safely-unique
+    /// starter-bigram map for the Tier B fast path.
+    public func shabadWithFLSignatures(forId id: String) throws -> (
+        shabad: FullShabad,
+        signatures: [String: [String]],
+        safeStarters: [String: String],
+        safeBigrams: [String: String]
+    ) {
         let s = try shabad(forId: id)
         let sigs = flSignatures[id] ?? [:]
         let starters = safeStarters[id] ?? [:]
-        return (s, sigs, starters)
+        let bigrams = safeBigrams[id] ?? [:]
+        return (s, sigs, starters, bigrams)
     }
 
     /// Drop everything. Called when Raagi Mode is exited so the next
@@ -136,10 +166,12 @@ public actor ShabadCache {
         let dropped = shabads.count
         let droppedSigs = flSignatures.count
         let droppedStarters = safeStarters.count
+        let droppedBigrams = safeBigrams.count
         shabads.removeAll(keepingCapacity: true)
         flSignatures.removeAll(keepingCapacity: true)
         safeStarters.removeAll(keepingCapacity: true)
-        NSLog("[DIAG] ShabadCache cleared (dropped \(dropped) shabads, \(droppedSigs) FL sigs, \(droppedStarters) safe-starter maps)")
+        safeBigrams.removeAll(keepingCapacity: true)
+        NSLog("[DIAG] ShabadCache cleared (dropped \(dropped) shabads, \(droppedSigs) FL sigs, \(droppedStarters) safe-starter maps, \(droppedBigrams) safe-bigram maps)")
     }
 
     /// Diagnostic: number of cached shabads (used for the bottom-of-
