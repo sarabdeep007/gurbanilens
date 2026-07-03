@@ -154,6 +154,32 @@ public struct SungModeAccumulatorStore: Equatable {
     /// many seconds of `now`. Prevents a briefly-touched-then-abandoned
     /// shabad from later winning after decay + one coincidental hit.
     public static let reLockMinRecencySeconds: TimeInterval = 3.0
+    /// Brief #9.23a Fix 1: floor applied to the currently-locked
+    /// shabad's weight when it is used as the ratio denominator for
+    /// re-lock evaluation. #9.22 kept the current-shabad slot alive
+    /// through stale eviction, but its weight can still decay
+    /// arbitrarily close to zero across a long pause — Deep's
+    /// #9.22 iPhone log had `currentWeight=0.0` and
+    /// `ratio=270735.62` on RE-LOCK from=HLD to=3CZ. Reading the
+    /// weight with `max(stored, currentWeightFloor)` keeps ratios
+    /// meaningful: a real strong challenger (weight ≥ 100) still
+    /// clears 100/20 = 5.0 >> 1.5, but a weak tier-3-noise
+    /// challenger (weight ~30) hits exactly the 1.5 ratio and is
+    /// blocked by the other four gates. The underlying stored
+    /// weight is NOT modified — the floor applies only at the read
+    /// site in `processMatchInLocked`, so decay behavior for other
+    /// callers is unchanged.
+    public static let currentWeightFloor: Double = 20.0
+    /// Brief #9.23a Fix 2: challenger's `lastTiers` ring must contain
+    /// at least this many hits at tier ≤ 1 to satisfy the tier-
+    /// quality gate. Raised from #9.22's "≥1 low-tier hit" because
+    /// Deep's #9.22 iPhone log showed RE-LOCK from=3CZ to=TUY
+    /// tiers=[3, 3, 1, 2] — one lonely tier-1 hit amid tier-3 noise
+    /// is not enough evidence to swap. Requiring two low-tier hits
+    /// filters that pattern out without blocking the real-world
+    /// Aukhi Gharri scenario ([3,1,3,1] → 2 low-tier hits still
+    /// passes).
+    public static let reLockMinLowTierHits: Int = 2
 
     // MARK: - State
 
@@ -236,14 +262,25 @@ public struct SungModeAccumulatorStore: Equatable {
             now: now,
             protectedShabadId: currentShabadId
         ) else {
-            let currentWeight = slots[currentShabadId]?.totalWeight ?? 0.001
+            // Brief #9.23a Fix 1: floor the read.
+            let currentWeight = max(
+                slots[currentShabadId]?.totalWeight ?? 0.001,
+                Self.currentWeightFloor
+            )
             return .noSwap(top3Summary: topSummary(top: 3), slotCount: slots.count, currentWeight: currentWeight)
         }
 
         // Refresh currentWeight AFTER the ingest — if the incoming
         // match was for the current shabad, ingest just added to its
         // weight and we want the post-add value in the decision.
-        let currentWeight = slots[currentShabadId]?.totalWeight ?? 0.001
+        // Brief #9.23a Fix 1: floor at read site so the ratio
+        // denominator can never collapse to near-zero and produce a
+        // bogus infinite ratio. Stored weight is untouched — decay
+        // continues normally for future ingests.
+        let currentWeight = max(
+            slots[currentShabadId]?.totalWeight ?? 0.001,
+            Self.currentWeightFloor
+        )
 
         let sorted = slots.sorted { $0.value.totalWeight > $1.value.totalWeight }
         guard let (topId, topAcc) = sorted.first else {
@@ -267,14 +304,17 @@ public struct SungModeAccumulatorStore: Equatable {
         //                    reLockMinRecencySeconds (3s) of now,
         //                    blocking briefly-touched-then-abandoned
         //                    shabads from later winning via decay
-        //   5. hasGoodTier — challenger has at least one tier-0/1
-        //                    hit in its lastTiers ring, blocking
-        //                    pure tier-2 accumulation
+        //   5. hasGoodTier — Brief #9.23a raised this gate: challenger
+        //                    has at least `reLockMinLowTierHits` (2,
+        //                    up from #9.22's 1) tier-0/1 hits in its
+        //                    lastTiers ring. Blocks a single tier-1
+        //                    hit amid tier-3 noise (Deep's #9.22
+        //                    tiers=[3,3,1,2] false swap).
         let hasWeight = topAcc.totalWeight >= Self.lockWeightThreshold
         let hasRatio = topAcc.totalWeight >= currentWeight * Self.lockRatio
         let hasHits = topAcc.hitCount >= Self.reLockMinHits
         let isRecent = now.timeIntervalSince(topAcc.lastSeenAt) <= Self.reLockMinRecencySeconds
-        let hasGoodTier = topAcc.lastTiers.contains(where: { $0 <= 1 })
+        let hasGoodTier = topAcc.lastTiers.filter { $0 <= 1 }.count >= Self.reLockMinLowTierHits
         if hasWeight && hasRatio && hasHits && isRecent && hasGoodTier {
             return .reLock(
                 shabadId: topId,

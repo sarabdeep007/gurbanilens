@@ -470,15 +470,18 @@ final class SungModeAccumulatorTests: XCTestCase {
     }
 
     func test_processMatchInLocked_reLock_requiresGoodTier() {
-        // Brief #9.22 Fix 2 gate 3 (tier quality): challenger's
-        // lastTiers ring must contain at least one tier ≤ 1. Pure
-        // tier-2 accumulation should not swap. Then a single tier-1
-        // hit unlocks the swap.
+        // Brief #9.22 Fix 2 gate 3 (tier quality), tightened by
+        // #9.23a Fix 2: challenger's lastTiers ring must contain at
+        // least `reLockMinLowTierHits` (2) hits at tier ≤ 1. Pure
+        // tier-2 accumulation still doesn't swap; a SINGLE tier-1 hit
+        // amid noise is also insufficient (this is the Deep #9.22
+        // false-swap pattern). Only a SECOND tier-1 hit unlocks the
+        // swap.
         var store = SungModeAccumulatorStore()
         _ = store.processMatch(shabadId: "BSJ", score: 50, tier: 0, now: at(0))
         store.capWeight(shabadId: "BSJ")
 
-        // 4 tier-2 hits at score=80 (weight=80 per hit).
+        // 4 tier-2 hits at score=80 (weight=80 per hit) — no low-tier.
         var lastDecision: SungModeLockedDecision = .noSwap(top3Summary: "", slotCount: 0, currentWeight: 0)
         for i in 0..<4 {
             lastDecision = store.processMatchInLocked(
@@ -490,15 +493,27 @@ final class SungModeAccumulatorTests: XCTestCase {
             XCTFail("Should NOT reLock on pure tier-2 evidence, got \(lastDecision)")
         }
 
-        // One tier-1 hit is the missing ingredient.
+        // First tier-1 hit: 1 low-tier < reLockMinLowTierHits (2) →
+        // still noSwap under #9.23a.
         lastDecision = store.processMatchInLocked(
             shabadId: "1HU", score: 80, tier: 1,
             currentShabadId: "BSJ", now: at(2.5)
         )
-        guard case .reLock(let toId, _, _, _, _, _) = lastDecision else {
-            XCTFail("Expected .reLock after tier-1 hit lands, got \(lastDecision)"); return
+        if case .reLock = lastDecision {
+            XCTFail("Should NOT reLock on a single tier-1 hit amid tier-2 noise, got \(lastDecision)")
+        }
+
+        // Second tier-1 hit: 2 low-tier ≥ 2 → tier gate passes; all
+        // other gates already met (weight/ratio/hits/recent) → reLock.
+        lastDecision = store.processMatchInLocked(
+            shabadId: "1HU", score: 80, tier: 1,
+            currentShabadId: "BSJ", now: at(2.8)
+        )
+        guard case .reLock(let toId, _, _, _, _, let tiers) = lastDecision else {
+            XCTFail("Expected .reLock after 2nd tier-1 hit lands, got \(lastDecision)"); return
         }
         XCTAssertEqual(toId, "1HU")
+        XCTAssertGreaterThanOrEqual(tiers.filter { $0 <= 1 }.count, 2)
     }
 
     func test_processMatchInLocked_reLock_allGatesMet_swaps() {
@@ -569,6 +584,183 @@ final class SungModeAccumulatorTests: XCTestCase {
         }
         XCTAssertEqual(toId, "NEW")
         XCTAssertEqual(hits, 4)
+    }
+
+    // MARK: - Brief #9.23a stability fixes
+
+    func test_currentWeightFloor_preventsInfiniteRatio_afterDecayToZero() {
+        // Brief #9.23a Fix 1: after the current shabad's stored
+        // weight decays to near-zero (Deep's #9.22 iPhone log:
+        // currentWeight=0.0 → ratio=270735.62 on RE-LOCK from=HLD
+        // to=3CZ), the ratio-denominator read at
+        // processMatchInLocked must apply the currentWeightFloor
+        // (20) so ratios stay meaningful and no bogus infinity is
+        // produced. The underlying stored slot weight is NOT
+        // modified — the floor applies at the read site only.
+        //
+        // Assertions:
+        //   1. Decision returns .noSwap on a single-hit challenger
+        //      (reLockMinHits=4 gate blocks it).
+        //   2. The `currentWeight` field in the .noSwap decision
+        //      equals currentWeightFloor.
+        //   3. The stored BSJ weight remains its decayed value
+        //      (below the floor), proving the floor is read-time
+        //      only.
+        var store = SungModeAccumulatorStore()
+        _ = store.processMatch(shabadId: "BSJ", score: 50, tier: 0, now: at(0))
+        store.capWeight(shabadId: "BSJ")
+        XCTAssertEqual(store.slots["BSJ"]?.totalWeight ?? 0, 100.0, accuracy: 0.001)
+
+        // Advance 30s — 5 half-lives → BSJ decays to ~3.125.
+        let farFuture = 30.0
+        let decision = store.processMatchInLocked(
+            shabadId: "1HU", score: 50, tier: 0,
+            currentShabadId: "BSJ", now: at(farFuture)
+        )
+
+        guard case .noSwap(_, _, let currentWeight) = decision else {
+            XCTFail("Expected .noSwap on single-hit challenger, got \(decision)"); return
+        }
+        // Floor applied at read site.
+        XCTAssertEqual(
+            currentWeight, SungModeAccumulatorStore.currentWeightFloor,
+            accuracy: 0.001,
+            "currentWeight in decision must be floored to currentWeightFloor"
+        )
+        // Underlying stored BSJ weight is BELOW the floor — proves
+        // the floor didn't leak into storage.
+        let bsjStored = store.slots["BSJ"]?.totalWeight ?? 0
+        XCTAssertLessThan(
+            bsjStored, SungModeAccumulatorStore.currentWeightFloor,
+            "Stored BSJ weight must remain decayed (below floor)"
+        )
+        XCTAssertGreaterThan(bsjStored, 0.0)
+    }
+
+    func test_currentWeightFloor_stillPermitsGenuineStrongChallenger() {
+        // Brief #9.23a Fix 1 sanity: the currentWeightFloor does NOT
+        // suppress genuine strong challengers. Same 30s pause setup
+        // as the previous test, but the challenger now runs 4 tier-1
+        // hits at score=100 (weight=150 per hit), so tiers=[1,1,1,1]
+        // clears #9.23a Fix 2's ≥2 low-tier gate too. Challenger
+        // weight exceeds 200; ratio against the floor is 10.0+ which
+        // trivially exceeds lockRatio=1.5 → reLock as expected.
+        var store = SungModeAccumulatorStore()
+        _ = store.processMatch(shabadId: "BSJ", score: 50, tier: 0, now: at(0))
+        store.capWeight(shabadId: "BSJ")
+
+        let pauseEnd = 30.0
+        var lastDecision: SungModeLockedDecision = .noSwap(top3Summary: "", slotCount: 0, currentWeight: 0)
+        for i in 0..<4 {
+            lastDecision = store.processMatchInLocked(
+                shabadId: "1HU", score: 100, tier: 1,
+                currentShabadId: "BSJ", now: at(pauseEnd + Double(i) * 0.3)
+            )
+        }
+        guard case .reLock(let toId, _, let weight, let hits, let currentWeight, _) = lastDecision else {
+            XCTFail("Expected .reLock on strong 4-hit tier-1 challenger, got \(lastDecision)"); return
+        }
+        XCTAssertEqual(toId, "1HU")
+        XCTAssertGreaterThanOrEqual(hits, SungModeAccumulatorStore.reLockMinHits)
+        XCTAssertGreaterThanOrEqual(weight, 200.0)
+        // BSJ is decayed far below floor → currentWeight reflects
+        // the floor, not the raw stored value.
+        XCTAssertEqual(
+            currentWeight, SungModeAccumulatorStore.currentWeightFloor,
+            accuracy: 0.001,
+            "currentWeight must equal the floor when stored BSJ weight decayed below it"
+        )
+        // Ratio against the floor still comfortably clears lockRatio.
+        XCTAssertGreaterThanOrEqual(
+            weight, currentWeight * SungModeAccumulatorStore.lockRatio
+        )
+    }
+
+    func test_reLockRequiresTwoLowTierHits_blocksSingleTier1AmidNoise() {
+        // Brief #9.23a Fix 2: replay Deep's #9.22 iPhone Bug 2
+        // exactly — challenger tiers=[3,3,1,2], currentWeight~97,
+        // challenger weight ~171, ratio ~1.75. Under #9.22 this
+        // false-swapped because ≥1 low-tier hit satisfied the gate.
+        // Under #9.23a the tier-quality gate requires ≥2 low-tier
+        // hits → noSwap. Rerun with the second tier-3 replaced by a
+        // tier-1 (tiers=[3,1,1,2]) → 2 low-tier → reLock fires.
+        var store = SungModeAccumulatorStore()
+        _ = store.processMatch(shabadId: "BSJ", score: 50, tier: 0, now: at(0))
+        store.capWeight(shabadId: "BSJ")
+
+        // Deep's exact tier composition. Scored to land the
+        // challenger weight north of 100 (satisfying hasWeight) so
+        // the ONLY blocker is the tier-quality gate.
+        let noisyEvents: [(score: Double, tier: Int)] = [
+            (60, 3),
+            (60, 3),
+            (80, 1),
+            (70, 2),
+        ]
+        var lastDecision: SungModeLockedDecision = .noSwap(top3Summary: "", slotCount: 0, currentWeight: 0)
+        for (i, ev) in noisyEvents.enumerated() {
+            lastDecision = store.processMatchInLocked(
+                shabadId: "1HU", score: ev.score, tier: ev.tier,
+                currentShabadId: "BSJ", now: at(1.0 + Double(i) * 0.3)
+            )
+        }
+        if case .reLock = lastDecision {
+            XCTFail("Should NOT reLock on tiers=[3,3,1,2] (1 low-tier hit); got \(lastDecision)")
+        }
+        // Confirm the assertion isolation: challenger DID reach
+        // weight ≥ 100 and hits = 4.
+        XCTAssertGreaterThanOrEqual(store.slots["1HU"]?.totalWeight ?? 0, 100.0)
+        XCTAssertEqual(store.slots["1HU"]?.hitCount, 4)
+        XCTAssertEqual(store.slots["1HU"]?.lastTiers.filter { $0 <= 1 }.count, 1)
+
+        // Fresh store. One tier-3 flipped to tier-1 → tiers=[3,1,1,2]
+        // → 2 low-tier hits → all gates pass → reLock.
+        var cleanerStore = SungModeAccumulatorStore()
+        _ = cleanerStore.processMatch(shabadId: "BSJ", score: 50, tier: 0, now: at(0))
+        cleanerStore.capWeight(shabadId: "BSJ")
+        let cleanerEvents: [(score: Double, tier: Int)] = [
+            (60, 3),
+            (80, 1),  // was (60, 3)
+            (80, 1),
+            (70, 2),
+        ]
+        lastDecision = .noSwap(top3Summary: "", slotCount: 0, currentWeight: 0)
+        for (i, ev) in cleanerEvents.enumerated() {
+            lastDecision = cleanerStore.processMatchInLocked(
+                shabadId: "1HU", score: ev.score, tier: ev.tier,
+                currentShabadId: "BSJ", now: at(1.0 + Double(i) * 0.3)
+            )
+        }
+        guard case .reLock(let toId, _, _, _, _, let tiers) = lastDecision else {
+            XCTFail("Expected .reLock on tiers=[3,1,1,2] (2 low-tier hits); got \(lastDecision)"); return
+        }
+        XCTAssertEqual(toId, "1HU")
+        XCTAssertGreaterThanOrEqual(tiers.filter { $0 <= 1 }.count, 2)
+    }
+
+    func test_reLockRequiresTwoLowTierHits_stillFiresOnCleanChallenger() {
+        // Brief #9.23a Fix 2 sanity: 4 clean tier-1 hits still reLock
+        // normally. tier=1 is counted as low-tier (≤ 1), so
+        // lastTiers=[1,1,1,1] trivially clears the ≥2 gate. Mirrors
+        // the #9.22 allGatesMet test at a different tier level.
+        var store = SungModeAccumulatorStore()
+        _ = store.processMatch(shabadId: "BSJ", score: 50, tier: 0, now: at(0))
+        store.capWeight(shabadId: "BSJ")
+
+        var lastDecision: SungModeLockedDecision = .noSwap(top3Summary: "", slotCount: 0, currentWeight: 0)
+        for i in 0..<4 {
+            lastDecision = store.processMatchInLocked(
+                shabadId: "1HU", score: 80, tier: 1,
+                currentShabadId: "BSJ", now: at(1.0 + Double(i) * 0.3)
+            )
+        }
+        guard case .reLock(let toId, _, let weight, let hits, _, let tiers) = lastDecision else {
+            XCTFail("Expected .reLock on 4 clean tier-1 hits, got \(lastDecision)"); return
+        }
+        XCTAssertEqual(toId, "1HU")
+        XCTAssertEqual(hits, 4)
+        XCTAssertGreaterThanOrEqual(weight, SungModeAccumulatorStore.lockWeightThreshold)
+        XCTAssertEqual(tiers.filter { $0 <= 1 }.count, 4)
     }
 }
 
