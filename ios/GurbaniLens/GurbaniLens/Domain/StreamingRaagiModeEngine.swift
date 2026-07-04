@@ -497,6 +497,14 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         // and skip the speech-mode pendingCandidate path entirely.
         // Perfect isolation between the two modes — speech behavior is
         // byte-for-byte unchanged when singingModeEnabled is false.
+        //
+        // Brief #9.23b: this early return is ALSO the initial-lock
+        // suppression for the legacy fast-lock (score ≥ 95) and
+        // 2-hit evidence-lock (score ≥ 80) branches below. Under
+        // sung-mode ON, the accumulator's `.lock` decision (→
+        // `lockTo(via:"sungAcc")`) is the ONLY authorized initial-
+        // lock path. Do not remove this gate without also gating
+        // the two `lockTo(via:)` sites below.
         if singingModeEnabled {
             await handleSungModeDiscoveringMatch(
                 shabadId: shabadId,
@@ -753,6 +761,30 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         // Walk all challengers and pick the best swap candidate
         // (highest latestScore that passes either gate).
         guard let winner = findBestSwapCandidate() else { return }
+
+        // Brief #9.23b: sung-mode owns cross-shabad re-lock. The
+        // legacy speech-mode evidence/bypass path picks a winner
+        // after just 2 challenger matches at score ≥ 75 (evidence)
+        // or a single match ≥ 92 (bypass) — that bypasses ALL five
+        // sung-mode re-lock gates (weight ≥ 100, ratio ≥ 1.5×
+        // current, hits ≥ 4, recency ≤ 3 s, ≥ 2 tier-0/1 hits).
+        // Deep's #9.23a iPhone log had
+        //     SWAP from=HLD to=6V0 via=evidence
+        //     challengerMatches=2 latestScore=81.0
+        // firing while the accumulator correctly said .noSwap — a
+        // toggle-isolation leak. Under sung-mode we log the
+        // suppression and return; the accumulator's
+        // `performSungModeReLock` (fired above via .reLock) is the
+        // ONLY authorized cross-shabad swap path when
+        // singingModeEnabled == true. Challenger tracking + the
+        // `challenger …` DIAG snapshot above still fire so we
+        // retain visibility into what the legacy path would have
+        // done.
+        if singingModeEnabled {
+            NSLog("[DIAG] StreamingRaagiModeEngine evidence-swap SUPPRESSED (sungMode owns lock/re-lock, shabadId=\(winner.entry.shabadId) matches=\(winner.entry.matchCount) latestScore=\(String(format: "%.1f", winner.entry.latestScore)) via=\(winner.via))")
+            return
+        }
+
         await performSwap(
             shabadId: winner.entry.shabadId,
             lineId: winner.entry.latestLineId,
