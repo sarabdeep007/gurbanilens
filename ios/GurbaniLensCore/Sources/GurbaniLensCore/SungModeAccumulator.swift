@@ -181,12 +181,101 @@ public struct SungModeAccumulatorStore: Equatable {
     /// passes).
     public static let reLockMinLowTierHits: Int = 2
 
+    // Brief #9.23 Part 1: repeat detection for alaap handling.
+    // Rationale in the brief: when the raagi holds on a tuk during a
+    // sustained vowel or melisma, ASR still emits partials for the
+    // vowel body but they all resolve to the same tuk. Meanwhile the
+    // matcher — asked to disambiguate common phrases like
+    // "gopal gobinde" — can float across many false shabads. The
+    // repeat detector notices when the same shabad keeps landing and
+    // reweights subsequent hits: the currently-repeated shabad gets
+    // a boost, cross-shabad "coincidental common-phrase" hits get
+    // downweighted. Clears when a genuinely-new shabad shows two
+    // consecutive hits, or on a timeout.
+
+    /// Post-increment count at which the repeat state activates
+    /// (i.e. from this hit onwards, boost/downweight multipliers
+    /// apply). Three consecutive same-shabad hits is roughly ~1.5 s
+    /// of raagi holding on a tuk at the streaming server's
+    /// ~500 ms partial cadence.
+    public static let repeatBoostThreshold: Int = 3
+    /// Multiplier applied to `addedWeight` for hits on the repeated
+    /// shabad (same as `RepeatState.shabadId`) while the state is
+    /// active.
+    public static let repeatBoostMultiplier: Double = 1.5
+    /// Multiplier applied to `addedWeight` for cross-shabad hits
+    /// (shabadId ≠ `RepeatState.shabadId`) while the state is
+    /// active. Suppresses the coincidental-common-phrase false
+    /// matches described in the brief.
+    public static let repeatDownweightMultiplier: Double = 0.5
+    /// Repeat state clears if no hit for the repeated shabad
+    /// arrives within this many seconds of `now`. Prevents a stale
+    /// boost from persisting into a new song.
+    public static let repeatTimeoutSeconds: TimeInterval = 8.0
+    /// Repeat state clears when a shabad OTHER than the repeated one
+    /// receives this many consecutive hits — signals the raagi has
+    /// genuinely moved on. Distinguished from a single stray
+    /// coincidental hit, which would trigger repeatedly and prevent
+    /// the boost from ever helping.
+    public static let repeatClearOtherShabadStreak: Int = 2
+
     // MARK: - State
 
     public private(set) var slots: [String: SungModeAccumulator]
 
+    /// Brief #9.23 Part 1: repeat-detection sidecar state. Nil when
+    /// no shabad has been seen recently; populated on the first hit
+    /// and updated on every subsequent ingest. See the
+    /// `repeatBoost…` tunables for semantics.
+    public private(set) var repeatState: RepeatState?
+
+    /// Sidecar state for the alaap repeat detector (Brief #9.23
+    /// Part 1). Distinct from `SungModeAccumulator` (per-shabad
+    /// evidence) — there is only one `RepeatState` at a time, and it
+    /// tracks the shabad the raagi is currently dwelling on.
+    public struct RepeatState: Equatable {
+        /// The shabad receiving the recent streak of hits. Multiplier
+        /// application compares this against the incoming `shabadId`.
+        public var shabadId: String
+        /// Most recent lineId for diagnostic logging; not used by
+        /// the multiplier logic (raagi may hold on a Rahao and drift
+        /// across sub-lines of the same tuk, all of which should
+        /// count toward the same repeat).
+        public var lineId: String
+        /// Consecutive-same-shabad hit count. Multipliers activate at
+        /// `repeatBoostThreshold`.
+        public var count: Int
+        /// Wall-clock timestamp of the most recent same-shabad hit;
+        /// drives the `repeatTimeoutSeconds` decay.
+        public var lastSeenAt: Date
+        /// Shabad-in-flight that could clear the repeat state if it
+        /// posts `repeatClearOtherShabadStreak` consecutive hits.
+        /// Nil when the last hit matched the repeat.
+        public var otherShabadStreakId: String?
+        /// Consecutive-different-shabad hit count for the streak
+        /// tracker above. Resets to 0 on any same-shabad hit.
+        public var otherShabadStreakCount: Int
+
+        public init(
+            shabadId: String,
+            lineId: String,
+            count: Int,
+            lastSeenAt: Date,
+            otherShabadStreakId: String? = nil,
+            otherShabadStreakCount: Int = 0
+        ) {
+            self.shabadId = shabadId
+            self.lineId = lineId
+            self.count = count
+            self.lastSeenAt = lastSeenAt
+            self.otherShabadStreakId = otherShabadStreakId
+            self.otherShabadStreakCount = otherShabadStreakCount
+        }
+    }
+
     public init(slots: [String: SungModeAccumulator] = [:]) {
         self.slots = slots
+        self.repeatState = nil
     }
 
     // MARK: - Public API
@@ -200,13 +289,18 @@ public struct SungModeAccumulatorStore: Equatable {
     ///   - tier: server tier (0=best..3=noisiest). Out-of-range clamps.
     ///   - now: current wall-clock time. Explicit so tests can pass
     ///          synthetic dates without touching real `Date()`.
+    ///   - lineId: incoming match's lineId. Threaded through to the
+    ///     Brief #9.23 Part 1 repeat detector purely for its
+    ///     diagnostic `RepeatState.lineId` field. Defaults to "" so
+    ///     existing tests keep compiling.
     public mutating func processMatch(
         shabadId: String,
         score: Double,
         tier: Int,
-        now: Date = Date()
+        now: Date = Date(),
+        lineId: String = ""
     ) -> SungModeLockDecision {
-        guard ingestMatch(shabadId: shabadId, score: score, tier: tier, now: now) else {
+        guard ingestMatch(shabadId: shabadId, score: score, tier: tier, now: now, lineId: lineId) else {
             return .noLock(top3Summary: topSummary(top: 3), slotCount: slots.count)
         }
 
@@ -253,14 +347,16 @@ public struct SungModeAccumulatorStore: Equatable {
         score: Double,
         tier: Int,
         currentShabadId: String,
-        now: Date = Date()
+        now: Date = Date(),
+        lineId: String = ""
     ) -> SungModeLockedDecision {
         guard ingestMatch(
             shabadId: shabadId,
             score: score,
             tier: tier,
             now: now,
-            protectedShabadId: currentShabadId
+            protectedShabadId: currentShabadId,
+            lineId: lineId
         ) else {
             // Brief #9.23a Fix 1: floor the read.
             let currentWeight = max(
@@ -369,12 +465,22 @@ public struct SungModeAccumulatorStore: Equatable {
         score: Double,
         tier: Int,
         now: Date,
-        protectedShabadId: String? = nil
+        protectedShabadId: String? = nil,
+        lineId: String = ""
     ) -> Bool {
         // 1. Floor-check the incoming hit.
         guard score >= Self.minScore else { return false }
         let tierClamped = max(0, min(tier, Self.tierMultiplier.count - 1))
-        let addedWeight = score * Self.tierMultiplier[tierClamped]
+
+        // Brief #9.23 Part 1: repeat-detector state update happens
+        // BEFORE weight computation so the multiplier below reflects
+        // the post-update state (i.e. the 3rd consecutive same-shabad
+        // hit sees `count == 3` and is itself boosted). Below-floor
+        // hits are skipped by the `guard` above — noise doesn't
+        // churn the repeat state.
+        updateRepeatState(shabadId: shabadId, lineId: lineId, now: now)
+        let repeatMult = repeatMultiplierFor(shabadId: shabadId)
+        let addedWeight = score * Self.tierMultiplier[tierClamped] * repeatMult
 
         // 2. Decay all existing slots to `now`.
         for (id, var acc) in slots {
@@ -434,6 +540,81 @@ public struct SungModeAccumulatorStore: Equatable {
     /// Drop all slots.
     public mutating func reset() {
         slots.removeAll()
+        repeatState = nil
+    }
+
+    // MARK: - Repeat detection (Brief #9.23 Part 1)
+
+    /// Update the sidecar `repeatState` for the current ingest.
+    /// Called from `ingestMatch` after the score-floor gate. Handles
+    /// timeout expiry, same-shabad increment, and different-shabad
+    /// streak tracking.
+    private mutating func updateRepeatState(
+        shabadId: String,
+        lineId: String,
+        now: Date
+    ) {
+        // Timeout: if the tracked shabad has gone quiet longer than
+        // `repeatTimeoutSeconds`, discard the state before deciding
+        // what this hit does. Prevents a stale boost from carrying
+        // into a new song.
+        if let state = repeatState,
+           now.timeIntervalSince(state.lastSeenAt) > Self.repeatTimeoutSeconds {
+            repeatState = nil
+        }
+
+        guard var state = repeatState else {
+            // Nothing tracked yet — this hit seeds a fresh state at
+            // count=1 (below the boost threshold, so no multiplier
+            // will apply yet).
+            repeatState = RepeatState(
+                shabadId: shabadId, lineId: lineId, count: 1, lastSeenAt: now
+            )
+            return
+        }
+
+        if state.shabadId == shabadId {
+            // Same shabad — extend the streak. Different lineId is
+            // fine; raagi holding a rahao may drift across sub-lines
+            // of the same tuk and it all counts as "dwelling here".
+            state.count += 1
+            state.lineId = lineId
+            state.lastSeenAt = now
+            state.otherShabadStreakId = nil
+            state.otherShabadStreakCount = 0
+            repeatState = state
+            return
+        }
+
+        // Different shabad — grow the other-shabad streak.
+        if state.otherShabadStreakId == shabadId {
+            state.otherShabadStreakCount += 1
+        } else {
+            state.otherShabadStreakId = shabadId
+            state.otherShabadStreakCount = 1
+        }
+        if state.otherShabadStreakCount >= Self.repeatClearOtherShabadStreak {
+            // Raagi has genuinely moved on — burn the state so the
+            // next hit seeds a fresh repeat.
+            repeatState = nil
+        } else {
+            repeatState = state
+        }
+    }
+
+    /// Repeat-detector multiplier for the current ingest. Reads the
+    /// state left by ``updateRepeatState`` on THIS same call. Returns
+    /// 1.0 when no active repeat, `repeatBoostMultiplier` for the
+    /// repeated shabad, `repeatDownweightMultiplier` for cross-shabad
+    /// hits during an active repeat.
+    private func repeatMultiplierFor(shabadId: String) -> Double {
+        guard let state = repeatState,
+              state.count >= Self.repeatBoostThreshold else {
+            return 1.0
+        }
+        return state.shabadId == shabadId
+            ? Self.repeatBoostMultiplier
+            : Self.repeatDownweightMultiplier
     }
 
     /// Format the top-N slots by weight as

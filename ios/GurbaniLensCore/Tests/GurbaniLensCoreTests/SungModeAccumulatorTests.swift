@@ -738,6 +738,131 @@ final class SungModeAccumulatorTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(tiers.filter { $0 <= 1 }.count, 2)
     }
 
+    // MARK: - Brief #9.23 Part 1: repeat detection for alaap
+
+    func test_repeatDetection_boostsCurrentShabadOn3ConsecutiveSameLineHits() {
+        // Feed 3 same-shabad same-line hits. The 3rd hit lands with
+        // count post-incremented to 3 — the boost threshold — so its
+        // weight is multiplied by repeatBoostMultiplier (1.5).
+        //
+        // Assertion: compare the 3rd-hit delta against a baseline
+        // store that saw 2 identical hits (post-decay reference).
+        // The 3rd hit's added weight should be 1.5× the baseline
+        // single-hit contribution.
+        var store = SungModeAccumulatorStore()
+        // Two hits — count goes 1 → 2, both unboosted.
+        _ = store.processMatch(shabadId: "BSJ", score: 50, tier: 0, now: at(0), lineId: "L1")
+        _ = store.processMatch(shabadId: "BSJ", score: 50, tier: 0, now: at(0.1), lineId: "L1")
+        XCTAssertEqual(store.repeatState?.count, 2)
+        // Snapshot weight just before the boosted hit lands. Third
+        // hit at t=0.2 — decay from the last update (t=0.1) is
+        // 0.1 s so weight barely moves.
+        let preBoostWeight = store.slots["BSJ"]?.totalWeight ?? 0
+        _ = store.processMatch(shabadId: "BSJ", score: 50, tier: 0, now: at(0.2), lineId: "L1")
+        let postBoostWeight = store.slots["BSJ"]?.totalWeight ?? 0
+        XCTAssertEqual(store.repeatState?.count, 3)
+
+        // Compute the decayed pre-boost weight the way the ingest
+        // pipeline does, then subtract to isolate the 3rd hit's
+        // contribution.
+        let decayFactor = pow(0.5, 0.1 / SungModeAccumulatorStore.halfLife)
+        let decayedPre = preBoostWeight * decayFactor
+        let addedByBoostedHit = postBoostWeight - decayedPre
+        // Baseline single-hit contribution for score 50 tier 0 is
+        // 50 * 2.0 = 100. Boosted: 100 * 1.5 = 150.
+        let baselineContribution = 50.0 * SungModeAccumulatorStore.tierMultiplier[0]
+        let expectedBoosted = baselineContribution * SungModeAccumulatorStore.repeatBoostMultiplier
+        XCTAssertEqual(addedByBoostedHit, expectedBoosted, accuracy: 0.5,
+                       "3rd hit should be boosted to \(expectedBoosted) (1.5× baseline \(baselineContribution))")
+    }
+
+    func test_repeatDetection_downweightsCrossShabadDuringRepeat() {
+        // Build repeat state on BSJ (3 same-shabad hits → count=3),
+        // then feed a cross-shabad hit. Multiplier for the cross-
+        // shabad update should be repeatDownweightMultiplier (0.5),
+        // producing HALF the baseline addedWeight.
+        var store = SungModeAccumulatorStore()
+        for i in 0..<3 {
+            _ = store.processMatch(shabadId: "BSJ", score: 50, tier: 0, now: at(Double(i) * 0.1), lineId: "L1")
+        }
+        XCTAssertEqual(store.repeatState?.shabadId, "BSJ")
+        XCTAssertEqual(store.repeatState?.count, 3)
+
+        // Cross-shabad hit — 1HU has no prior slot, so the added
+        // weight is exactly the slot's totalWeight after ingest.
+        _ = store.processMatch(shabadId: "1HU", score: 50, tier: 0, now: at(0.4), lineId: "LX")
+        let hitWeight = store.slots["1HU"]?.totalWeight ?? 0
+        let baselineContribution = 50.0 * SungModeAccumulatorStore.tierMultiplier[0]
+        let expected = baselineContribution * SungModeAccumulatorStore.repeatDownweightMultiplier
+        XCTAssertEqual(hitWeight, expected, accuracy: 0.001,
+                       "Cross-shabad hit during repeat should be 0.5× baseline (\(expected))")
+        // Repeat state should still exist (only 1 other-shabad hit,
+        // needs 2 to clear).
+        XCTAssertNotNil(store.repeatState)
+        XCTAssertEqual(store.repeatState?.otherShabadStreakId, "1HU")
+        XCTAssertEqual(store.repeatState?.otherShabadStreakCount, 1)
+    }
+
+    func test_repeatDetection_clearsOnNewShabadWith2ConsecutiveHits() {
+        // Build BSJ repeat state, then feed shabad B twice. On the
+        // 2nd B hit the other-shabad streak reaches
+        // repeatClearOtherShabadStreak (2) and the state clears.
+        // A subsequent hit for any shabad should NOT see any
+        // multiplier (both slots score normally).
+        var store = SungModeAccumulatorStore()
+        for i in 0..<3 {
+            _ = store.processMatch(shabadId: "BSJ", score: 50, tier: 0, now: at(Double(i) * 0.1), lineId: "L1")
+        }
+        XCTAssertEqual(store.repeatState?.count, 3)
+
+        // Two consecutive cross-shabad hits.
+        _ = store.processMatch(shabadId: "OTH", score: 50, tier: 0, now: at(0.4), lineId: "LX")
+        _ = store.processMatch(shabadId: "OTH", score: 50, tier: 0, now: at(0.5), lineId: "LY")
+        XCTAssertNil(store.repeatState, "Repeat state must clear after 2 consecutive different-shabad hits")
+
+        // Feed a 3rd OTH hit — because the state was just cleared,
+        // this seeds a fresh repeat starting at count=1 → no boost
+        // yet. Weight added should be the plain baseline.
+        let preWeight = store.slots["OTH"]?.totalWeight ?? 0
+        _ = store.processMatch(shabadId: "OTH", score: 50, tier: 0, now: at(0.6), lineId: "LZ")
+        let postWeight = store.slots["OTH"]?.totalWeight ?? 0
+        let decayFactor = pow(0.5, 0.1 / SungModeAccumulatorStore.halfLife)
+        let addedByNormalHit = postWeight - preWeight * decayFactor
+        let baselineContribution = 50.0 * SungModeAccumulatorStore.tierMultiplier[0]
+        XCTAssertEqual(addedByNormalHit, baselineContribution, accuracy: 0.5,
+                       "After state cleared, next hit should score at baseline (\(baselineContribution))")
+        // A brand-new state should now be tracking OTH at count=1.
+        XCTAssertEqual(store.repeatState?.shabadId, "OTH")
+        XCTAssertEqual(store.repeatState?.count, 1)
+    }
+
+    func test_repeatDetection_clearsOn8SecondTimeout() {
+        // Build BSJ repeat state, then advance past repeatTimeoutSeconds
+        // (8.0). Any subsequent hit should see the state torn down
+        // BEFORE the multiplier check, so a cross-shabad hit gets
+        // no downweight.
+        var store = SungModeAccumulatorStore()
+        for i in 0..<3 {
+            _ = store.processMatch(shabadId: "BSJ", score: 50, tier: 0, now: at(Double(i) * 0.1), lineId: "L1")
+        }
+        XCTAssertEqual(store.repeatState?.count, 3)
+
+        // Just past the timeout — repeat state should be cleared on
+        // the next ingest.
+        let past = 0.2 + SungModeAccumulatorStore.repeatTimeoutSeconds + 0.1
+        _ = store.processMatch(shabadId: "OTH", score: 50, tier: 0, now: at(past), lineId: "LX")
+
+        // OTH weight added at baseline — no downweight because state
+        // was torn down before multiplier evaluation.
+        let othWeight = store.slots["OTH"]?.totalWeight ?? 0
+        let baselineContribution = 50.0 * SungModeAccumulatorStore.tierMultiplier[0]
+        XCTAssertEqual(othWeight, baselineContribution, accuracy: 0.001,
+                       "Post-timeout cross-shabad hit should score at baseline (\(baselineContribution))")
+        // A fresh repeat state should be seeded on OTH at count=1.
+        XCTAssertEqual(store.repeatState?.shabadId, "OTH")
+        XCTAssertEqual(store.repeatState?.count, 1)
+    }
+
     func test_reLockRequiresTwoLowTierHits_stillFiresOnCleanChallenger() {
         // Brief #9.23a Fix 2 sanity: 4 clean tier-1 hits still reLock
         // normally. tier=1 is counted as low-tier (≤ 1), so

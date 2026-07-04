@@ -567,7 +567,7 @@ public final class StreamingRaagiModeEngine: ObservableObject {
             NSLog("[DIAG] StreamingRaagiModeEngine sungMode discovery tier-3 skip seq=\(seq) shabadId=\(shabadId) score=\(String(format: "%.1f", score))")
             return
         }
-        let decision = sungStore.processMatch(shabadId: shabadId, score: score, tier: tier)
+        let decision = sungStore.processMatch(shabadId: shabadId, score: score, tier: tier, lineId: lineId)
         // Diagnostic: computed weight contribution for this event.
         // Matches the brief's suggested log format.
         let tierClamped = max(0, min(tier, SungModeAccumulatorStore.tierMultiplier.count - 1))
@@ -627,7 +627,7 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         // ignore the decision and just log the diagnostic.
         if singingModeEnabled, let currentId = currentShabad?.id {
             let decision = sungStore.processMatchInLocked(
-                shabadId: currentId, score: score, tier: tier, currentShabadId: currentId
+                shabadId: currentId, score: score, tier: tier, currentShabadId: currentId, lineId: lineId
             )
             if case .noSwap(let top3Summary, let slotCount, let currentWeight) = decision {
                 NSLog("[DIAG] StreamingRaagiModeEngine sungMode locked-acc seq=\(seq) same-shabad \(currentId) tier=\(tier) score=\(String(format: "%.1f", score)) → current:\(String(format: "%.1f", currentWeight)) top3=[\(top3Summary)] slotCount=\(slotCount)")
@@ -702,7 +702,7 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         // shabads directly and return.
         if singingModeEnabled, let currentId = currentShabad?.id {
             let decision = sungStore.processMatchInLocked(
-                shabadId: shabadId, score: score, tier: tier, currentShabadId: currentId
+                shabadId: shabadId, score: score, tier: tier, currentShabadId: currentId, lineId: lineId
             )
             switch decision {
             case .noSwap(let top3Summary, let slotCount, let currentWeight):
