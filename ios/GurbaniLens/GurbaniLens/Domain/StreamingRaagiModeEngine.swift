@@ -290,13 +290,39 @@ public final class StreamingRaagiModeEngine: ObservableObject {
 
     // MARK: - Init
 
-    /// Brief #9.20: Sung Kirtan Mode (Beta) flag, read at init from
-    /// UserDefaults. When true, DISCOVERING uses a decaying multi-slot
-    /// accumulator instead of the single-slot pendingCandidate path.
-    /// LOCKED-state behavior is unchanged. Read once at init — a
-    /// mid-session toggle takes effect at the NEXT raagi-mode start
-    /// (matches the streaming/raagi flag pattern).
-    private let singingModeEnabled: Bool
+    /// Brief #9.20: Sung Kirtan Mode (Beta) flag. Brief #9.23d: read
+    /// FRESH from UserDefaults on every access. The original #9.20
+    /// design stored a snapshot at init to match the streaming/raagi
+    /// flag pattern, but that produced a split-brain bug on Deep's
+    /// 2026-07-05 iPhone log — session B's engine.init logged
+    /// `singingMode=false` while StreamingProvider (which reads the
+    /// same UserDefaults key fresh at connect) opened
+    /// `?mode=sung`. Rather than trust ANY cached snapshot, this
+    /// property now hits UserDefaults on every read, guaranteeing
+    /// consistency with the toggle UI. `settingsSingingModeKey`
+    /// centralizes the key name so accidental key drift can't recur.
+    static let settingsSingingModeKey: String = "settings.singingModeEnabled"
+    private var singingModeEnabled: Bool {
+        UserDefaults.standard.bool(forKey: Self.settingsSingingModeKey)
+    }
+    /// Brief #9.23d: last-observed value of `singingModeEnabled`, used
+    /// by ``checkSungModeToggle`` to detect user-driven changes and
+    /// fire the ``didToggleSungMode`` reset. Seeded at init to the
+    /// current UserDefaults value so the first observer notification
+    /// doesn't spuriously fire.
+    private var lastKnownSungModeEnabled: Bool
+    /// Brief #9.23d: NotificationCenter token for the UserDefaults
+    /// change observer. Kept so `deinit` can drop it cleanly. Fired on
+    /// EVERY UserDefaults write; the observer callback compares
+    /// against `lastKnownSungModeEnabled` to no-op on unrelated keys.
+    private var userDefaultsObserver: NSObjectProtocol?
+    /// Brief #9.23d: value of `singingModeEnabled` at the moment we
+    /// called `provider.connect()` in the last `start()`. The
+    /// StreamingProvider reads UserDefaults at connect time to pick
+    /// `?mode=sung`; if the user toggles mid-session the server keeps
+    /// running with whatever was on the handshake. We log this at
+    /// toggle-change time so the trace makes the mismatch obvious.
+    private var wsHandshakeSungModeAtStart: Bool?
     /// Brief #9.20: sung-mode discovery accumulator. Empty in speech
     /// mode and always empty in LOCKED. Reset on stop() and on
     /// successful lock.
@@ -320,7 +346,11 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         self.cache = ShabadCache(corpus: corpus)
         self.provider = provider
         self.mic = StreamingMicCapture()
-        self.singingModeEnabled = UserDefaults.standard.bool(forKey: "settings.singingModeEnabled")
+        // Brief #9.23d: seed change-detection baseline with the same
+        // fresh UserDefaults read that the computed property uses. Any
+        // future divergence from this baseline (via the observer below)
+        // fires `didToggleSungMode`.
+        self.lastKnownSungModeEnabled = UserDefaults.standard.bool(forKey: Self.settingsSingingModeKey)
         var store = SungModeAccumulatorStore()
         // Brief #9.23 Part 4: hydrate the ambiguous-shabad set from
         // the app bundle. Missing / malformed JSON isn't fatal — the
@@ -332,7 +362,75 @@ public final class StreamingRaagiModeEngine: ObservableObject {
             NSLog("[DIAG] StreamingRaagiModeEngine ambiguousSet NOT loaded — multiplier inert")
         }
         self.sungStore = store
-        NSLog("[DIAG] StreamingRaagiModeEngine.init singingMode=\(self.singingModeEnabled)")
+        NSLog("[DIAG] StreamingRaagiModeEngine.init singingMode=\(self.lastKnownSungModeEnabled) (fresh read)")
+
+        // Brief #9.23d: subscribe to UserDefaults changes so a user
+        // toggle mid-session fires the reset handler
+        // (`didToggleSungMode`). NotificationCenter posts on any key
+        // change — the observer callback compares against
+        // `lastKnownSungModeEnabled` to filter out unrelated writes.
+        // Delivered on `.main` queue and bridged into the actor via
+        // a `Task { @MainActor in ... }` so all engine state mutations
+        // stay MainActor-isolated.
+        userDefaultsObserver = NotificationCenter.default.addObserver(
+            forName: UserDefaults.didChangeNotification,
+            object: UserDefaults.standard,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.checkSungModeToggle()
+            }
+        }
+    }
+
+    deinit {
+        if let obs = userDefaultsObserver {
+            NotificationCenter.default.removeObserver(obs)
+        }
+    }
+
+    // MARK: - Reactive sung-mode toggle (Brief #9.23d)
+
+    /// Brief #9.23d: called on every UserDefaults change notification.
+    /// Compares the fresh value against `lastKnownSungModeEnabled` and,
+    /// on a real toggle, calls `didToggleSungMode(_:)`. Cheap enough to
+    /// run on every UserDefaults write (one dict lookup + one bool
+    /// compare); the observer fires often (any @AppStorage set), so
+    /// this MUST early-return on unchanged values.
+    private func checkSungModeToggle() {
+        let now = self.singingModeEnabled
+        if now == lastKnownSungModeEnabled { return }
+        let old = lastKnownSungModeEnabled
+        lastKnownSungModeEnabled = now
+        didToggleSungMode(from: old, to: now)
+    }
+
+    /// Brief #9.23d: user toggled Sung Kirtan Mode mid-session.
+    /// Resets sung-mode transient state (accumulator slots, alaap,
+    /// empty-partial counter, repeat detector, alaapMode flag) so the
+    /// new mode starts clean. **Does not** touch `currentShabad`,
+    /// `currentLineId`, `lockState`, `challengers`, `currentDisplaySeq`,
+    /// or the peak-score/time tracking — the user's visible pangti
+    /// stays put through the toggle. **Does not** force a WebSocket
+    /// reconnect; the server was told `mode=sung` (or not) at
+    /// handshake time and continues with that window profile until
+    /// the next session. When the handshake value diverges from the
+    /// new toggle we log a note so the trace makes the mismatch
+    /// obvious.
+    private func didToggleSungMode(from old: Bool, to new: Bool) {
+        let accumulatorState: String
+        if new {
+            accumulatorState = sungStore.slots.isEmpty ? "active-empty" : "active-\(sungStore.slots.count)-slots"
+        } else {
+            accumulatorState = sungStore.slots.isEmpty ? "inactive-empty" : "inactive-\(sungStore.slots.count)-slots-will-reset"
+        }
+        NSLog("[DIAG] StreamingRaagiModeEngine sungMode CHANGED old=\(old) new=\(new) at \(ISO8601DateFormatter().string(from: Date())) accumulator=\(accumulatorState)")
+        if let handshake = wsHandshakeSungModeAtStart, handshake != new {
+            NSLog("[DIAG] StreamingRaagiModeEngine mid-session sungMode toggle: WS handshake was mode=\(handshake ? "sung" : "speech"), server will not reconfigure until next session")
+        }
+        sungStore.reset()
+        emptyPartialCount = 0
+        alaapState = false
     }
 
     // MARK: - Effective-lineId resolver (Brief #9.24 Part 7)
@@ -376,7 +474,15 @@ public final class StreamingRaagiModeEngine: ObservableObject {
             return
         }
         NSLog("[DIAG] StreamingRaagiModeEngine.start (state=discovering)")
-        NSLog("[DIAG] StreamingRaagiModeEngine sungMode=\(singingModeEnabled) at start")
+        // Brief #9.23d: re-sync the change-detection baseline with a
+        // fresh read; a toggle that happened while the engine was
+        // stopped won't fire the observer's diff, but the next
+        // `checkSungModeToggle` should treat the current value as the
+        // baseline (not the value from the prior session).
+        let sungAtStart = self.singingModeEnabled
+        lastKnownSungModeEnabled = sungAtStart
+        wsHandshakeSungModeAtStart = sungAtStart
+        NSLog("[DIAG] StreamingRaagiModeEngine sungMode=\(sungAtStart) at start (fresh read)")
         setAudioState(.listening)
         bufferEnergy = 0
         activeJaikara = nil
@@ -523,6 +629,13 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         score: Double,
         tier: Int
     ) async {
+        // Brief #9.23d: log a fresh read of the toggle at every match
+        // so the trace shows whether sung-mode gates are firing as
+        // expected. Cheap (one UserDefaults dict lookup); noisy but
+        // essential — this line is the smoking gun for the split-brain
+        // toggle bug Deep hit on 2026-07-05.
+        let sungNow = self.singingModeEnabled
+        NSLog("[DIAG] StreamingRaagiModeEngine handleMatch sungModeEnabled=\(sungNow) seq=\(seq) shabadId=\(shabadId) tier=\(tier) score=\(String(format: "%.1f", score))")
         // Stale check — newer match already won display.
         if seq < currentDisplaySeq {
             NSLog("[DIAG] StreamingRaagiModeEngine match seq=\(seq) currentDisplaySeq=\(currentDisplaySeq) result=stale (pre-fetch)")
@@ -630,6 +743,7 @@ public final class StreamingRaagiModeEngine: ObservableObject {
             NSLog("[DIAG] StreamingRaagiModeEngine sungMode discovery tier-3 skip seq=\(seq) shabadId=\(shabadId) score=\(String(format: "%.1f", score))")
             return
         }
+        NSLog("[DIAG] SungModeAccumulator.processMatch sungModeEnabled=\(self.singingModeEnabled) shabadId=\(shabadId) score=\(String(format: "%.1f", score)) tier=\(tier) seq=\(seq)")
         let decision = sungStore.processMatch(shabadId: shabadId, score: score, tier: tier, lineId: lineId)
         // Diagnostic: computed weight contribution for this event.
         // Matches the brief's suggested log format.
@@ -689,6 +803,7 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         // trigger reLock by definition (leader IS current), so we
         // ignore the decision and just log the diagnostic.
         if singingModeEnabled, let currentId = currentShabad?.id {
+            NSLog("[DIAG] SungModeAccumulator.processMatchInLocked sungModeEnabled=true same-shabad shabadId=\(currentId) score=\(String(format: "%.1f", score)) tier=\(tier) seq=\(seq)")
             let decision = sungStore.processMatchInLocked(
                 shabadId: currentId, score: score, tier: tier, currentShabadId: currentId, lineId: lineId
             )
@@ -764,6 +879,7 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         // high-score short-circuit intact). On .reLock we swap
         // shabads directly and return.
         if singingModeEnabled, let currentId = currentShabad?.id {
+            NSLog("[DIAG] SungModeAccumulator.processMatchInLocked sungModeEnabled=true cross-shabad shabadId=\(shabadId) currentShabad=\(currentId) score=\(String(format: "%.1f", score)) tier=\(tier) seq=\(seq)")
             let decision = sungStore.processMatchInLocked(
                 shabadId: shabadId, score: score, tier: tier, currentShabadId: currentId, lineId: lineId
             )
