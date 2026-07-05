@@ -29,12 +29,14 @@ struct RaagiView: View {
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
+                // Brief #9.24 Part 8: center-align the pangti stack to
+                // match sundar-gutka / Gurdwara projector convention.
+                VStack(alignment: .center, spacing: 14) {
                     Text(shabad.headerLabel)
                         .font(.system(size: 13, weight: .medium))
                         .foregroundColor(Theme.onSurfaceVariant)
-                        .padding(.leading, 4)
                         .padding(.top, 8)
+                        .frame(maxWidth: .infinity, alignment: .center)
 
                     // Brief #9.24 Part 6: section title (Sloku ॥,
                     // Astpadi ॥, Paurhi ॥…) preceding the current
@@ -44,7 +46,7 @@ struct RaagiView: View {
                         Text(section)
                             .font(.notoSerifGurmukhi(14, weight: .medium))
                             .foregroundColor(Self.highlightTint.opacity(0.7))
-                            .padding(.leading, 4)
+                            .frame(maxWidth: .infinity, alignment: .center)
                     }
 
                     ForEach(shabad.lines, id: \.id) { line in
@@ -76,10 +78,10 @@ struct RaagiView: View {
         Text(rowGurmukhi(line))
             .font(.notoSerifGurmukhi(24, weight: .medium))
             .foregroundColor(Theme.onSurface)
-            .multilineTextAlignment(.leading)
+            .multilineTextAlignment(.center)
             .padding(.vertical, 10)
             .padding(.horizontal, 14)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .center)
             .background(
                 RoundedRectangle(cornerRadius: 10)
                     .fill(Self.highlightTintBackground)
@@ -96,10 +98,10 @@ struct RaagiView: View {
         Text(rowGurmukhi(line))
             .font(.notoSerifGurmukhi(20))
             .foregroundColor(Theme.onSurfaceVariant.opacity(0.85))
-            .multilineTextAlignment(.leading)
+            .multilineTextAlignment(.center)
             .padding(.vertical, 4)
             .padding(.horizontal, 14)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .center)
             .id(line.id)
     }
 
