@@ -31,6 +31,15 @@ struct RaagiModeScreen<Engine: RaagiModeViewModel>: View {
 
     @AppStorage("settings.raagiViewMode") private var viewModeRaw: String = "raagi"
 
+    /// Brief #9.24 Part 5: view-layer peek state. When non-nil, the
+    /// content area renders `shabad.lines[peekIndex]` instead of the
+    /// engine's live `currentLineId`, and a "▶ Resume auto-follow"
+    /// pill appears at the bottom. Auto-follow (engine + accumulator)
+    /// keeps running behind the scenes — only the display is frozen.
+    /// Tapping the pill clears peek and snaps back to whatever the
+    /// engine is on at that moment.
+    @State private var peekIndex: Int? = nil
+
     private var viewMode: ViewMode {
         ViewMode(rawValue: viewModeRaw) ?? .raagi
     }
@@ -131,31 +140,106 @@ struct RaagiModeScreen<Engine: RaagiModeViewModel>: View {
 
     @ViewBuilder
     private var content: some View {
-        Group {
-            if let shabad = engine.currentShabad, let lineId = engine.currentLineId {
-                // Sticky shabad on screen. Audio cycles in the bottom
-                // bar independently — this view doesn't react to
-                // .listening / .recording / .processing transitions
-                // at all.
-                shabadView(shabad: shabad, lineId: lineId)
-                    // .id() on the shabadId means SwiftUI treats a
-                    // cross-shabad swap as "different view", which
-                    // makes the .transition(.opacity) actually fire
-                    // the cross-fade. Without the .id, SwiftUI sees
-                    // the same RaagiView/SangatView struct and just
-                    // updates props.
-                    .id("\(shabad.id)#\(viewMode.rawValue)")
-                    .transition(.opacity)
-            } else {
-                entryHint
-                    .id("entry-hint")
-                    .transition(.opacity)
+        ZStack(alignment: .bottom) {
+            Group {
+                if let shabad = engine.currentShabad, let lineId = engine.currentLineId {
+                    // Sticky shabad on screen. Audio cycles in the bottom
+                    // bar independently — this view doesn't react to
+                    // .listening / .recording / .processing transitions
+                    // at all.
+                    let displayLineId = effectiveLineId(shabad: shabad, liveLineId: lineId)
+                    shabadView(shabad: shabad, lineId: displayLineId)
+                        // .id() on the shabadId means SwiftUI treats a
+                        // cross-shabad swap as "different view", which
+                        // makes the .transition(.opacity) actually fire
+                        // the cross-fade. Without the .id, SwiftUI sees
+                        // the same RaagiView/SangatView struct and just
+                        // updates props.
+                        .id("\(shabad.id)#\(viewMode.rawValue)")
+                        .transition(.opacity)
+                        .contentShape(Rectangle())
+                        .gesture(peekSwipeGesture(shabad: shabad, liveLineId: lineId))
+                } else {
+                    entryHint
+                        .id("entry-hint")
+                        .transition(.opacity)
+                }
+            }
+            // Brief #9.24 Part 5: Resume-auto-follow pill. Only shown
+            // when the user has swiped into peek mode. Tapping it
+            // clears peek and lets the engine's live currentLineId
+            // drive display again.
+            if peekIndex != nil {
+                resumePill
+                    .padding(.bottom, 12)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
+        .animation(.easeInOut(duration: 0.2), value: peekIndex)
         // .animation pulls SwiftUI into the .transition for both
         // (nil ↔ shabad) and (shabadA ↔ shabadB) swaps. 250 ms
         // matches the jaikara banner fade.
         .animation(.easeInOut(duration: 0.25), value: engine.currentShabad?.id)
+        // Cross-shabad swap clears peek — a different shabad has no
+        // meaningful continuation of the previous peek index.
+        .onChange(of: engine.currentShabad?.id) { _ in
+            peekIndex = nil
+        }
+    }
+
+    // MARK: - Peek helpers (Brief #9.24 Part 5)
+
+    private func effectiveLineId(shabad: FullShabad, liveLineId: String) -> String {
+        guard let idx = peekIndex, shabad.lines.indices.contains(idx) else {
+            return liveLineId
+        }
+        return shabad.lines[idx].id
+    }
+
+    /// Horizontal drag → advance / retreat peek by one line. Cheap
+    /// enough to install on every render; SwiftUI keeps the gesture
+    /// stable across view updates because the closure captures only
+    /// value-type state.
+    private func peekSwipeGesture(shabad: FullShabad, liveLineId: String) -> some Gesture {
+        DragGesture(minimumDistance: 30)
+            .onEnded { value in
+                let dx = value.translation.width
+                let dy = value.translation.height
+                // Reject near-vertical drags so they don't fight
+                // RaagiView's own scroll.
+                guard abs(dx) > abs(dy) * 1.3 else { return }
+                let currentIdx = peekIndex ??
+                    (shabad.lines.firstIndex(where: { $0.id == liveLineId }) ?? 0)
+                let delta = dx < 0 ? 1 : -1
+                let next = max(0, min(shabad.lines.count - 1, currentIdx + delta))
+                peekIndex = next
+            }
+    }
+
+    private var resumePill: some View {
+        Button {
+            peekIndex = nil
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "play.fill")
+                    .font(.system(size: 12, weight: .semibold))
+                Text("Resume auto-follow")
+                    .font(.system(size: 14, weight: .medium))
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+            .foregroundColor(Theme.onPrimary)
+            .background(
+                Capsule().fill(Theme.primary.opacity(0.9))
+            )
+            .overlay(
+                Capsule().stroke(Theme.onPrimary.opacity(0.2), lineWidth: 0.5)
+            )
+        }
+        .buttonStyle(.plain)
+        // 44 pt min tap target satisfied by the padding above (30 pt
+        // width + inline text expands well past 44 pt).
+        .accessibilityLabel("Resume auto-follow")
     }
 
     @ViewBuilder
