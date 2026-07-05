@@ -738,6 +738,79 @@ final class SungModeAccumulatorTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(tiers.filter { $0 <= 1 }.count, 2)
     }
 
+    // MARK: - Brief #9.23 Part 3: alaap-mode re-lock ratio gate
+
+    func test_alaapMode_requiresDoubleRatioForReLock() {
+        // Verifies the alaapReLockRatio (2.0) supplants the normal
+        // lockRatio (1.5) in the LOCKED-state ratio-vs-current gate
+        // when `alaapMode` is set. Two identical event streams into
+        // two identical stores — only alaapMode differs. The event
+        // set is tuned so the challenger:current ratio lands between
+        // 1.5 and 2.0: the non-alaap store re-locks, the alaap store
+        // does not. One extra strong challenger hit then pushes the
+        // alaap store past 2.0 → reLock fires under alaap too.
+
+        // Build a store primed with BSJ at weight 130 (2 seed hits
+        // then cap to a precise value). Two hits keeps repeatState
+        // below the boost threshold, so it doesn't perturb weights.
+        func primed(alaap: Bool) -> SungModeAccumulatorStore {
+            var s = SungModeAccumulatorStore()
+            s.alaapMode = alaap
+            _ = s.processMatch(shabadId: "BSJ", score: 50, tier: 0, now: at(0))
+            _ = s.processMatch(shabadId: "BSJ", score: 50, tier: 0, now: at(0.05))
+            s.capWeight(shabadId: "BSJ", cap: 130)
+            return s
+        }
+
+        // Challenger events tuned for ratio ~1.7 vs decayed BSJ ~115.
+        // 2 tier-1 hits at score 40 (weight 60 each) + 2 tier-2 hits
+        // at score 40 (weight 40 each). Total raw ≈ 200, low-tier
+        // count = 2 (satisfies reLockMinLowTierHits).
+        let events: [(score: Double, tier: Int)] = [
+            (40, 1), (40, 1), (40, 2), (40, 2),
+        ]
+
+        // Non-alaap: ratio ~1.7 > 1.5 → reLock fires.
+        var normal = primed(alaap: false)
+        var lastNormal: SungModeLockedDecision =
+            .noSwap(top3Summary: "", slotCount: 0, currentWeight: 0)
+        for (i, ev) in events.enumerated() {
+            lastNormal = normal.processMatchInLocked(
+                shabadId: "1HU", score: ev.score, tier: ev.tier,
+                currentShabadId: "BSJ", now: at(1.0 + Double(i) * 0.05)
+            )
+        }
+        guard case .reLock(let normalId, _, _, _, _, _) = lastNormal else {
+            XCTFail("Non-alaap should reLock at ratio >1.5; got \(lastNormal)"); return
+        }
+        XCTAssertEqual(normalId, "1HU")
+
+        // Alaap: identical stream, ratio ~1.7 < 2.0 → noSwap.
+        var alaap = primed(alaap: true)
+        var lastAlaap: SungModeLockedDecision =
+            .noSwap(top3Summary: "", slotCount: 0, currentWeight: 0)
+        for (i, ev) in events.enumerated() {
+            lastAlaap = alaap.processMatchInLocked(
+                shabadId: "1HU", score: ev.score, tier: ev.tier,
+                currentShabadId: "BSJ", now: at(1.0 + Double(i) * 0.05)
+            )
+        }
+        if case .reLock = lastAlaap {
+            XCTFail("Alaap should NOT reLock at ratio <2.0; got \(lastAlaap)")
+        }
+
+        // One more strong challenger hit pushes ratio comfortably
+        // past 2.0 — reLock should now fire under alaap too.
+        let bump = alaap.processMatchInLocked(
+            shabadId: "1HU", score: 100, tier: 1,
+            currentShabadId: "BSJ", now: at(1.25)
+        )
+        guard case .reLock(let bumpId, _, _, _, _, _) = bump else {
+            XCTFail("Alaap should reLock once ratio clears 2.0; got \(bump)"); return
+        }
+        XCTAssertEqual(bumpId, "1HU")
+    }
+
     // MARK: - Brief #9.23 Part 1: repeat detection for alaap
 
     func test_repeatDetection_boostsCurrentShabadOn3ConsecutiveSameLineHits() {

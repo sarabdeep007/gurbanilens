@@ -219,6 +219,17 @@ public struct SungModeAccumulatorStore: Equatable {
     /// the boost from ever helping.
     public static let repeatClearOtherShabadStreak: Int = 2
 
+    /// Brief #9.23 Part 3: elevated re-lock ratio applied while the
+    /// engine reports `alaapMode = true` (four consecutive empty
+    /// ASR partials — the raagi is holding a vowel, and the matcher
+    /// gets no phoneme progression to work with). Under alaap the
+    /// re-lock gate demands 2.0× current-shabad weight instead of
+    /// the usual 1.5×, so a coincidental cross-shabad hit stack has
+    /// to be that much stronger before it can override a
+    /// legitimately-locked shabad. Reverts to `lockRatio` the
+    /// moment a non-empty partial arrives.
+    public static let alaapReLockRatio: Double = 2.0
+
     // MARK: - State
 
     public private(set) var slots: [String: SungModeAccumulator]
@@ -228,6 +239,15 @@ public struct SungModeAccumulatorStore: Equatable {
     /// and updated on every subsequent ingest. See the
     /// `repeatBoost…` tunables for semantics.
     public private(set) var repeatState: RepeatState?
+
+    /// Brief #9.23 Part 3: engine-driven alaap flag. Set true when
+    /// the engine observes N consecutive empty ASR partials (raagi
+    /// is on a sustained vowel / melisma); cleared on the first non-
+    /// empty partial. While true, `processMatchInLocked` uses the
+    /// tightened `alaapReLockRatio` (2.0) instead of `lockRatio`
+    /// (1.5) as the re-lock ratio-vs-current gate. Read-write so
+    /// the engine can toggle it in step with its own alaap state.
+    public var alaapMode: Bool = false
 
     /// Sidecar state for the alaap repeat detector (Brief #9.23
     /// Part 1). Distinct from `SungModeAccumulator` (per-shabad
@@ -406,8 +426,12 @@ public struct SungModeAccumulatorStore: Equatable {
         //                    lastTiers ring. Blocks a single tier-1
         //                    hit amid tier-3 noise (Deep's #9.22
         //                    tiers=[3,3,1,2] false swap).
+        // Brief #9.23 Part 3: when alaapMode is set, the ratio gate
+        // tightens from lockRatio (1.5) to alaapReLockRatio (2.0).
+        // Other gates are unchanged.
+        let effectiveRatio = alaapMode ? Self.alaapReLockRatio : Self.lockRatio
         let hasWeight = topAcc.totalWeight >= Self.lockWeightThreshold
-        let hasRatio = topAcc.totalWeight >= currentWeight * Self.lockRatio
+        let hasRatio = topAcc.totalWeight >= currentWeight * effectiveRatio
         let hasHits = topAcc.hitCount >= Self.reLockMinHits
         let isRecent = now.timeIntervalSince(topAcc.lastSeenAt) <= Self.reLockMinRecencySeconds
         let hasGoodTier = topAcc.lastTiers.filter { $0 <= 1 }.count >= Self.reLockMinLowTierHits
@@ -541,6 +565,7 @@ public struct SungModeAccumulatorStore: Equatable {
     public mutating func reset() {
         slots.removeAll()
         repeatState = nil
+        alaapMode = false
     }
 
     // MARK: - Repeat detection (Brief #9.23 Part 1)

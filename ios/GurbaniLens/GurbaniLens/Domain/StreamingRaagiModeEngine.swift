@@ -302,6 +302,19 @@ public final class StreamingRaagiModeEngine: ObservableObject {
     /// successful lock.
     private var sungStore: SungModeAccumulatorStore
 
+    /// Brief #9.23 Part 3: consecutive empty/whitespace ASR partials
+    /// received while LOCKED under sung-mode. When this reaches
+    /// `alaapEmptyPartialThreshold` the engine flips into alaap
+    /// state and hardens the re-lock ratio gate in `sungStore`.
+    private var emptyPartialCount: Int = 0
+    /// Brief #9.23 Part 3: true after `emptyPartialCount` crosses
+    /// the threshold. Cleared as soon as a non-empty partial lands.
+    private var alaapState: Bool = false
+    /// Brief #9.23 Part 3: how many empty partials in a row before
+    /// alaap kicks in. At the streaming server's ~500 ms cadence, 4
+    /// covers ~2 s of sustained-vowel — a real hold, not a brief gap.
+    private static let alaapEmptyPartialThreshold: Int = 4
+
     public init(corpus: Corpus, provider: StreamingProvider) {
         self.corpus = corpus
         self.cache = ShabadCache(corpus: corpus)
@@ -334,6 +347,8 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         lastFLMatchLen = 0
         lastFLMatchAttemptTime = nil
         sungStore.reset()
+        emptyPartialCount = 0
+        alaapState = false
         lockState = .discovering
         pendingCandidate = nil
         challengers.removeAll(keepingCapacity: true)
@@ -401,6 +416,8 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         pendingCandidate = nil
         challengers.removeAll(keepingCapacity: true)
         sungStore.reset()
+        emptyPartialCount = 0
+        alaapState = false
     }
 
     // MARK: - Activity → audioState
@@ -428,6 +445,9 @@ public final class StreamingRaagiModeEngine: ObservableObject {
             }
 
         case .partial(_, let transcript, _):
+            // Brief #9.23 Part 3: track ASR-silent partials so the
+            // sung-mode re-lock ratio gate can tighten during alaap.
+            updateAlaapStateIfNeeded(transcript: transcript)
             // Brief #9.7-iOS: partials drive the local FL match for
             // fast within-shabad pangti highlight. Match events
             // (server) still drive the lock state machine and any
@@ -794,6 +814,42 @@ public final class StreamingRaagiModeEngine: ObservableObject {
             tier: tier,
             challengerMatchCount: winner.entry.matchCount
         )
+    }
+
+    // MARK: - Alaap detection (Brief #9.23 Part 3)
+
+    /// Track consecutive empty/whitespace ASR partials while LOCKED
+    /// under sung-mode. Four in a row (~2 s at ~500 ms cadence) flips
+    /// the engine into alaap state, which tightens the sung-mode
+    /// re-lock ratio gate on the accumulator from 1.5× to 2.0×. The
+    /// first non-empty partial clears the state and reverts the gate.
+    ///
+    /// Only meaningful under sung-mode and in LOCKED — discovery has
+    /// no lock to defend, and speech-mode doesn't route through the
+    /// sung-mode accumulator paths. Cheap on the hot path: a trim +
+    /// isEmpty check on the partial's transcript.
+    private func updateAlaapStateIfNeeded(transcript: String) {
+        guard singingModeEnabled else { return }
+        guard case .locked = lockState else { return }
+        let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            emptyPartialCount += 1
+            if emptyPartialCount >= Self.alaapEmptyPartialThreshold, !alaapState {
+                alaapState = true
+                sungStore.alaapMode = true
+                NSLog("[DIAG] StreamingRaagiModeEngine alaapState=true (emptyCount=\(emptyPartialCount) windowSec=2.0)")
+            }
+            return
+        }
+        // Non-empty partial resumes normal cadence — reset counter,
+        // clear alaap.
+        let wasAlaap = alaapState
+        emptyPartialCount = 0
+        if wasAlaap {
+            alaapState = false
+            sungStore.alaapMode = false
+            NSLog("[DIAG] StreamingRaagiModeEngine alaapState=false (non-empty partial resumed)")
+        }
     }
 
     // MARK: - First-letter local match (Brief #9.7)
