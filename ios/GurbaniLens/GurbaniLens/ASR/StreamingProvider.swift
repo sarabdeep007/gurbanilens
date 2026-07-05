@@ -162,8 +162,26 @@ public final class StreamingProvider: @unchecked Sendable {
         }
         lock.unlock()
 
-        NSLog("[DIAG] StreamingProvider.connect opening \(endpoint.absoluteString)")
-        var req = URLRequest(url: endpoint)
+        // Brief #9.23 part 2: when Sung Kirtan Mode is enabled, tell
+        // the server to use its longer inference-window profile
+        // (WINDOW_S=5.5 instead of the default) so alaap / sustained
+        // vowels get enough surrounding audio context to keep the
+        // matcher's phrase-level disambiguation working. Read once
+        // per connect to match the engine's "flag at start" contract.
+        let sungMode = UserDefaults.standard.bool(forKey: "settings.singingModeEnabled")
+        let effectiveURL: URL
+        if sungMode {
+            var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false) ?? URLComponents()
+            var items = components.queryItems ?? []
+            items.append(URLQueryItem(name: "mode", value: "sung"))
+            components.queryItems = items
+            effectiveURL = components.url ?? endpoint
+            NSLog("[DIAG] StreamingProvider WS opening with mode=sung URL=\(effectiveURL.absoluteString)")
+        } else {
+            effectiveURL = endpoint
+            NSLog("[DIAG] StreamingProvider.connect opening \(endpoint.absoluteString)")
+        }
+        var req = URLRequest(url: effectiveURL)
         req.setValue("Bearer \(effectiveToken)", forHTTPHeaderField: "Authorization")
         let wsTask = session.webSocketTask(with: req)
 
