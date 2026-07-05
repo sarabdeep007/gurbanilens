@@ -335,6 +335,24 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         NSLog("[DIAG] StreamingRaagiModeEngine.init singingMode=\(self.singingModeEnabled)")
     }
 
+    // MARK: - Effective-lineId resolver (Brief #9.24 Part 7)
+
+    /// Return the given triggering lineId if the shabad's display
+    /// body contains it, else fall back to the first display line.
+    /// Logs a DIAG line on fallback because it's a surprising path —
+    /// after the Part-7 Manglacharan inclusion, this should be rare.
+    private static func resolveEffectiveLineId(_ triggeringLineId: String, in shabad: FullShabad) -> String {
+        if shabad.lines.contains(where: { $0.id == triggeringLineId }) {
+            return triggeringLineId
+        }
+        if let first = shabad.lines.first {
+            NSLog("[DIAG] StreamingRaagiModeEngine anchor fallback shabadId=\(shabad.id) triggeringLineId=\(triggeringLineId) not in display body — anchoring to first line \(first.id)")
+            return first.id
+        }
+        NSLog("[DIAG] StreamingRaagiModeEngine anchor fallback shabadId=\(shabad.id) — shabad has no display lines")
+        return triggeringLineId
+    }
+
     // MARK: - Ambiguous-shabad set loader (Brief #9.23 Part 4)
 
     private static func loadAmbiguousShabadSet() -> AmbiguousShabadSet? {
@@ -1190,8 +1208,17 @@ public final class StreamingRaagiModeEngine: ObservableObject {
             return
         }
 
+        // Brief #9.24 Part 7: anchor the visible pangti to the line
+        // that actually triggered the lock. `lineId` is the server
+        // match's line — Manglacharan lines are now included in
+        // `fetched.lines`, so the highlight lands on Mool Mantar when
+        // that's where the raagi began. Defensive fallback to the
+        // first display line covers the rare case of a triggering
+        // line that isn't in the display body (should not happen after
+        // ShabadCache's Manglacharan inclusion, but logged if it does).
+        let effectiveLineId = Self.resolveEffectiveLineId(lineId, in: fetched)
         currentShabad = fetched
-        currentLineId = lineId
+        currentLineId = effectiveLineId
         currentLineIdSetByFL = false  // server-driven, not FL
         currentShabadFLSigs = sigs
         currentShabadSafeStarters = starters
@@ -1215,8 +1242,8 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         }
 
         NSLog("[DIAG] StreamingRaagiModeEngine LOCK shabadId=\(shabadId) via=\(via) score=\(String(format: "%.1f", peakScore))")
-        NSLog("[DIAG] StreamingRaagiModeEngine display update: first shabad shabadId=\(shabadId) lineId=\(lineId) seq=\(seq) tier=\(tier) score=\(String(format: "%.1f", peakScore))")
-        NSLog("[DIAG] StreamingRaagiModeEngine.currentShabad sticky shabadId=\(shabadId) lineId=\(lineId) currentDisplaySeq=\(seq)")
+        NSLog("[DIAG] StreamingRaagiModeEngine display update: first shabad shabadId=\(shabadId) lineId=\(effectiveLineId) triggeringLineId=\(lineId) seq=\(seq) tier=\(tier) score=\(String(format: "%.1f", peakScore))")
+        NSLog("[DIAG] StreamingRaagiModeEngine.currentShabad sticky shabadId=\(shabadId) lineId=\(effectiveLineId) currentDisplaySeq=\(seq)")
     }
 
     /// LOCKED → LOCKED transition with a new shabadId. Used by both
@@ -1254,8 +1281,13 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         }
 
         let prevId = currentShabad?.id ?? "nil"
+        // Brief #9.24 Part 7: anchor to the challenger's triggering
+        // lineId (same policy as `lockTo`). Manglacharan is now in
+        // `fetched.lines` so a swap onto a shabad whose triggering
+        // hit was Mool Mantar lands on Mool Mantar.
+        let effectiveLineId = Self.resolveEffectiveLineId(lineId, in: fetched)
         currentShabad = fetched
-        currentLineId = lineId
+        currentLineId = effectiveLineId
         currentLineIdSetByFL = false  // server-driven swap
         currentShabadFLSigs = sigs
         currentShabadSafeStarters = starters
@@ -1282,8 +1314,8 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         } else {
             NSLog("[DIAG] StreamingRaagiModeEngine SWAP from=\(prevId) to=\(shabadId) via=\(via) score=\(String(format: "%.1f", score))")
         }
-        NSLog("[DIAG] StreamingRaagiModeEngine display update: shabad swap from=\(prevId) to=\(shabadId) lineId=\(lineId) seq=\(seq) tier=\(tier) score=\(String(format: "%.1f", score))")
-        NSLog("[DIAG] StreamingRaagiModeEngine.currentShabad sticky shabadId=\(shabadId) lineId=\(lineId) currentDisplaySeq=\(seq)")
+        NSLog("[DIAG] StreamingRaagiModeEngine display update: shabad swap from=\(prevId) to=\(shabadId) lineId=\(effectiveLineId) triggeringLineId=\(lineId) seq=\(seq) tier=\(tier) score=\(String(format: "%.1f", score))")
+        NSLog("[DIAG] StreamingRaagiModeEngine.currentShabad sticky shabadId=\(shabadId) lineId=\(effectiveLineId) currentDisplaySeq=\(seq)")
     }
 
     // MARK: - Jaikara

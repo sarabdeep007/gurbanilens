@@ -67,15 +67,25 @@ public actor ShabadCache {
             return cached
         }
         let raw = try corpus.shabadLines(shabadId: id)
+        // Brief #9.24 Part 7: include Manglacharan (e.g., Mool
+        // Mantar at the head of Japji) in the display body so a
+        // server match on Mool Mantar's lineId resolves to a
+        // visible line — previous behavior stripped Manglacharan
+        // during ShabadCache build, leaving `currentLineId` pointing
+        // at a line that RaagiView couldn't render or scroll to and
+        // the display fell back to lines[0] (the shabad body). This
+        // filter now mirrors the server's corpus.py: keep everything
+        // except Sirlekh. Sirlekh continues to feed sectionHeaders
+        // (Part 6) so the section title still renders above the body.
         let filtered = raw.filter { line in
             let lt = line.lineType?.lowercased() ?? ""
-            return lt == "pankti" || lt == "rahao"
+            return lt == "pankti" || lt == "rahao" || lt == "manglacharan"
         }
         // Brief #9.24 Part 6: preserve Sirlekh lines separately so
         // the display can show the current section header (Sloku,
         // Astpadi, Paurhi, etc.) above the visible pangti. Not
         // rendered inline — kept out of `lines` because RaagiView
-        // iterates all lines assuming they are pankti/rahao content.
+        // iterates all lines assuming they are pankti-body content.
         let sirlekh = raw.filter { line in
             (line.lineType?.lowercased() ?? "") == "sirlekh"
         }
