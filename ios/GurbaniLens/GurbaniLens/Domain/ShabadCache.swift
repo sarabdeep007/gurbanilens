@@ -71,7 +71,15 @@ public actor ShabadCache {
             let lt = line.lineType?.lowercased() ?? ""
             return lt == "pankti" || lt == "rahao"
         }
-        let built = FullShabad(id: id, lines: filtered)
+        // Brief #9.24 Part 6: preserve Sirlekh lines separately so
+        // the display can show the current section header (Sloku,
+        // Astpadi, Paurhi, etc.) above the visible pangti. Not
+        // rendered inline — kept out of `lines` because RaagiView
+        // iterates all lines assuming they are pankti/rahao content.
+        let sirlekh = raw.filter { line in
+            (line.lineType?.lowercased() ?? "") == "sirlekh"
+        }
+        let built = FullShabad(id: id, lines: filtered, sectionHeaders: sirlekh)
         shabads[id] = built
 
         // Brief #9.7: precompute FL signatures for every pangti.

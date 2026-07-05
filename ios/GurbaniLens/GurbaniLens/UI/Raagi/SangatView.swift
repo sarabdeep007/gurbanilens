@@ -25,6 +25,15 @@ struct SangatView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            // Brief #9.24 Part 6: section header at the top of the
+            // projector view (smaller than in RaagiView because
+            // Sangat mode is meant to be scanned at a distance).
+            if let section = currentSectionHeader {
+                Text(section)
+                    .font(.notoSerifGurmukhi(12, weight: .medium))
+                    .foregroundColor(Theme.onSurfaceVariant.opacity(0.7))
+                    .padding(.top, 16)
+            }
             Spacer()
             Group {
                 if let line = currentLine {
@@ -54,6 +63,13 @@ struct SangatView: View {
     private var currentLine: Line? {
         shabad.lines.first(where: { $0.id == currentLineId })
             ?? shabad.lines.first
+    }
+
+    private var currentSectionHeader: String? {
+        guard let idx = shabad.lines.firstIndex(where: { $0.id == currentLineId }) else {
+            return nil
+        }
+        return shabad.sectionHeader(forLineIndex: idx)
     }
 
     private func rowGurmukhi(_ line: Line) -> String {

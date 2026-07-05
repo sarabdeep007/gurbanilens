@@ -36,6 +36,17 @@ struct RaagiView: View {
                         .padding(.leading, 4)
                         .padding(.top, 8)
 
+                    // Brief #9.24 Part 6: section title (Sloku ॥,
+                    // Astpadi ॥, Paurhi ॥…) preceding the current
+                    // pangti. Empty when the shabad has no sirlekh
+                    // before the current line.
+                    if let section = currentSectionHeader {
+                        Text(section)
+                            .font(.notoSerifGurmukhi(14, weight: .medium))
+                            .foregroundColor(Self.highlightTint.opacity(0.7))
+                            .padding(.leading, 4)
+                    }
+
                     ForEach(shabad.lines, id: \.id) { line in
                         line.id == currentLineId
                             ? AnyView(highlightedRow(line))
@@ -100,6 +111,15 @@ struct RaagiView: View {
             return unicode
         }
         return Gurmukhi.fromAnmolLipi(line.gurmukhi)
+    }
+
+    /// Brief #9.24 Part 6: current section header text based on the
+    /// currently highlighted pangti's position in the shabad.
+    private var currentSectionHeader: String? {
+        guard let idx = shabad.lines.firstIndex(where: { $0.id == currentLineId }) else {
+            return nil
+        }
+        return shabad.sectionHeader(forLineIndex: idx)
     }
 }
 

@@ -39,6 +39,31 @@ public struct Line: Hashable, Sendable {
     }
 }
 
+extension Line {
+    /// Brief #9.24 Part 6: find the section-header line that most
+    /// recently precedes a given orderId. Given an array of
+    /// candidates (typically the Sirlekh lines of a shabad), returns
+    /// the one with the highest `orderId` that is still ≤ the
+    /// reference. Nil when the list is empty or every candidate is
+    /// past `referenceOrderId`.
+    ///
+    /// Order-agnostic on the input: internally does a single linear
+    /// pass. Callers can pass the candidate list unordered.
+    public static func nearestSectionHeader(
+        from candidates: [Line],
+        atOrderId referenceOrderId: Int
+    ) -> Line? {
+        var best: Line?
+        for candidate in candidates {
+            guard candidate.orderId <= referenceOrderId else { continue }
+            if best == nil || candidate.orderId > best!.orderId {
+                best = candidate
+            }
+        }
+        return best
+    }
+}
+
 /// A single match result from the Matcher.
 /// Mirrors core/gurbanilens/matcher.py:Match
 public struct Match: Hashable, Sendable {

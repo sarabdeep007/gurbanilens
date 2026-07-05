@@ -50,10 +50,17 @@ public struct FullShabad: Sendable, Equatable, Identifiable {
     /// Display lines in order. First line's `ang` gives the page
     /// number for headers; pangti counts span the shabad.
     public let lines: [Line]
+    /// Brief #9.24 Part 6: Sirlekh (section header) lines associated
+    /// with this shabad, in orderId order. Not rendered inline; the
+    /// section-header UI walks this list to find the nearest header
+    /// preceding the currently-displayed pangti. Empty when a shabad
+    /// has no sirlekh lines (simple 4-tuk shabads).
+    public let sectionHeaders: [Line]
 
-    public init(id: String, lines: [Line]) {
+    public init(id: String, lines: [Line], sectionHeaders: [Line] = []) {
         self.id = id
         self.lines = lines
+        self.sectionHeaders = sectionHeaders
     }
 
     /// Title shown above the shabad — uses the first line's Ang for
@@ -63,6 +70,22 @@ public struct FullShabad: Sendable, Equatable, Identifiable {
     public var headerLabel: String {
         guard let first = lines.first else { return "" }
         return "Ang \(first.ang)"
+    }
+
+    /// Brief #9.24 Part 6: nearest section header preceding the
+    /// pangti at `lineIndex`. Returns the Gurmukhi Unicode text
+    /// ("ਸਲੋਕੁ ॥", "ਪਉੜੀ ॥") or nil when the shabad has no sirlekh
+    /// lines before the pangti (very simple shabads).
+    public func sectionHeader(forLineIndex lineIndex: Int) -> String? {
+        guard lines.indices.contains(lineIndex) else { return nil }
+        let refOrderId = lines[lineIndex].orderId
+        guard let header = Line.nearestSectionHeader(from: sectionHeaders, atOrderId: refOrderId) else {
+            return nil
+        }
+        if let unicode = header.gurmukhiUnicode, !unicode.isEmpty {
+            return unicode
+        }
+        return Gurmukhi.fromAnmolLipi(header.gurmukhi)
     }
 
     public static func == (lhs: FullShabad, rhs: FullShabad) -> Bool {
