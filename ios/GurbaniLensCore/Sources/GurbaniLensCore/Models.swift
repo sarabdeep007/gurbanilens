@@ -43,19 +43,33 @@ extension Line {
     /// Brief #9.24 Part 6: find the section-header line that most
     /// recently precedes a given orderId. Given an array of
     /// candidates (typically the Sirlekh lines of a shabad), returns
-    /// the one with the highest `orderId` that is still ≤ the
-    /// reference. Nil when the list is empty or every candidate is
-    /// past `referenceOrderId`.
+    /// the one with the highest `orderId` that is still STRICTLY less
+    /// than `referenceOrderId`. Nil when the list is empty or every
+    /// candidate is at or past `referenceOrderId`.
     ///
     /// Order-agnostic on the input: internally does a single linear
     /// pass. Callers can pass the candidate list unordered.
+    ///
+    /// Brief #9.23d: strict `<` (previously `<=`). A sirlekh at the
+    /// same orderId as the reference line is "on the same row", not
+    /// "behind us" — showing it as a header would be visually
+    /// redundant with the highlighted line. More importantly, the
+    /// strict version keeps `nearestSectionHeader(atOrderId: firstLine.orderId)`
+    /// nil for shabads whose sirlekh sits AFTER the first
+    /// Manglacharan line (Japji Sahib: Mool Mantar orderId 1 →
+    /// "|| ਜਪੁ ||" orderId 2 → "ਆਦਿ ਸਚੁ" orderId 3). Without the
+    /// strict compare + the pre-existing "skip candidates past
+    /// reference" guard, callers could still surface the shabad's
+    /// own opening sirlekh as a top-of-body header, which is
+    /// visually wrong (the sirlekh belongs BETWEEN Mool Mantar and
+    /// "ਆਦਿ ਸਚੁ", not before Mool Mantar).
     public static func nearestSectionHeader(
         from candidates: [Line],
         atOrderId referenceOrderId: Int
     ) -> Line? {
         var best: Line?
         for candidate in candidates {
-            guard candidate.orderId <= referenceOrderId else { continue }
+            guard candidate.orderId < referenceOrderId else { continue }
             if best == nil || candidate.orderId > best!.orderId {
                 best = candidate
             }

@@ -46,4 +46,45 @@ final class LineSectionHeaderTests: XCTestCase {
         ]
         XCTAssertNil(Line.nearestSectionHeader(from: sirlekh, atOrderId: 5))
     }
+
+    /// Brief #9.23d: Japji-mirror case. BaniDB stores Japji Sahib as:
+    ///   - orderId 1, Manglacharan "<> siq nwmu..." (Mool Mantar)
+    ///   - orderId 2, Sirlekh "] jpu ]" ("|| ਜਪੁ ||")
+    ///   - orderId 3, Pankti "Awid scu..." ("ਆਦਿ ਸਚੁ")
+    /// The sirlekh sits BETWEEN Mool Mantar and Aad Sach, not before
+    /// Mool Mantar. `nearestSectionHeader` walking backward from Mool
+    /// Mantar (orderId 1) must return nil — otherwise the display
+    /// renders "|| ਜਪੁ ||" above Mool Mantar, which is visually and
+    /// convention-wise wrong (Japji Sahib traditionally opens with
+    /// Mool Mantar; the ਜਪੁ sirlekh is a mid-shabad marker). Walking
+    /// backward from Aad Sach (orderId 3) correctly returns the
+    /// sirlekh.
+    func test_japjiSahibSectionHeaderPositioning() {
+        let sirlekh = line("JAP", orderId: 2, type: "Sirlekh", gurmukhi: "] jpu ]")
+
+        // Mool Mantar (orderId 1) → nothing legitimately precedes it,
+        // even though the sirlekh has a higher orderId in the corpus.
+        let atMoolMantar = Line.nearestSectionHeader(from: [sirlekh], atOrderId: 1)
+        XCTAssertNil(atMoolMantar, "No sirlekh should render above Mool Mantar (Japji orderId 1)")
+
+        // Aad Sach (orderId 3) → the "|| ਜਪੁ ||" sirlekh is genuinely
+        // behind us in the shabad and should render as the section
+        // header.
+        let atAadSach = Line.nearestSectionHeader(from: [sirlekh], atOrderId: 3)
+        XCTAssertEqual(atAadSach?.id, "JAP", "|| ਜਪੁ || should render as section header from Aad Sach onward")
+    }
+
+    /// Brief #9.23d: `<` strictness — a candidate at the same orderId
+    /// as the reference is NOT considered "behind us". Unique orderIds
+    /// in the real corpus make this edge case rare, but the change
+    /// from `<=` to `<` needs an explicit regression guard.
+    func test_strictLessThanExcludesEqualOrderId() {
+        let sirlekh = [
+            line("SL", orderId: 10, type: "Sirlekh"),
+        ]
+        // refOrderId equal to candidate → excluded.
+        XCTAssertNil(Line.nearestSectionHeader(from: sirlekh, atOrderId: 10))
+        // refOrderId one past → included.
+        XCTAssertEqual(Line.nearestSectionHeader(from: sirlekh, atOrderId: 11)?.id, "SL")
+    }
 }
