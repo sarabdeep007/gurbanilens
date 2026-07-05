@@ -230,6 +230,14 @@ public struct SungModeAccumulatorStore: Equatable {
     /// moment a non-empty partial arrives.
     public static let alaapReLockRatio: Double = 2.0
 
+    /// Brief #9.23 Part 4: multiplier applied to `addedWeight` for a
+    /// LOCKED-state cross-shabad hit whose shabad is in the
+    /// `ambiguousSet`. Halves the evidence a coincidental common-
+    /// phrase match contributes toward re-lock. Discovery hits and
+    /// same-shabad hits are unaffected — only cross-shabad in
+    /// LOCKED.
+    public static let ambiguousMultiplier: Double = 0.5
+
     // MARK: - State
 
     public private(set) var slots: [String: SungModeAccumulator]
@@ -248,6 +256,13 @@ public struct SungModeAccumulatorStore: Equatable {
     /// (1.5) as the re-lock ratio-vs-current gate. Read-write so
     /// the engine can toggle it in step with its own alaap state.
     public var alaapMode: Bool = false
+
+    /// Brief #9.23 Part 4: optional precomputed ambiguous-shabad
+    /// set. Populated at engine.init from the JSON bundled by
+    /// scripts/fetch_ios_deps.sh + scripts/build_ambiguous_shabad_set.py.
+    /// Nil in tests + speech mode where the ambiguity multiplier
+    /// should be inert.
+    public var ambiguousSet: AmbiguousShabadSet? = nil
 
     /// Sidecar state for the alaap repeat detector (Brief #9.23
     /// Part 1). Distinct from `SungModeAccumulator` (per-shabad
@@ -504,7 +519,15 @@ public struct SungModeAccumulatorStore: Equatable {
         // churn the repeat state.
         updateRepeatState(shabadId: shabadId, lineId: lineId, now: now)
         let repeatMult = repeatMultiplierFor(shabadId: shabadId)
-        let addedWeight = score * Self.tierMultiplier[tierClamped] * repeatMult
+        // Brief #9.23 Part 4: ambiguous-shabad downweight. Applies
+        // ONLY to LOCKED-state cross-shabad hits (protectedShabadId
+        // is set + differs from incoming) whose shabadId is in the
+        // ambiguousSet. Discovery hits are untouched so a real lock
+        // can still form on an ambiguous shabad; same-shabad hits
+        // are untouched so the current shabad refreshes at full
+        // weight.
+        let ambigMult = ambiguousMultiplierFor(shabadId: shabadId, protectedShabadId: protectedShabadId)
+        let addedWeight = score * Self.tierMultiplier[tierClamped] * repeatMult * ambigMult
 
         // 2. Decay all existing slots to `now`.
         for (id, var acc) in slots {
@@ -640,6 +663,17 @@ public struct SungModeAccumulatorStore: Equatable {
         return state.shabadId == shabadId
             ? Self.repeatBoostMultiplier
             : Self.repeatDownweightMultiplier
+    }
+
+    /// Brief #9.23 Part 4: return the ambiguous-shabad multiplier.
+    /// Applies only when we are ingesting a LOCKED-state cross-
+    /// shabad hit (i.e. `protectedShabadId` is non-nil and differs
+    /// from the incoming shabad) whose shabadId is in the
+    /// `ambiguousSet`. Otherwise returns 1.0.
+    private func ambiguousMultiplierFor(shabadId: String, protectedShabadId: String?) -> Double {
+        guard let amb = ambiguousSet else { return 1.0 }
+        guard let current = protectedShabadId, current != shabadId else { return 1.0 }
+        return amb.contains(shabadId) ? Self.ambiguousMultiplier : 1.0
     }
 
     /// Format the top-N slots by weight as

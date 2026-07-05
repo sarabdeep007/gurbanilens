@@ -35,6 +35,10 @@ data/sggs/*.json
 data/sggs/*.db
 data/sggs/*.sqlite
 !data/sggs/.gitkeep
+# Small precomputed asset produced by scripts/build_ambiguous_shabad_set.py
+# (~19 KB at threshold=25, 3-grams). Shipped to iOS bundle via
+# scripts/fetch_ios_deps.sh; kept in-repo so a checkout is self-sufficient.
+!data/sggs/ambiguous_shabads.json
 
 # Eval runs
 eval_runs/

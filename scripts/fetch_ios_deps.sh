@@ -106,6 +106,30 @@ copy_sggs_db() {
   log "Copied $(filesize "$SGGS_DEST") B"
 }
 
+# ------------------------------------------- ambiguous-shabad set (#9.23) --
+# JSON produced by scripts/build_ambiguous_shabad_set.py. Loaded on
+# engine.init by StreamingRaagiModeEngine to downweight cross-shabad
+# hits during LOCKED sung-mode. Missing file is non-fatal (the
+# accumulator's ambiguous multiplier is inert without it).
+AMBIG_SOURCE="${REPO_ROOT}/data/sggs/ambiguous_shabads.json"
+AMBIG_DEST="${DATA_DIR}/ambiguous_shabads.json"
+
+copy_ambiguous_shabads() {
+  if [[ ! -f "$AMBIG_SOURCE" ]]; then
+    warn "ambiguous_shabads.json not found at $AMBIG_SOURCE"
+    warn "Run: python scripts/build_ambiguous_shabad_set.py"
+    warn "(skipping — sung-mode ambiguity multiplier will be inert)"
+    return
+  fi
+  if [[ $FORCE -eq 0 && -f "$AMBIG_DEST" && $(filesize "$AMBIG_DEST") -eq $(filesize "$AMBIG_SOURCE") ]]; then
+    log "ambiguous_shabads.json already at $AMBIG_DEST ($(filesize "$AMBIG_DEST") B) — skipping"
+    return
+  fi
+  log "Copying ambiguous_shabads.json → $AMBIG_DEST"
+  cp -f "$AMBIG_SOURCE" "$AMBIG_DEST"
+  log "Copied $(filesize "$AMBIG_DEST") B"
+}
+
 # Use `huggingface-cli download` when available (handles LFS + directory
 # layout cleanly). Otherwise fall back to git lfs clone, then git checkout
 # only the requested model subdir.
@@ -198,6 +222,7 @@ fetch_silero_vad() {
 ensure_tool curl
 
 copy_sggs_db
+copy_ambiguous_shabads
 fetch_noto_font
 fetch_silero_vad
 if [[ $BUNDLE_MODEL -eq 1 ]]; then

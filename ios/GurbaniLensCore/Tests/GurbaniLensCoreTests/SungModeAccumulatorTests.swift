@@ -738,6 +738,70 @@ final class SungModeAccumulatorTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(tiers.filter { $0 <= 1 }.count, 2)
     }
 
+    // MARK: - Brief #9.23 Part 4: ambiguous-shabad downweight
+
+    func test_ambiguousShabadSet_appliesHalfWeightMultiplier() {
+        // Cross-shabad LOCKED-state hit on a shabad flagged as
+        // ambiguous should have its addedWeight halved. Baseline
+        // (no ambiguous set) established side-by-side.
+        let ambig = AmbiguousShabadSet(shabadIds: ["AMB1"])
+
+        // Baseline: fresh store, no ambiguousSet. Seed BSJ as
+        // "current" via a discovery hit, then feed AMB1 as cross-
+        // shabad LOCKED hit — record its slot weight.
+        var baseline = SungModeAccumulatorStore()
+        _ = baseline.processMatch(shabadId: "BSJ", score: 50, tier: 0, now: at(0))
+        _ = baseline.processMatchInLocked(
+            shabadId: "AMB1", score: 90, tier: 0,
+            currentShabadId: "BSJ", now: at(0.1)
+        )
+        let baseWeight = baseline.slots["AMB1"]?.totalWeight ?? 0
+        XCTAssertGreaterThan(baseWeight, 0)
+
+        // With ambiguousSet: same setup but AMB1 gets the 0.5×.
+        var withAmb = SungModeAccumulatorStore()
+        withAmb.ambiguousSet = ambig
+        _ = withAmb.processMatch(shabadId: "BSJ", score: 50, tier: 0, now: at(0))
+        _ = withAmb.processMatchInLocked(
+            shabadId: "AMB1", score: 90, tier: 0,
+            currentShabadId: "BSJ", now: at(0.1)
+        )
+        let dampedWeight = withAmb.slots["AMB1"]?.totalWeight ?? 0
+        XCTAssertEqual(
+            dampedWeight, baseWeight * SungModeAccumulatorStore.ambiguousMultiplier,
+            accuracy: 0.001,
+            "Cross-shabad hit on ambiguous shabad should be 0.5× baseline"
+        )
+    }
+
+    func test_ambiguousShabadSet_doesNotAffectCurrentShabad() {
+        // Same-shabad refresh in LOCKED — even if the current shabad
+        // is in the ambiguous set, its own hits should NOT be
+        // damped; the multiplier only affects cross-shabad hits.
+        let ambig = AmbiguousShabadSet(shabadIds: ["CUR1"])
+
+        // Baseline: no ambig, seed CUR1 + one same-shabad refresh.
+        var baseline = SungModeAccumulatorStore()
+        _ = baseline.processMatch(shabadId: "CUR1", score: 50, tier: 0, now: at(0))
+        _ = baseline.processMatchInLocked(
+            shabadId: "CUR1", score: 90, tier: 0,
+            currentShabadId: "CUR1", now: at(0.1)
+        )
+        let baseWeight = baseline.slots["CUR1"]?.totalWeight ?? 0
+
+        // With ambig: identical calls; CUR1 should end at same weight.
+        var withAmb = SungModeAccumulatorStore()
+        withAmb.ambiguousSet = ambig
+        _ = withAmb.processMatch(shabadId: "CUR1", score: 50, tier: 0, now: at(0))
+        _ = withAmb.processMatchInLocked(
+            shabadId: "CUR1", score: 90, tier: 0,
+            currentShabadId: "CUR1", now: at(0.1)
+        )
+        let sameShabadWeight = withAmb.slots["CUR1"]?.totalWeight ?? 0
+        XCTAssertEqual(sameShabadWeight, baseWeight, accuracy: 0.001,
+                       "Same-shabad hits must be unaffected by ambiguous multiplier")
+    }
+
     // MARK: - Brief #9.23 Part 3: alaap-mode re-lock ratio gate
 
     func test_alaapMode_requiresDoubleRatioForReLock() {

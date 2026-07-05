@@ -321,8 +321,33 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         self.provider = provider
         self.mic = StreamingMicCapture()
         self.singingModeEnabled = UserDefaults.standard.bool(forKey: "settings.singingModeEnabled")
-        self.sungStore = SungModeAccumulatorStore()
+        var store = SungModeAccumulatorStore()
+        // Brief #9.23 Part 4: hydrate the ambiguous-shabad set from
+        // the app bundle. Missing / malformed JSON isn't fatal — the
+        // accumulator just skips the multiplier (returns 1.0).
+        if let ambig = Self.loadAmbiguousShabadSet() {
+            store.ambiguousSet = ambig
+            NSLog("[DIAG] StreamingRaagiModeEngine ambiguousSet loaded (count=\(ambig.count) threshold=\(ambig.threshold))")
+        } else {
+            NSLog("[DIAG] StreamingRaagiModeEngine ambiguousSet NOT loaded — multiplier inert")
+        }
+        self.sungStore = store
         NSLog("[DIAG] StreamingRaagiModeEngine.init singingMode=\(self.singingModeEnabled)")
+    }
+
+    // MARK: - Ambiguous-shabad set loader (Brief #9.23 Part 4)
+
+    private static func loadAmbiguousShabadSet() -> AmbiguousShabadSet? {
+        guard let url = Bundle.main.url(forResource: "ambiguous_shabads", withExtension: "json") else {
+            return nil
+        }
+        do {
+            let data = try Data(contentsOf: url)
+            return try AmbiguousShabadSet.load(fromJSON: data)
+        } catch {
+            NSLog("[DIAG] StreamingRaagiModeEngine ambiguous_shabads.json parse failed: \(error.localizedDescription)")
+            return nil
+        }
     }
 
     // MARK: - Public lifecycle
