@@ -670,10 +670,27 @@ public struct SungModeAccumulatorStore: Equatable {
     /// shabad hit (i.e. `protectedShabadId` is non-nil and differs
     /// from the incoming shabad) whose shabadId is in the
     /// `ambiguousSet`. Otherwise returns 1.0.
+    ///
+    /// Brief #9.25 Part 4: the pre-#9.25 implementation returned
+    /// silently, which meant the entire ambiguous-set feature was
+    /// invisible in Deep's iPhone logs — no way to tell whether the
+    /// multiplier was firing or whether Deep's observed wrong-shabad
+    /// cascade was even eligible for downweight. The two DIAG lines
+    /// added below fire ONLY on the LOCKED cross-shabad path (the
+    /// only path where the multiplier has semantic effect) so
+    /// discovery + same-shabad ingests stay quiet. `applied` = we
+    /// halved the hit's weight; `no-apply` = the shabad wasn't in
+    /// the ambiguous set so it went through at full weight.
     private func ambiguousMultiplierFor(shabadId: String, protectedShabadId: String?) -> Double {
         guard let amb = ambiguousSet else { return 1.0 }
         guard let current = protectedShabadId, current != shabadId else { return 1.0 }
-        return amb.contains(shabadId) ? Self.ambiguousMultiplier : 1.0
+        if amb.contains(shabadId) {
+            NSLog("[DIAG] SungModeAccumulator ambiguousSet applied shabadId=\(shabadId) currentShabad=\(current) multiplier=\(Self.ambiguousMultiplier) setCount=\(amb.count)")
+            return Self.ambiguousMultiplier
+        } else {
+            NSLog("[DIAG] SungModeAccumulator ambiguousSet no-apply shabadId=\(shabadId) currentShabad=\(current) multiplier=1.0 (not in set, setCount=\(amb.count))")
+            return 1.0
+        }
     }
 
     /// Format the top-N slots by weight as
