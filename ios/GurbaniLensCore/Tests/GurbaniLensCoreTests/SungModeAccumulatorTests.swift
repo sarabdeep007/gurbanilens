@@ -1024,5 +1024,144 @@ final class SungModeAccumulatorTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(weight, SungModeAccumulatorStore.lockWeightThreshold)
         XCTAssertEqual(tiers.filter { $0 <= 1 }.count, 4)
     }
+
+    // MARK: - Brief #9.23e: ping-pong detection between same pair
+
+    func test_pingPongDetection_blocksThirdSwapBetweenSamePair() {
+        // Deep's post-#9.25 iPhone log had three RE-LOCK swaps
+        // HLD↔NB5 in ~62 s, each individually passing all five
+        // #9.23a gates. The ping-pong tracker records the pair; the
+        // 3rd swap in the 60-second window is denied and a lockout
+        // is armed. Mirrors that exact scenario at the accumulator
+        // API level.
+        var store = SungModeAccumulatorStore()
+
+        // First swap HLD → NB5 within the window. Allowed; state
+        // seeded with a single timestamp.
+        let block1 = store.recordAndCheckPingPong(from: "HLD", to: "NB5", now: at(0))
+        XCTAssertFalse(block1, "First swap between a fresh pair must be allowed")
+        XCTAssertEqual(
+            store.pingPongState.map { Set([$0.shabadA, $0.shabadB]) },
+            Set(["HLD", "NB5"])
+        )
+        XCTAssertEqual(store.pingPongState?.swapTimestamps.count, 1)
+        XCTAssertNil(store.pingPongLockoutUntil)
+
+        // Second swap back NB5 → HLD, still inside the window.
+        // Allowed; count reaches 2.
+        let block2 = store.recordAndCheckPingPong(from: "NB5", to: "HLD", now: at(30))
+        XCTAssertFalse(block2, "Second swap between the same pair must be allowed")
+        XCTAssertEqual(store.pingPongState?.swapTimestamps.count, 2)
+        XCTAssertNil(store.pingPongLockoutUntil)
+
+        // Third swap HLD → NB5 within the same 60 s window. This is
+        // the ping-pong signal — DENIED, and a lockout is armed.
+        let block3 = store.recordAndCheckPingPong(from: "HLD", to: "NB5", now: at(45))
+        XCTAssertTrue(block3, "Third swap between the same pair within 60 s must be BLOCKED")
+        XCTAssertEqual(store.pingPongState?.swapTimestamps.count, 3)
+        XCTAssertNotNil(store.pingPongLockoutUntil, "Lockout must be armed on ping-pong detection")
+        let expectedUntil = at(45).addingTimeInterval(SungModeAccumulatorStore.pingPongLockoutSeconds)
+        XCTAssertEqual(
+            store.pingPongLockoutUntil?.timeIntervalSince1970 ?? 0,
+            expectedUntil.timeIntervalSince1970,
+            accuracy: 0.001,
+            "Lockout must expire pingPongLockoutSeconds after the blocking swap"
+        )
+
+        // Sanity: another attempt inside the lockout window is still
+        // denied, without appending yet-another timestamp (the swap
+        // did not actually happen).
+        let block4 = store.recordAndCheckPingPong(from: "NB5", to: "HLD", now: at(50))
+        XCTAssertTrue(block4, "Further same-pair attempts during lockout must remain BLOCKED")
+        XCTAssertEqual(
+            store.pingPongState?.swapTimestamps.count, 3,
+            "Lockout denials must not grow the timestamp list"
+        )
+    }
+
+    func test_pingPongDetection_allowsSwapToThirdShabad() {
+        // Establish an active lockout on HLD↔NB5 via the same 3-swap
+        // sequence. Then request a swap to a THIRD shabad ANC — the
+        // lockout is pair-specific, so this must proceed. State
+        // resets to the new pair.
+        var store = SungModeAccumulatorStore()
+        _ = store.recordAndCheckPingPong(from: "HLD", to: "NB5", now: at(0))
+        _ = store.recordAndCheckPingPong(from: "NB5", to: "HLD", now: at(20))
+        _ = store.recordAndCheckPingPong(from: "HLD", to: "NB5", now: at(40))
+        XCTAssertNotNil(store.pingPongLockoutUntil, "Precondition: lockout is active")
+
+        // Swap NB5 → ANC while HLD↔NB5 lockout is still live. ANC is
+        // outside the tracked pair, so this must be allowed.
+        let block = store.recordAndCheckPingPong(from: "NB5", to: "ANC", now: at(50))
+        XCTAssertFalse(block, "Swap involving a third shabad must proceed during pair lockout")
+        XCTAssertEqual(
+            store.pingPongState.map { Set([$0.shabadA, $0.shabadB]) },
+            Set(["NB5", "ANC"]),
+            "State must reset to track the new pair"
+        )
+        XCTAssertEqual(
+            store.pingPongState?.swapTimestamps.count, 1,
+            "State must reset to a fresh single timestamp"
+        )
+        XCTAssertNil(
+            store.pingPongLockoutUntil,
+            "Lockout was tied to the old pair; a new-pair reset clears it"
+        )
+    }
+
+    func test_pingPongDetection_clearsAfterLockoutWindow() {
+        // Establish a lockout at t=45 s (expires at t=105 s). At
+        // t=106 s the SAME pair swap is allowed again — the tracker
+        // clears expired state on the next call, then seeds a fresh
+        // single-timestamp state.
+        var store = SungModeAccumulatorStore()
+        _ = store.recordAndCheckPingPong(from: "HLD", to: "NB5", now: at(0))
+        _ = store.recordAndCheckPingPong(from: "NB5", to: "HLD", now: at(20))
+        _ = store.recordAndCheckPingPong(from: "HLD", to: "NB5", now: at(45))
+        XCTAssertNotNil(store.pingPongLockoutUntil, "Precondition: lockout is active")
+
+        // Advance one second past the lockoutUntil timestamp.
+        let past = 45.0 + SungModeAccumulatorStore.pingPongLockoutSeconds + 1.0
+        let block = store.recordAndCheckPingPong(from: "NB5", to: "HLD", now: at(past))
+        XCTAssertFalse(block, "Same-pair swap must be allowed after the lockout window expires")
+        XCTAssertNil(store.pingPongLockoutUntil, "Expired lockout must be cleared")
+        XCTAssertEqual(
+            store.pingPongState.map { Set([$0.shabadA, $0.shabadB]) },
+            Set(["HLD", "NB5"]),
+            "Fresh state must seed on the same pair after lockout expiry"
+        )
+        XCTAssertEqual(
+            store.pingPongState?.swapTimestamps.count, 1,
+            "Fresh state must contain only the just-recorded swap"
+        )
+    }
+
+    func test_pingPongDetection_resetsOnNewPair() {
+        // Establish HLD↔NB5 as the tracked pair with two swaps, then
+        // pivot to HLD↔TUY. The tracker must switch to the new pair
+        // and NOT accumulate HLD↔NB5 evidence alongside HLD↔TUY.
+        var store = SungModeAccumulatorStore()
+        _ = store.recordAndCheckPingPong(from: "HLD", to: "NB5", now: at(0))
+        _ = store.recordAndCheckPingPong(from: "NB5", to: "HLD", now: at(10))
+        XCTAssertEqual(
+            store.pingPongState.map { Set([$0.shabadA, $0.shabadB]) },
+            Set(["HLD", "NB5"])
+        )
+        XCTAssertEqual(store.pingPongState?.swapTimestamps.count, 2)
+
+        // HLD → TUY: a new pair emerges. State pivots.
+        let block = store.recordAndCheckPingPong(from: "HLD", to: "TUY", now: at(15))
+        XCTAssertFalse(block, "New-pair swap must be allowed")
+        XCTAssertEqual(
+            store.pingPongState.map { Set([$0.shabadA, $0.shabadB]) },
+            Set(["HLD", "TUY"]),
+            "State must now track the new pair"
+        )
+        XCTAssertEqual(
+            store.pingPongState?.swapTimestamps.count, 1,
+            "State must seed at a fresh single timestamp on pair reset"
+        )
+        XCTAssertNil(store.pingPongLockoutUntil, "Pair reset must not carry stale lockout")
+    }
 }
 

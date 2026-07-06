@@ -238,6 +238,38 @@ public struct SungModeAccumulatorStore: Equatable {
     /// LOCKED.
     public static let ambiguousMultiplier: Double = 0.5
 
+    // MARK: - Ping-pong protection (Brief #9.23e)
+    //
+    // Post-#9.25 iPhone verification: Deep sang Anand Bhya (correct
+    // shabad TUY ang 917) but the accumulator ping-ponged through
+    // HLD(ang 590) → NB5(ang 450) → HLD → NB5 → HLD → TUY within
+    // ~62 seconds. Both HLD and NB5 matched "meri maaye" with
+    // genuine tier-1 confidence (not tier-3 noise), and every swap
+    // cleared all five #9.23a re-lock gates. The remaining pathology
+    // is the RAPID FLIP between the SAME two shabads — a signal
+    // that the matcher is oscillating on a genuinely-ambiguous phrase
+    // and no amount of additional evidence within either shabad
+    // deserves a swap. Freezing the pair for a cooldown lets the
+    // audio move past the ambiguous phrase before either can win
+    // again.
+
+    /// Sliding window (in seconds) over which swaps between the SAME
+    /// pair are counted. Chosen at ~1 minute so a natural ~62-second
+    /// oscillation like Deep's HLD↔NB5 replay is captured but a
+    /// slow drift back to the same pair over many minutes is not.
+    public static let pingPongWindowSeconds: TimeInterval = 60.0
+    /// Number of swaps between the SAME pair within
+    /// `pingPongWindowSeconds` before the pair is frozen. 3 lets a
+    /// first-two-swap "the raagi genuinely switched then switched
+    /// back" flow through, but the third swap in quick succession is
+    /// almost certainly the matcher oscillating on an ambiguous
+    /// phrase.
+    public static let pingPongMaxSwaps: Int = 3
+    /// How long (in seconds) the frozen pair stays denied after
+    /// `pingPongMaxSwaps` swaps land in the window. Matches
+    /// `pingPongWindowSeconds` so the two knobs move together.
+    public static let pingPongLockoutSeconds: TimeInterval = 60.0
+
     // MARK: - State
 
     public private(set) var slots: [String: SungModeAccumulator]
@@ -263,6 +295,41 @@ public struct SungModeAccumulatorStore: Equatable {
     /// Nil in tests + speech mode where the ambiguity multiplier
     /// should be inert.
     public var ambiguousSet: AmbiguousShabadSet? = nil
+
+    /// Brief #9.23e: sliding-window tracker for swaps between the same
+    /// pair of shabads. Nil when no candidate pair is being watched;
+    /// populated on the first re-lock and updated on subsequent
+    /// re-locks that involve either the same or a new pair. See
+    /// ``recordAndCheckPingPong(from:to:now:)``.
+    public private(set) var pingPongState: PingPongState? = nil
+
+    /// Brief #9.23e: absolute wall-clock time at which the current
+    /// ping-pong lockout expires. Nil when no lockout is active.
+    /// While non-nil AND `now < pingPongLockoutUntil`, re-locks
+    /// between the exact pair in `pingPongState` are denied. Other
+    /// cross-shabad swaps (to a third shabad) proceed normally.
+    public private(set) var pingPongLockoutUntil: Date? = nil
+
+    /// Brief #9.23e: sidecar state for the same-pair swap tracker.
+    /// Distinct from `SungModeAccumulator` (per-shabad evidence) —
+    /// only one pair is tracked at a time.
+    public struct PingPongState: Equatable {
+        /// One end of the tracked pair. Order between A and B is
+        /// arbitrary; membership checks are done with a Set.
+        public var shabadA: String
+        /// The other end of the tracked pair.
+        public var shabadB: String
+        /// Wall-clock times of the swaps that established this state.
+        /// Pruned to the last `pingPongWindowSeconds` on every update
+        /// so the count reflects only recent activity.
+        public var swapTimestamps: [Date]
+
+        public init(shabadA: String, shabadB: String, swapTimestamps: [Date]) {
+            self.shabadA = shabadA
+            self.shabadB = shabadB
+            self.swapTimestamps = swapTimestamps
+        }
+    }
 
     /// Sidecar state for the alaap repeat detector (Brief #9.23
     /// Part 1). Distinct from `SungModeAccumulator` (per-shabad
@@ -451,6 +518,24 @@ public struct SungModeAccumulatorStore: Equatable {
         let isRecent = now.timeIntervalSince(topAcc.lastSeenAt) <= Self.reLockMinRecencySeconds
         let hasGoodTier = topAcc.lastTiers.filter { $0 <= 1 }.count >= Self.reLockMinLowTierHits
         if hasWeight && hasRatio && hasHits && isRecent && hasGoodTier {
+            // Brief #9.23e Fix 2: ping-pong protection. When the SAME
+            // two shabads have swapped `pingPongMaxSwaps` times in
+            // `pingPongWindowSeconds`, freeze the pair for a
+            // `pingPongLockoutSeconds` cooldown. All five re-lock
+            // gates above still had to pass — this is a targeted
+            // stop on OSCILLATION between two genuinely-plausible
+            // shabads, not a blanket weakening of the re-lock bar.
+            // First-time swaps and A→B→C→… multi-shabad transitions
+            // are unaffected; only the specific A↔B pair is denied
+            // during lockout, so a swap to a third shabad Z still
+            // proceeds normally.
+            if recordAndCheckPingPong(from: currentShabadId, to: topId, now: now) {
+                return .noSwap(
+                    top3Summary: topSummary(top: 3),
+                    slotCount: slots.count,
+                    currentWeight: currentWeight
+                )
+            }
             return .reLock(
                 shabadId: topId,
                 peakScore: topAcc.maxScoreSeen,
@@ -589,6 +674,102 @@ public struct SungModeAccumulatorStore: Equatable {
         slots.removeAll()
         repeatState = nil
         alaapMode = false
+        pingPongState = nil
+        pingPongLockoutUntil = nil
+    }
+
+    // MARK: - Ping-pong detection (Brief #9.23e)
+
+    /// Record a pending re-lock attempt from `currentShabadId` to
+    /// `targetShabadId` and return `true` if the attempt should be
+    /// BLOCKED as ping-pong. See the `pingPongWindowSeconds` /
+    /// `pingPongMaxSwaps` / `pingPongLockoutSeconds` tunables for the
+    /// exact thresholds.
+    ///
+    /// Six-step decision tree:
+    ///   1. If a previous lockout has expired, clear the state + lockout
+    ///      timestamp so the caller starts from a clean slate.
+    ///   2. If pingPongState exists AND the incoming pair matches the
+    ///      tracked pair AND a lockout is still active → BLOCK.
+    ///   3. If pingPongState exists AND the incoming pair matches the
+    ///      tracked pair AND no lockout → append this timestamp,
+    ///      filter to the sliding window, and BLOCK + arm a lockout if
+    ///      the count now clears `pingPongMaxSwaps`; otherwise ALLOW.
+    ///   4. If pingPongState exists but the incoming pair is DIFFERENT
+    ///      → reset state to the new pair (and clear any stale
+    ///      lockout tied to the old pair) and ALLOW.
+    ///   5. If pingPongState is nil → initialise state with the new
+    ///      pair and ALLOW.
+    ///   6. Invariant: only the exact tracked A↔B pair is subject to
+    ///      the lockout; a swap to a third shabad Z proceeds and
+    ///      resets state.
+    ///
+    /// Only called from `processMatchInLocked` at the point where all
+    /// five #9.23a re-lock gates would fire. `internal` so the unit
+    /// tests can drive the state machine directly without staging a
+    /// full 3-round re-lock cascade through the accumulator ingest
+    /// pipeline.
+    internal mutating func recordAndCheckPingPong(
+        from currentShabadId: String,
+        to targetShabadId: String,
+        now: Date
+    ) -> Bool {
+        // Step 1: expire any completed lockout — the state was tied
+        // to that specific pair, so clear it together.
+        if let until = pingPongLockoutUntil, now >= until {
+            NSLog("[DIAG] SungModeAccumulator ping-pong lockout expired at now=\(now.timeIntervalSince1970)")
+            pingPongState = nil
+            pingPongLockoutUntil = nil
+        }
+
+        let newPair = Set([currentShabadId, targetShabadId])
+
+        guard var state = pingPongState else {
+            // Step 5: no state → seed it with this swap and allow.
+            pingPongState = PingPongState(
+                shabadA: currentShabadId,
+                shabadB: targetShabadId,
+                swapTimestamps: [now]
+            )
+            return false
+        }
+
+        let existingPair = Set([state.shabadA, state.shabadB])
+        if existingPair != newPair {
+            // Step 4: different pair → reset. A lockout on the old
+            // pair is no longer meaningful because the state slot
+            // now tracks a different pair; if the old A↔B pair
+            // resumes ping-ponging, a fresh 3-swap streak will
+            // re-arm the freeze from scratch.
+            pingPongLockoutUntil = nil
+            pingPongState = PingPongState(
+                shabadA: currentShabadId,
+                shabadB: targetShabadId,
+                swapTimestamps: [now]
+            )
+            return false
+        }
+
+        // Steps 2/3: same pair.
+        if pingPongLockoutUntil != nil {
+            // Step 2: lockout still active → BLOCK. Do not append the
+            // timestamp; the swap did not actually happen.
+            NSLog("[DIAG] SungModeAccumulator ping-pong lockout active — denying swap from=\(currentShabadId) to=\(targetShabadId) shabadA=\(state.shabadA) shabadB=\(state.shabadB)")
+            return true
+        }
+
+        // Step 3: append + filter to the sliding window + threshold-check.
+        state.swapTimestamps.append(now)
+        let cutoff = now.addingTimeInterval(-Self.pingPongWindowSeconds)
+        state.swapTimestamps.removeAll { $0 < cutoff }
+        if state.swapTimestamps.count >= Self.pingPongMaxSwaps {
+            pingPongState = state
+            pingPongLockoutUntil = now.addingTimeInterval(Self.pingPongLockoutSeconds)
+            NSLog("[DIAG] SungModeAccumulator ping-pong DETECTED between shabadA=\(state.shabadA) and shabadB=\(state.shabadB) swapCount=\(state.swapTimestamps.count) window=\(Int(Self.pingPongWindowSeconds))s — freezing on \(currentShabadId) for lockoutSeconds=\(Int(Self.pingPongLockoutSeconds))")
+            return true
+        }
+        pingPongState = state
+        return false
     }
 
     // MARK: - Repeat detection (Brief #9.23 Part 1)
