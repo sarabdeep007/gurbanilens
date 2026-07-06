@@ -328,18 +328,25 @@ public final class StreamingRaagiModeEngine: ObservableObject {
     /// successful lock.
     private var sungStore: SungModeAccumulatorStore
 
-    /// Brief #9.23 Part 3: consecutive empty/whitespace ASR partials
-    /// received while LOCKED under sung-mode. When this reaches
-    /// `alaapEmptyPartialThreshold` the engine flips into alaap
-    /// state and hardens the re-lock ratio gate in `sungStore`.
-    private var emptyPartialCount: Int = 0
-    /// Brief #9.23 Part 3: true after `emptyPartialCount` crosses
-    /// the threshold. Cleared as soon as a non-empty partial lands.
+    /// Brief #9.23 Part 3 / #9.25: consecutive alaap-signal partials
+    /// received while LOCKED under sung-mode. Pre-#9.25 this was
+    /// incremented from the CLIENT-side observation of empty
+    /// transcripts on the `.partial` stream — which never worked
+    /// because the server was still emitting garbage `match` events
+    /// during alaap, not empty partials. #9.25 moves detection to the
+    /// server: `event=alaap` heartbeats replace the empty-partial
+    /// counting, and `event=match` clears the counter. When this
+    /// reaches `alaapServerEventThreshold` the engine flips into
+    /// alaap state and hardens the re-lock ratio gate in `sungStore`.
+    private var serverAlaapCount: Int = 0
+    /// Brief #9.23 Part 3: true after `serverAlaapCount` crosses
+    /// the threshold. Cleared as soon as a real match lands.
     private var alaapState: Bool = false
-    /// Brief #9.23 Part 3: how many empty partials in a row before
-    /// alaap kicks in. At the streaming server's ~500 ms cadence, 4
-    /// covers ~2 s of sustained-vowel — a real hold, not a brief gap.
-    private static let alaapEmptyPartialThreshold: Int = 4
+    /// Brief #9.25: how many consecutive server `event=alaap` events
+    /// before alaap kicks in. At the streaming server's ~750 ms
+    /// partial cadence, 4 covers ~3 s of sustained alaap — a real
+    /// hold, not a brief gap.
+    private static let alaapServerEventThreshold: Int = 4
 
     public init(corpus: Corpus, provider: StreamingProvider) {
         self.corpus = corpus
@@ -429,7 +436,7 @@ public final class StreamingRaagiModeEngine: ObservableObject {
             NSLog("[DIAG] StreamingRaagiModeEngine mid-session sungMode toggle: WS handshake was mode=\(handshake ? "sung" : "speech"), server will not reconfigure until next session")
         }
         sungStore.reset()
-        emptyPartialCount = 0
+        serverAlaapCount = 0
         alaapState = false
     }
 
@@ -496,7 +503,7 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         lastFLMatchLen = 0
         lastFLMatchAttemptTime = nil
         sungStore.reset()
-        emptyPartialCount = 0
+        serverAlaapCount = 0
         alaapState = false
         lockState = .discovering
         pendingCandidate = nil
@@ -565,7 +572,7 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         pendingCandidate = nil
         challengers.removeAll(keepingCapacity: true)
         sungStore.reset()
-        emptyPartialCount = 0
+        serverAlaapCount = 0
         alaapState = false
     }
 
@@ -594,16 +601,21 @@ public final class StreamingRaagiModeEngine: ObservableObject {
             }
 
         case .partial(_, let transcript, _):
-            // Brief #9.23 Part 3: track ASR-silent partials so the
-            // sung-mode re-lock ratio gate can tighten during alaap.
-            updateAlaapStateIfNeeded(transcript: transcript)
             // Brief #9.7-iOS: partials drive the local FL match for
             // fast within-shabad pangti highlight. Match events
             // (server) still drive the lock state machine and any
-            // cross-shabad swap detection.
+            // cross-shabad swap detection. Brief #9.25 removes the
+            // client-side empty-partial alaap counter from this path
+            // — server-driven `event=alaap` is now the source of
+            // truth (server never emitted empty partials during
+            // alaap; the client counter never fired).
             handlePartialForFLMatch(transcript: transcript)
 
         case .match(let seq, let shabadId, let lineId, let score, let tier, _, _):
+            // Brief #9.25: a real match clears any server-driven
+            // alaap accumulation. If we were in alaap, drop out of
+            // it and revert the sungStore re-lock ratio.
+            resetAlaapOnRealMatch(reason: "match")
             await handleMatch(seq: seq, shabadId: shabadId, lineId: lineId, score: score, tier: tier)
 
         case .jaikara(_, let phrase):
@@ -614,9 +626,64 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         case .noMatch(let seq, let reason, _):
             NSLog("[DIAG] StreamingRaagiModeEngine no_match seq=\(seq) reason=\(reason)")
 
+        case .alaap(let seq, let reason, let partialLen, _):
+            // Brief #9.25: server observed a degenerate ASR partial
+            // (whitespace / vowel-only / repeat-tokens / repeat-
+            // bigram) and suppressed the matcher cascade. Do NOT
+            // touch accumulator, current shabad, or peek state.
+            // Increment `serverAlaapCount`; once it crosses the
+            // threshold, flip into alaap state so the sung-mode
+            // re-lock ratio gate tightens from 1.5× to 2.0×.
+            handleServerAlaap(seq: seq, reason: reason, partialLen: partialLen)
+
+        case .noConfidentMatch(let seq, let reason, let top1Score, let top1Tier, _):
+            // Brief #9.25: server matcher accepted a candidate but
+            // sung-mode confidence gate blocked emission. Diagnostic
+            // only — no state mutation. Do NOT reset alaap state
+            // (this is not a real match, it's the server telling us
+            // it explicitly refused to emit one).
+            NSLog("[DIAG] StreamingRaagiModeEngine event=no_confident_match seq=\(seq) top1_score=\(String(format: "%.1f", top1Score)) top1_tier=\(top1Tier) reason=\(reason)")
+
         case .disconnected(let reason):
             NSLog("[DIAG] StreamingRaagiModeEngine disconnected reason=\(reason)")
             setAudioState(.error("disconnected — reconnecting…"))
+        }
+    }
+
+    // MARK: - Server-driven alaap (Brief #9.25)
+
+    /// Increment the server-alaap counter; once it crosses the
+    /// threshold, flip alaap state on and tighten `sungStore`'s
+    /// re-lock ratio. Only meaningful under sung-mode + LOCKED —
+    /// discovery has no lock to defend, speech mode never receives
+    /// `event=alaap`.
+    private func handleServerAlaap(seq: Int, reason: String, partialLen: Int) {
+        guard singingModeEnabled else { return }
+        guard case .locked = lockState else {
+            NSLog("[DIAG] StreamingRaagiModeEngine event=alaap ignored (state=\(lockState)) seq=\(seq) reason=\(reason)")
+            return
+        }
+        serverAlaapCount += 1
+        if serverAlaapCount >= Self.alaapServerEventThreshold, !alaapState {
+            alaapState = true
+            sungStore.alaapMode = true
+            NSLog("[DIAG] StreamingRaagiModeEngine event=alaap serverAlaapCount=\(serverAlaapCount) alaapState=true reason=\(reason) partialLen=\(partialLen) — re-lock ratio → \(SungModeAccumulatorStore.alaapReLockRatio)")
+        } else {
+            NSLog("[DIAG] StreamingRaagiModeEngine event=alaap serverAlaapCount=\(serverAlaapCount) alaapState=\(alaapState) reason=\(reason) partialLen=\(partialLen)")
+        }
+    }
+
+    /// Called on any real `event=match`. Resets the server-alaap
+    /// counter and, if we were in alaap, drops back out of it.
+    private func resetAlaapOnRealMatch(reason: String) {
+        if serverAlaapCount != 0 || alaapState {
+            let wasAlaap = alaapState
+            serverAlaapCount = 0
+            if wasAlaap {
+                alaapState = false
+                sungStore.alaapMode = false
+                NSLog("[DIAG] StreamingRaagiModeEngine alaapState=false (\(reason) resumed; re-lock ratio → \(SungModeAccumulatorStore.lockRatio))")
+            }
         }
     }
 
@@ -973,42 +1040,6 @@ public final class StreamingRaagiModeEngine: ObservableObject {
             tier: tier,
             challengerMatchCount: winner.entry.matchCount
         )
-    }
-
-    // MARK: - Alaap detection (Brief #9.23 Part 3)
-
-    /// Track consecutive empty/whitespace ASR partials while LOCKED
-    /// under sung-mode. Four in a row (~2 s at ~500 ms cadence) flips
-    /// the engine into alaap state, which tightens the sung-mode
-    /// re-lock ratio gate on the accumulator from 1.5× to 2.0×. The
-    /// first non-empty partial clears the state and reverts the gate.
-    ///
-    /// Only meaningful under sung-mode and in LOCKED — discovery has
-    /// no lock to defend, and speech-mode doesn't route through the
-    /// sung-mode accumulator paths. Cheap on the hot path: a trim +
-    /// isEmpty check on the partial's transcript.
-    private func updateAlaapStateIfNeeded(transcript: String) {
-        guard singingModeEnabled else { return }
-        guard case .locked = lockState else { return }
-        let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty {
-            emptyPartialCount += 1
-            if emptyPartialCount >= Self.alaapEmptyPartialThreshold, !alaapState {
-                alaapState = true
-                sungStore.alaapMode = true
-                NSLog("[DIAG] StreamingRaagiModeEngine alaapState=true (emptyCount=\(emptyPartialCount) windowSec=2.0)")
-            }
-            return
-        }
-        // Non-empty partial resumes normal cadence — reset counter,
-        // clear alaap.
-        let wasAlaap = alaapState
-        emptyPartialCount = 0
-        if wasAlaap {
-            alaapState = false
-            sungStore.alaapMode = false
-            NSLog("[DIAG] StreamingRaagiModeEngine alaapState=false (non-empty partial resumed)")
-        }
     }
 
     // MARK: - First-letter local match (Brief #9.7)

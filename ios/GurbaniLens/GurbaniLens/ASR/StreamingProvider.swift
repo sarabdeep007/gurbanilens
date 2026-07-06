@@ -340,6 +340,35 @@ public final class StreamingProvider: @unchecked Sendable {
             NSLog("[DIAG] StreamingProvider received event=no_match seq=\(seq) reason=\(reason) tier3_top=\(tier3Top.map { String(format: "%.1f", $0) } ?? "nil")")
             emit(.noMatch(seq: seq, reason: reason, tier3Top: tier3Top))
 
+        case "alaap":
+            // Brief #9.25: server-side alaap suppression. The ASR produced a
+            // degenerate partial (whitespace / vowel-only / repeat-tokens /
+            // repeat-bigram) and the server chose to skip both the matcher
+            // cascade and the `match` emission. Delivered only on sung-mode
+            // sessions; speech-mode never sees this. Payload includes the
+            // reason string, the raw partial length, and a 40-char preview
+            // for the trace.
+            let seq = (dict["seq"] as? Int) ?? -1
+            let reason = (dict["reason"] as? String) ?? ""
+            let partialLen = (dict["partial_len"] as? Int) ?? 0
+            let preview = (dict["partial_preview"] as? String) ?? ""
+            NSLog("[DIAG] StreamingProvider received event=alaap seq=\(seq) reason=\(reason) partial_len=\(partialLen) preview=\"\(preview)\"")
+            emit(.alaap(seq: seq, reason: reason, partialLen: partialLen, partialPreview: preview))
+
+        case "no_confident_match":
+            // Brief #9.25: server matcher accepted a candidate but the
+            // top-1/top-3 scores were too weak to warrant `match` under
+            // sung-mode confidence rules. Delivered only on sung-mode
+            // sessions. Client uses these for observability only — no
+            // accumulator update, no lock change.
+            let seq = (dict["seq"] as? Int) ?? -1
+            let reason = (dict["reason"] as? String) ?? ""
+            let top1Score = (dict["top1_score"] as? Double) ?? 0
+            let top1Tier = (dict["top1_tier"] as? Int) ?? -1
+            let top3Scores = (dict["top3_scores"] as? [Double]) ?? []
+            NSLog("[DIAG] StreamingProvider received event=no_confident_match seq=\(seq) reason=\(reason) top1_score=\(String(format: "%.1f", top1Score)) top1_tier=\(top1Tier) top3=\(top3Scores.map { String(format: "%.1f", $0) })")
+            emit(.noConfidentMatch(seq: seq, reason: reason, top1Score: top1Score, top1Tier: top1Tier, top3Scores: top3Scores))
+
         case "ping":
             NSLog("[DIAG] StreamingProvider received event=ping → auto-pong")
             sendJSON(["type": "pong"], label: "pong")
@@ -432,6 +461,16 @@ public enum StreamingEvent: Sendable {
     case match(seq: Int, shabadId: String, lineId: String, score: Double, tier: Int, ang: Int, transcript: String)
     case jaikara(seq: Int, phrase: String)
     case noMatch(seq: Int, reason: String, tier3Top: Double?)
+    /// Brief #9.25: server-side alaap suppression heartbeat. Emitted when the
+    /// ASR partial is degenerate (whitespace / vowel-only / repeat-tokens /
+    /// repeat-bigram) and the server chose to skip both the matcher cascade
+    /// and the `match` emission. Sung-mode sessions only.
+    case alaap(seq: Int, reason: String, partialLen: Int, partialPreview: String)
+    /// Brief #9.25: server matcher accepted a candidate but the top-1/top-3
+    /// scores fell under the sung-mode confidence gate — so a `match` was
+    /// suppressed. Diagnostic only; no client-side state change. Sung-mode
+    /// sessions only.
+    case noConfidentMatch(seq: Int, reason: String, top1Score: Double, top1Tier: Int, top3Scores: [Double])
     /// Transport-level disconnect or transient error. The provider
     /// auto-reconnects (exponential backoff) unless ``StreamingProvider/disconnect()``
     /// was called explicitly.
