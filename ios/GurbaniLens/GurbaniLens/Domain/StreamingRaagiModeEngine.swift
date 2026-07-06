@@ -658,6 +658,20 @@ public final class StreamingRaagiModeEngine: ObservableObject {
     /// discovery has no lock to defend, speech mode never receives
     /// `event=alaap`.
     private func handleServerAlaap(seq: Int, reason: String, partialLen: Int) {
+        // Brief #9.23e Fix 1: unconditional entry DIAG. Deep's post-#9.25
+        // iPhone log had ZERO `event=alaap` DIAGs despite server logs
+        // showing 40+ `alaap suppression: too_short` firings. Two silent
+        // paths in the prior code hid whether we reached this handler at
+        // all: (a) `guard singingModeEnabled else { return }` returned
+        // without logging; (b) if StreamingProvider itself never received
+        // `type: "alaap"` we'd have no client-side breadcrumb either.
+        // This entry line fires before both guards so future traces
+        // definitively distinguish "engine never called" (silent → server
+        // is the culprit) from "engine called but gated" (this line
+        // present → check state / sung flag). Cost is one NSLog per
+        // server-side alaap event — matches the cadence of other event
+        // handlers and is bounded by the server's own alaap suppression.
+        NSLog("[DIAG] StreamingRaagiModeEngine event=alaap ENTRY seq=\(seq) reason=\(reason) partialLen=\(partialLen) lockState=\(lockState) singingModeEnabled=\(singingModeEnabled)")
         guard singingModeEnabled else { return }
         guard case .locked = lockState else {
             NSLog("[DIAG] StreamingRaagiModeEngine event=alaap ignored (state=\(lockState)) seq=\(seq) reason=\(reason)")
