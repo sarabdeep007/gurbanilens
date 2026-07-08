@@ -21,6 +21,11 @@ public struct SungModeAccumulator: Equatable {
     public var lastSeenAt: Date
     /// Bounded ring of recently-observed tiers. Diagnostic only.
     public var lastTiers: [Int]
+    /// Brief #9.26: most recent lineId observed for this shabad.
+    /// Used by ``SungModeAccumulatorStore/topCandidates(maxCount:)``
+    /// so the candidate-cloud UX can preview the last-sung pangti
+    /// per row.
+    public var lastLineId: String
 
     public init(
         totalWeight: Double,
@@ -28,7 +33,8 @@ public struct SungModeAccumulator: Equatable {
         maxTierSeen: Int,
         maxScoreSeen: Double,
         lastSeenAt: Date,
-        lastTiers: [Int]
+        lastTiers: [Int],
+        lastLineId: String = ""
     ) {
         self.totalWeight = totalWeight
         self.hitCount = hitCount
@@ -36,6 +42,7 @@ public struct SungModeAccumulator: Equatable {
         self.maxScoreSeen = maxScoreSeen
         self.lastSeenAt = lastSeenAt
         self.lastTiers = lastTiers
+        self.lastLineId = lastLineId
     }
 }
 
@@ -635,6 +642,12 @@ public struct SungModeAccumulatorStore: Equatable {
             if existing.lastTiers.count > Self.lastTiersCap {
                 existing.lastTiers.removeFirst(existing.lastTiers.count - Self.lastTiersCap)
             }
+            // Brief #9.26: refresh lastLineId only when caller supplied
+            // one so tests that omit the lineId parameter keep the
+            // existing value stable.
+            if !lineId.isEmpty {
+                existing.lastLineId = lineId
+            }
             slots[shabadId] = existing
         } else {
             slots[shabadId] = SungModeAccumulator(
@@ -643,7 +656,8 @@ public struct SungModeAccumulatorStore: Equatable {
                 maxTierSeen: tierClamped,
                 maxScoreSeen: score,
                 lastSeenAt: now,
-                lastTiers: [tierClamped]
+                lastTiers: [tierClamped],
+                lastLineId: lineId
             )
         }
 
@@ -873,6 +887,102 @@ public struct SungModeAccumulatorStore: Equatable {
             return 1.0
         }
     }
+
+    // MARK: - Candidate cloud (Brief #9.26)
+
+    /// Brief #9.26: per-shabad row used by
+    /// ``StreamingRaagiModeEngine``'s candidate-cloud UX. Emitted by
+    /// ``topCandidates(maxCount:)`` post-filters/sort. The
+    /// accumulator has no knowledge of ang (that lives in the
+    /// on-device corpus keyed by shabadId+lineId); the engine
+    /// enriches ``ang`` with a ShabadCache lookup before publishing
+    /// to the UI. Default `ang = 0` marks "not yet resolved".
+    public struct CandidateRow: Equatable {
+        public let shabadId: String
+        public let ang: Int
+        public let matchedLineId: String
+        public let maxScoreSeen: Double
+        public let weight: Double
+        public let hits: Int
+
+        public init(
+            shabadId: String,
+            ang: Int,
+            matchedLineId: String,
+            maxScoreSeen: Double,
+            weight: Double,
+            hits: Int
+        ) {
+            self.shabadId = shabadId
+            self.ang = ang
+            self.matchedLineId = matchedLineId
+            self.maxScoreSeen = maxScoreSeen
+            self.weight = weight
+            self.hits = hits
+        }
+    }
+
+    /// Brief #9.26: ranked candidate list for the cloud UX. Applies
+    /// the following post-processing to the raw `slots` dict:
+    ///
+    ///   1. Sort by weight descending.
+    ///   2. Cap at `maxCount` rows (default 8).
+    ///   3. **Weight filter**: hide any candidate whose weight is
+    ///      strictly less than 25% of the top candidate's weight.
+    ///   4. **Score filter**: hide any candidate whose max observed
+    ///      score is strictly less than 60.
+    ///   5. **Visibility floor**: always return at least 2 rows when
+    ///      the store has ≥ 2 slots (so the UI never has to render an
+    ///      empty box). The floor OVERRIDES the two filters — if the
+    ///      filters would drop below 2, the top-2 by weight are
+    ///      restored regardless of thresholds.
+    ///
+    /// Rows carry the accumulator's `lastLineId` as `matchedLineId`
+    /// so the UI can preview the last-observed pangti per row.
+    /// `ang` is a placeholder (0) — engine enriches via ShabadCache.
+    public func topCandidates(maxCount: Int = 8) -> [CandidateRow] {
+        if slots.isEmpty { return [] }
+        let sorted = slots.sorted { $0.value.totalWeight > $1.value.totalWeight }
+        let topWeight = sorted.first!.value.totalWeight
+        let weightCutoff = topWeight * Self.candidateWeightRatioFloor
+        let filtered = sorted.filter { _, acc in
+            acc.totalWeight >= weightCutoff && acc.maxScoreSeen >= Self.candidateMinMaxScore
+        }
+        // Floor: guarantee at least 2 rows when slots has ≥ 2 entries.
+        // Filters can be aggressive on early ingest — falling back to
+        // the top-N by raw weight keeps the UI populated.
+        let visibleSource: [(key: String, value: SungModeAccumulator)]
+        if sorted.count >= Self.candidateMinVisibleFloor && filtered.count < Self.candidateMinVisibleFloor {
+            visibleSource = Array(sorted.prefix(max(filtered.count, Self.candidateMinVisibleFloor)))
+        } else {
+            visibleSource = filtered
+        }
+        let capped = visibleSource.prefix(maxCount)
+        return capped.map { id, acc in
+            CandidateRow(
+                shabadId: id,
+                ang: 0,
+                matchedLineId: acc.lastLineId,
+                maxScoreSeen: acc.maxScoreSeen,
+                weight: acc.totalWeight,
+                hits: acc.hitCount
+            )
+        }
+    }
+
+    /// Brief #9.26: rows whose weight is < this fraction of the top
+    /// row's weight are dropped by ``topCandidates``. 25% keeps
+    /// long-tail noise off screen without pruning genuinely-close
+    /// runners-up (which typically land in the 50-80% range).
+    public static let candidateWeightRatioFloor: Double = 0.25
+    /// Brief #9.26: rows whose maxScoreSeen is below this are dropped.
+    /// 60 is comfortably below the discovery evidence floor (80) but
+    /// above pure-noise scores (~40-50).
+    public static let candidateMinMaxScore: Double = 60.0
+    /// Brief #9.26: floor on visible-row count. When the store has
+    /// ≥ this many slots, ``topCandidates`` returns at least this
+    /// many rows even if the filters would drop below.
+    public static let candidateMinVisibleFloor: Int = 2
 
     /// Format the top-N slots by weight as
     /// `"<shabadId>:<weight>h<hitCount>"` entries, space-joined.

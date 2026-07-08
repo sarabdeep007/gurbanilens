@@ -1163,5 +1163,91 @@ final class SungModeAccumulatorTests: XCTestCase {
         )
         XCTAssertNil(store.pingPongLockoutUntil, "Pair reset must not carry stale lockout")
     }
+
+    // MARK: - Candidate cloud (Brief #9.26)
+
+    /// The 25% weight-ratio filter must drop rows whose weight is
+    /// strictly less than 25% of the top candidate's weight while
+    /// keeping rows that clear the ratio.
+    func testCandidateCloud_filterBelow25PercentDrops() {
+        // Craft 4 slots with weights ~200, ~90, ~30, ~20 by controlling
+        // hit counts. Score=80 tier=0 → per-hit weight=160. Recent
+        // enough timestamps so decay is negligible.
+        var store = SungModeAccumulatorStore()
+        for i in 0..<3 {
+            _ = store.processMatch(shabadId: "TOP", score: 80, tier: 0, now: at(Double(i) * 0.1), lineId: "L-top")
+        }
+        // Runner-up: two hits at moderate weight → ~250, cleanly above 25% of TOP's ~400.
+        for i in 0..<2 {
+            _ = store.processMatch(shabadId: "MID", score: 70, tier: 0, now: at(0.5 + Double(i) * 0.1), lineId: "L-mid")
+        }
+        // Low candidate: one weak hit → weight below the 25% cutoff of TOP but well above min-score gate.
+        _ = store.processMatch(shabadId: "LOW", score: 60, tier: 3, now: at(0.8), lineId: "L-low")
+
+        let rows = store.topCandidates(maxCount: 8)
+        // TOP must be first.
+        XCTAssertEqual(rows.first?.shabadId, "TOP")
+        // MID must appear (weight comfortably ≥ 25% of TOP).
+        XCTAssertTrue(rows.contains { $0.shabadId == "MID" })
+        // LOW is filtered out for being < 25% of TOP's weight.
+        XCTAssertFalse(rows.contains { $0.shabadId == "LOW" },
+            "LOW's weight is < 25% of TOP — must be filtered out")
+        // Rows sorted by weight desc.
+        for i in 0..<max(0, rows.count - 1) {
+            XCTAssertGreaterThanOrEqual(rows[i].weight, rows[i + 1].weight)
+        }
+    }
+
+    /// When the filters would drop the visible list below the floor,
+    /// the top-2 slots by weight must be restored — the UI must never
+    /// see a single-row list when we have ≥ 2 candidates.
+    func testCandidateCloud_alwaysKeeps2Floor() {
+        // TOP dominates strongly; a WEAK candidate exists at only
+        // ~5% of TOP's weight AND max score below 60 → both filters
+        // would strip it. The floor must reinstate it.
+        var store = SungModeAccumulatorStore()
+        for i in 0..<5 {
+            _ = store.processMatch(shabadId: "TOP", score: 90, tier: 0, now: at(Double(i) * 0.1), lineId: "L-top")
+        }
+        // Score 55 clears the minScore gate (40) but is below the
+        // 60 candidate-min-score filter. Only one hit → low weight.
+        _ = store.processMatch(shabadId: "WEAK", score: 55, tier: 2, now: at(0.9), lineId: "L-weak")
+
+        let rows = store.topCandidates(maxCount: 8)
+        XCTAssertGreaterThanOrEqual(rows.count, 2, "Floor guarantees ≥2 rows when store has ≥2 slots")
+        XCTAssertEqual(rows[0].shabadId, "TOP")
+        // The floor must reinstate WEAK even though both filters strip it.
+        XCTAssertTrue(rows.contains { $0.shabadId == "WEAK" },
+            "Floor must reinstate WEAK when filters strip it below the 2-row floor")
+    }
+
+    /// Rows must be returned sorted by weight descending, with the
+    /// `matchedLineId` field carrying the accumulator's most recent
+    /// `lastLineId` per shabad.
+    func testCandidateCloud_ranksByWeightDescAndCarriesMatchedLine() {
+        var store = SungModeAccumulatorStore()
+        // Three shabads with intentionally-ordered weights: A > B > C.
+        for i in 0..<4 {
+            _ = store.processMatch(shabadId: "A", score: 90, tier: 0, now: at(Double(i) * 0.1), lineId: "A-\(i)")
+        }
+        for i in 0..<3 {
+            _ = store.processMatch(shabadId: "B", score: 85, tier: 0, now: at(Double(i) * 0.1), lineId: "B-\(i)")
+        }
+        for i in 0..<2 {
+            _ = store.processMatch(shabadId: "C", score: 80, tier: 0, now: at(Double(i) * 0.1), lineId: "C-\(i)")
+        }
+        let rows = store.topCandidates(maxCount: 8)
+        // Order check: A, B, C by weight desc.
+        let ids = rows.map(\.shabadId)
+        XCTAssertEqual(ids, ["A", "B", "C"], "Rows must sort by weight descending")
+        // matchedLineId must reflect the latest lineId ingested per shabad.
+        XCTAssertEqual(rows.first(where: { $0.shabadId == "A" })?.matchedLineId, "A-3")
+        XCTAssertEqual(rows.first(where: { $0.shabadId == "B" })?.matchedLineId, "B-2")
+        XCTAssertEqual(rows.first(where: { $0.shabadId == "C" })?.matchedLineId, "C-1")
+        // Cap respected.
+        XCTAssertLessThanOrEqual(rows.count, 8)
+        // Ang placeholder is zero at accumulator level.
+        for row in rows { XCTAssertEqual(row.ang, 0) }
+    }
 }
 
