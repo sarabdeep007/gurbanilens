@@ -106,9 +106,21 @@ struct AppNavGraph: View {
                     let streamingOn = UserDefaults.standard
                         .bool(forKey: "settings.streamingModeEnabled")
                     if streamingOn, let streaming = container.streamingRaagiModeEngine {
+                        // Brief #9.26: pass the cloud force-lock +
+                        // pangti-text closures wired to the streaming
+                        // engine. Buffered engine passes nil (its
+                        // extension returns candidateCloud=nil so the
+                        // cloud branch inside RaagiModeScreen never
+                        // fires anyway).
                         RaagiModeScreen(
                             engine: streaming,
-                            onExit: { container.exitRaagiMode() }
+                            onExit: { container.exitRaagiMode() },
+                            onForceLockFromCloud: { shabadId, lineId in
+                                container.forceLockFromCloud(shabadId: shabadId, matchedLineId: lineId)
+                            },
+                            fetchPangtiTextForCloud: { shabadId, lineId in
+                                await streaming.fetchPangtiText(shabadId: shabadId, lineId: lineId)
+                            }
                         )
                     } else if !streamingOn, let engine = container.raagiModeEngine {
                         RaagiModeScreen(

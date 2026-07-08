@@ -1066,6 +1066,23 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         candidateCloud = .hidden
     }
 
+    /// Brief #9.26: fetch the display Gurmukhi text for a pangti in
+    /// a candidate shabad. Called by the cloud UX to preview each
+    /// row's matched-pangti. Prefers `gurmukhiUnicode`, falls back
+    /// to AnmolLipi conversion — same policy as `RaagiView.rowGurmukhi`.
+    public func fetchPangtiText(shabadId: String, lineId: String) async -> String? {
+        do {
+            let shabad = try await cache.shabad(forId: shabadId)
+            guard let line = shabad.lines.first(where: { $0.id == lineId }) else { return nil }
+            if let uni = line.gurmukhiUnicode, !uni.isEmpty {
+                return uni
+            }
+            return Gurmukhi.fromAnmolLipi(line.gurmukhi)
+        } catch {
+            return nil
+        }
+    }
+
     /// Brief #9.21: sung-mode cross-shabad re-lock. Called from
     /// `handleDifferentShabadMatchInLock` when the accumulator
     /// declares a new leader has crossed all three re-lock gates.

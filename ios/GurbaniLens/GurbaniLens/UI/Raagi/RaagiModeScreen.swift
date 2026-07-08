@@ -28,6 +28,27 @@ import GurbaniLensCore
 struct RaagiModeScreen<Engine: RaagiModeViewModel>: View {
     @ObservedObject var engine: Engine
     let onExit: () -> Void
+    /// Brief #9.26: cloud force-lock closure. Wired to the streaming
+    /// engine's ``forceLockFromCloud`` via the AppNavGraph. Nil for
+    /// the buffered engine — buffered mode doesn't surface the cloud
+    /// so the closure is never called.
+    let onForceLockFromCloud: ((String, String) -> Void)?
+    /// Brief #9.26: async pangti-text fetcher for cloud rows. Wired
+    /// to `StreamingRaagiModeEngine.fetchPangtiText`. Nil for the
+    /// buffered engine — cloud never renders under buffered.
+    let fetchPangtiTextForCloud: ((String, String) async -> String?)?
+
+    init(
+        engine: Engine,
+        onExit: @escaping () -> Void,
+        onForceLockFromCloud: ((String, String) -> Void)? = nil,
+        fetchPangtiTextForCloud: ((String, String) async -> String?)? = nil
+    ) {
+        self.engine = engine
+        self.onExit = onExit
+        self.onForceLockFromCloud = onForceLockFromCloud
+        self.fetchPangtiTextForCloud = fetchPangtiTextForCloud
+    }
 
     @AppStorage("settings.raagiViewMode") private var viewModeRaw: String = "raagi"
 
@@ -159,6 +180,23 @@ struct RaagiModeScreen<Engine: RaagiModeViewModel>: View {
                         .transition(.opacity)
                         .contentShape(Rectangle())
                         .gesture(peekSwipeGesture(shabad: shabad, liveLineId: lineId))
+                } else if case let .visible(rows, partialsSeen) = engine.candidateCloud,
+                          let onForceLock = onForceLockFromCloud,
+                          let fetchText = fetchPangtiTextForCloud {
+                    // Brief #9.26: streaming engine has entered the
+                    // progressive-narrowing cloud path. Replaces the
+                    // entry hint until the accumulator locks (auto),
+                    // the user taps a row (manual), or the cloud is
+                    // dismissed on any lock/re-lock/stop/toggle.
+                    CandidateCloudView(
+                        rows: rows,
+                        partialsSeen: partialsSeen,
+                        onForceLock: onForceLock,
+                        onCancel: onExit,
+                        fetchPangtiText: fetchText
+                    )
+                    .id("candidate-cloud")
+                    .transition(.opacity)
                 } else {
                     entryHint
                         .id("entry-hint")
@@ -180,10 +218,28 @@ struct RaagiModeScreen<Engine: RaagiModeViewModel>: View {
         // (nil ↔ shabad) and (shabadA ↔ shabadB) swaps. 250 ms
         // matches the jaikara banner fade.
         .animation(.easeInOut(duration: 0.25), value: engine.currentShabad?.id)
+        // Brief #9.26: also cross-fade when the cloud appears /
+        // disappears (nil ↔ .visible ↔ .hidden) so the entry-hint /
+        // cloud / shabad-body swaps stay smooth.
+        .animation(.easeInOut(duration: 0.22), value: cloudVisibilityKey)
         // Cross-shabad swap clears peek — a different shabad has no
         // meaningful continuation of the previous peek index.
         .onChange(of: engine.currentShabad?.id) { _ in
             peekIndex = nil
+        }
+    }
+
+    /// Brief #9.26: a stable animation key for the cloud state.
+    /// Reduces `.visible(rows, partialsSeen)` to a lightweight
+    /// value so SwiftUI's `.animation(value:)` only fires on
+    /// meaningful (nil ↔ visible ↔ hidden) transitions, not on
+    /// every row shuffle within an already-visible cloud (rows
+    /// have their own animation in CandidateCloudView).
+    private var cloudVisibilityKey: String {
+        switch engine.candidateCloud {
+        case .none: return "nil"
+        case .some(.hidden): return "hidden"
+        case .some(.visible): return "visible"
         }
     }
 
