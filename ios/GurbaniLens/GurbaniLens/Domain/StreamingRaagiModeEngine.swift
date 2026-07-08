@@ -89,6 +89,12 @@ public final class StreamingRaagiModeEngine: ObservableObject {
     @Published public private(set) var bufferEnergy: Float = 0
     @Published public private(set) var providerLabel: String = "GurbaniLens Streaming"
     @Published public private(set) var activeJaikara: String?
+    /// Brief #9.26: progressive-narrowing candidate cloud state. See
+    /// ``CandidateCloudState`` in `RaagiModeViewModel.swift`. Only
+    /// non-nil while singing-mode DISCOVERING has processed ≥ 5
+    /// partials without a fast-lock hit. Cleared to `nil` (or set
+    /// to `.hidden`) on any lock / re-lock / stop / mode toggle.
+    @Published public private(set) var candidateCloud: CandidateCloudState?
 
     // MARK: - Deps
 
@@ -348,6 +354,44 @@ public final class StreamingRaagiModeEngine: ObservableObject {
     /// hold, not a brief gap.
     private static let alaapServerEventThreshold: Int = 4
 
+    // MARK: - Candidate cloud (Brief #9.26)
+
+    /// Number of partial `event=match` events consumed by the sung-
+    /// mode DISCOVERING path in the current session. Reset in
+    /// ``start`` / ``stop`` / ``didToggleSungMode`` and on any
+    /// successful lock. Drives the fast-lock 3-partial window AND
+    /// the ≥5-partial cloud-entry threshold.
+    private var discoveryPartialCount: Int = 0
+
+    /// Brief #9.26 fast-lock (Fix 1) score threshold. When
+    /// ``discoveryPartialCount`` ≤ ``sungFastLockMaxPartials`` AND
+    /// the incoming match has score ≥ this AND tier ≤
+    /// ``sungFastLockMaxTier``, the engine LOCKS immediately —
+    /// bypassing the accumulator entirely. Matches Deep's validated
+    /// "clean input, high confidence" case: preserves ~90% correct
+    /// wins for spoken/sung clear inputs.
+    private static let sungFastLockScoreThreshold: Double = 90.0
+    /// Fast-lock tier gate — tier ≤ this qualifies.
+    private static let sungFastLockMaxTier: Int = 1
+    /// Fast-lock partial-count gate — check applies for the first
+    /// N partials of DISCOVERING only. After N partials with no
+    /// fast-lock hit, we fall into the accumulator + cloud path.
+    private static let sungFastLockMaxPartials: Int = 3
+    /// Cloud entry threshold: after this many partials in
+    /// DISCOVERING with no fast-lock or accumulator lock, publish
+    /// the cloud state on every subsequent partial.
+    private static let cloudEntryMinPartials: Int = 5
+    /// Cloud auto-lock rule A weight ratio: top candidate must be
+    /// > this × sum-of-other-visible-candidate weights.
+    private static let cloudAutoLockDominanceRatio: Double = 1.5
+    /// Cloud auto-lock rule A weight floor: top candidate must
+    /// also have weight ≥ this.
+    private static let cloudAutoLockMinWeight: Double = 100.0
+    /// Cloud auto-lock rule B tier-≤1 hit count.
+    private static let cloudRelaxedFastLockMinLowTierHits: Int = 3
+    /// Cloud auto-lock rule B max-score gate.
+    private static let cloudRelaxedFastLockMinScore: Double = 85.0
+
     public init(corpus: Corpus, provider: StreamingProvider) {
         self.corpus = corpus
         self.cache = ShabadCache(corpus: corpus)
@@ -438,6 +482,12 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         sungStore.reset()
         serverAlaapCount = 0
         alaapState = false
+        // Brief #9.26: any mode-toggle wipes the transient cloud +
+        // partial counter — a switch from speech ↔ sung shouldn't
+        // leave a stale cloud on screen or a partial count from the
+        // previous mode.
+        discoveryPartialCount = 0
+        dismissCandidateCloud(reason: "sungModeToggle")
     }
 
     // MARK: - Effective-lineId resolver (Brief #9.24 Part 7)
@@ -508,6 +558,9 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         lockState = .discovering
         pendingCandidate = nil
         challengers.removeAll(keepingCapacity: true)
+        // Brief #9.26: reset cloud state + partial counter each session.
+        discoveryPartialCount = 0
+        candidateCloud = nil
         sessionId = UUID().uuidString
 
         mic.onActivity = { [weak self] _, rms, vadActive in
@@ -574,6 +627,10 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         sungStore.reset()
         serverAlaapCount = 0
         alaapState = false
+        // Brief #9.26: teardown drops any lingering cloud state so the
+        // next session starts from a clean slate.
+        discoveryPartialCount = 0
+        candidateCloud = nil
     }
 
     // MARK: - Activity → audioState
@@ -813,6 +870,34 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         tier: Int,
         seq: Int
     ) async {
+        // Brief #9.26 Fix 1: count every ingest-eligible partial
+        // (post tier-3 filter runs below, but the partial-counter
+        // ticks unconditionally so the fast-lock 3-partial window is
+        // measured in server events, not accumulator ingests). The
+        // counter drives BOTH the fast-lock 3-partial window AND
+        // the ≥5-partial cloud-entry threshold.
+        discoveryPartialCount += 1
+
+        // Brief #9.26 Fix 1: FAST-LOCK path. Deep validated ~90%
+        // correct on clean spoken/sung inputs — the accumulator's
+        // "wait for 3 hits" + weight threshold pathway is
+        // deliberately preserved for uncertain inputs and DELIBERATELY
+        // bypassed here so clean-input latency stays at one partial.
+        // Rule: within the first `sungFastLockMaxPartials` server
+        // matches, any hit with score ≥ 90 AND tier ≤ 1 → LOCK
+        // immediately, no cloud. The `if` order guarantees this
+        // check fires BEFORE tier-3 filter or accumulator ingest,
+        // so a legitimate clean tier-0/1 hit at 90+ can never be
+        // masked by later noise.
+        if discoveryPartialCount <= Self.sungFastLockMaxPartials
+            && score >= Self.sungFastLockScoreThreshold
+            && tier <= Self.sungFastLockMaxTier {
+            NSLog("[DIAG] StreamingRaagiModeEngine sungMode FAST-LOCK shabadId=\(shabadId) partial=\(discoveryPartialCount) score=\(String(format: "%.1f", score)) tier=\(tier) via=sungFast")
+            await lockTo(shabadId: shabadId, lineId: lineId, peakScore: score, via: "sungFast", seq: seq, tier: tier)
+            sungStore.capWeight(shabadId: shabadId)
+            return
+        }
+
         // Brief #9.22 Fix 3: skip tier-3 hits in sung-mode DISCOVERY.
         // Tier-3 is full-SGGS regex noise; during noisy sung audio it
         // scatters across many candidates and delays lock (Deep saw
@@ -835,6 +920,14 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         switch decision {
         case .noLock(let top3Summary, let slotCount):
             NSLog("[DIAG] StreamingRaagiModeEngine sungMode accumulator seq=\(seq) added \(shabadId) tier=\(tierClamped) score=\(String(format: "%.1f", score)) weight+=\(String(format: "%.1f", addedWeight)) → top3=[\(top3Summary)] slotCount=\(slotCount)")
+            // Brief #9.26 Fix 1: after ≥5 partials with no fast-lock
+            // or accumulator lock, engage the candidate-cloud UX.
+            // The update helper computes the top-N via the accumulator,
+            // enriches each row with ang via ShabadCache, publishes
+            // state to the UI, and then checks the auto-lock rules.
+            if discoveryPartialCount >= Self.cloudEntryMinPartials {
+                await updateCandidateCloud(seq: seq, tier: tier)
+            }
         case .lock(let topId, let peakScore, let weight, let hitCount, let runnerUpWeight, let tiers):
             NSLog("[DIAG] StreamingRaagiModeEngine sungMode LOCK shabadId=\(topId) weight=\(String(format: "%.1f", weight)) hits=\(hitCount) runnerUpWeight=\(String(format: "%.1f", runnerUpWeight)) peakScore=\(String(format: "%.1f", peakScore)) tiers=\(tiers)")
             await lockTo(shabadId: topId, lineId: lineId, peakScore: peakScore, via: "sungAcc", seq: seq, tier: tier)
@@ -845,6 +938,132 @@ public final class StreamingRaagiModeEngine: ObservableObject {
             // NEXT re-lock require an impossibly-large challenger.
             sungStore.capWeight(shabadId: topId)
         }
+    }
+
+    // MARK: - Candidate cloud publish + auto-lock (Brief #9.26)
+
+    /// Brief #9.26 Fix 1: recompute the top-N candidate rows from the
+    /// sung accumulator, enrich each row with `ang` via ShabadCache,
+    /// publish the resulting `.visible(...)` cloud state to the UI,
+    /// and evaluate the two auto-lock rules. Called after each
+    /// DISCOVERING partial once ``discoveryPartialCount`` has crossed
+    /// ``cloudEntryMinPartials``.
+    ///
+    /// Ang lookup: `cache.shabad(forId:)` is memoized inside the
+    /// actor, so the N ≤ 8 fetches per partial are cheap after the
+    /// first partial in a session. Best-effort — a fetch failure
+    /// leaves that row's `ang = 0`, which the UI renders as "Ang —".
+    private func updateCandidateCloud(seq: Int, tier: Int) async {
+        let rawRows = sungStore.topCandidates(maxCount: 8)
+        guard !rawRows.isEmpty else { return }
+        var enriched: [SungModeAccumulatorStore.CandidateRow] = []
+        enriched.reserveCapacity(rawRows.count)
+        for row in rawRows {
+            var angForRow = 0
+            do {
+                let shabad = try await cache.shabad(forId: row.shabadId)
+                // Prefer the matched line's ang, fall back to the
+                // shabad's first display line.
+                if let matched = shabad.lines.first(where: { $0.id == row.matchedLineId }) {
+                    angForRow = matched.ang
+                } else if let first = shabad.lines.first {
+                    angForRow = first.ang
+                }
+            } catch {
+                NSLog("[DIAG] StreamingRaagiModeEngine cloud ang fetch failed shabadId=\(row.shabadId): \(error.localizedDescription)")
+            }
+            enriched.append(SungModeAccumulatorStore.CandidateRow(
+                shabadId: row.shabadId,
+                ang: angForRow,
+                matchedLineId: row.matchedLineId,
+                maxScoreSeen: row.maxScoreSeen,
+                weight: row.weight,
+                hits: row.hits
+            ))
+        }
+        let previous = candidateCloud
+        let newState: CandidateCloudState = .visible(rows: enriched, partialsSeen: discoveryPartialCount)
+        candidateCloud = newState
+        if previous != newState {
+            NSLog("[DIAG] StreamingRaagiModeEngine cloud STATE change: partials=\(discoveryPartialCount) candidates=\(enriched.count) top=\(enriched.first?.shabadId ?? "nil")")
+        }
+
+        // Auto-lock evaluation.
+        guard let top = enriched.first else { return }
+        let sumOthers = enriched.dropFirst().reduce(0.0) { $0 + $1.weight }
+        let ruleA = top.weight > sumOthers * Self.cloudAutoLockDominanceRatio
+            && top.weight >= Self.cloudAutoLockMinWeight
+        // Rule B pulls tier info directly from the accumulator slot.
+        let lowTierHits = sungStore.slots[top.shabadId]?.lastTiers.filter { $0 <= 1 }.count ?? 0
+        let ruleB = lowTierHits >= Self.cloudRelaxedFastLockMinLowTierHits
+            && top.maxScoreSeen >= Self.cloudRelaxedFastLockMinScore
+        if ruleA || ruleB {
+            let ruleTag = ruleA ? "dominance" : "relaxedFast"
+            NSLog("[DIAG] StreamingRaagiModeEngine cloud AUTO-LOCK top=\(top.shabadId) topWeight=\(String(format: "%.1f", top.weight)) sumOthers=\(String(format: "%.1f", sumOthers)) rule=\(ruleTag) via=cloudAuto")
+            await performCloudLock(
+                shabadId: top.shabadId,
+                lineId: top.matchedLineId,
+                peakScore: top.maxScoreSeen,
+                via: "cloudAuto",
+                seq: seq,
+                tier: tier
+            )
+        }
+    }
+
+    /// Brief #9.26 Fix 1: shared lock helper for the cloud auto-lock
+    /// and force-lock paths. Dismisses the cloud, calls the standard
+    /// ``lockTo`` pathway (which handles ShabadCache + FL sig
+    /// snapshot + state transition), and caps the winner's weight.
+    private func performCloudLock(
+        shabadId: String,
+        lineId: String,
+        peakScore: Double,
+        via: String,
+        seq: Int,
+        tier: Int
+    ) async {
+        candidateCloud = .hidden
+        await lockTo(shabadId: shabadId, lineId: lineId, peakScore: peakScore, via: via, seq: seq, tier: tier)
+        sungStore.capWeight(shabadId: shabadId)
+    }
+
+    /// Brief #9.26 Fix 1: user tapped a candidate row in the cloud
+    /// UX. Immediately locks to the tapped shabad using the row's
+    /// last-observed `matchedLineId` as the highlight anchor.
+    /// Guarded: only fires while state == .discovering AND the
+    /// cloud is currently .visible. Emitted DIAG logs the manual
+    /// origin so the trace is unambiguous.
+    public func forceLockFromCloud(shabadId: String, matchedLineId: String) async {
+        guard case .discovering = lockState else {
+            NSLog("[DIAG] StreamingRaagiModeEngine cloud FORCE-LOCK ignored — state=\(lockState) shabadId=\(shabadId)")
+            return
+        }
+        NSLog("[DIAG] StreamingRaagiModeEngine cloud FORCE-LOCK from user tap shabadId=\(shabadId) lineId=\(matchedLineId) via=cloudManual")
+        let peak = sungStore.slots[shabadId]?.maxScoreSeen ?? Self.sungFastLockScoreThreshold
+        // seq: use currentDisplaySeq so the stale-check inside
+        // lockTo (`seq < currentDisplaySeq`) passes. During discovery
+        // currentDisplaySeq is still 0 (never wrote a match to the
+        // display); subsequent server matches at higher seq will win
+        // normally.
+        await performCloudLock(
+            shabadId: shabadId,
+            lineId: matchedLineId,
+            peakScore: peak,
+            via: "cloudManual",
+            seq: currentDisplaySeq,
+            tier: 1
+        )
+    }
+
+    /// Brief #9.26: dismiss the candidate cloud with a diagnostic
+    /// reason. Called on lock/re-lock/stop/mode-toggle paths that
+    /// need to make sure the cloud isn't left stale on-screen.
+    /// Emits a DIAG only when the state actually changes.
+    private func dismissCandidateCloud(reason: String) {
+        if candidateCloud == nil || candidateCloud == .hidden { return }
+        NSLog("[DIAG] StreamingRaagiModeEngine cloud DISMISS reason=\(reason)")
+        candidateCloud = .hidden
     }
 
     /// Brief #9.21: sung-mode cross-shabad re-lock. Called from
@@ -1393,6 +1612,13 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         // make sure the fresh lock starts with a clean slate.
         challengers.removeAll(keepingCapacity: true)
         lockState = .locked
+        // Brief #9.26: dismiss the cloud on ANY lock transition —
+        // covers fast-lock, accumulator lock, cloud auto-lock, and
+        // manual cloud lock uniformly. Also reset the discovery
+        // partial counter so re-entering discovery from a stop or
+        // toggle starts from zero.
+        dismissCandidateCloud(reason: "lock via=\(via)")
+        discoveryPartialCount = 0
         NSLog("[DIAG] StreamingRaagiModeEngine FL snapshot shabadId=\(shabadId) sigsCount=\(sigs.count)")
         // Brief #9.10-iOS: dump every pangti's FL signature so traces
         // show exactly what the matcher is working against — helps

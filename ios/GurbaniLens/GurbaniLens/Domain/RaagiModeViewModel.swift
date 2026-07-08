@@ -28,7 +28,25 @@ public protocol RaagiModeViewModel: ObservableObject {
     var bufferEnergy: Float { get }
     /// Jaikara banner text (3-s auto-fade). `nil` between jaikaras.
     var activeJaikara: String? { get }
+    /// Brief #9.26: progressive-narrowing candidate cloud state.
+    /// `nil` (default) means no cloud shown. Only the streaming
+    /// engine populates this — the buffered engine's extension
+    /// returns nil unconditionally.
+    var candidateCloud: CandidateCloudState? { get }
 }
 
-// Existing engine satisfies the protocol unchanged.
-extension RaagiModeEngine: RaagiModeViewModel {}
+// Existing engine satisfies the protocol unchanged. Brief #9.26:
+// buffered mode never surfaces the candidate cloud.
+extension RaagiModeEngine: RaagiModeViewModel {
+    public var candidateCloud: CandidateCloudState? { nil }
+}
+
+/// Brief #9.26: state for the progressive-narrowing candidate cloud
+/// surfaced during uncertain sung-mode DISCOVERING. `.visible` means
+/// the UI should render the cloud in place of the entry hint;
+/// `.hidden` or `nil` means normal display (entry hint OR locked
+/// shabad).
+public enum CandidateCloudState: Equatable {
+    case hidden
+    case visible(rows: [SungModeAccumulatorStore.CandidateRow], partialsSeen: Int)
+}

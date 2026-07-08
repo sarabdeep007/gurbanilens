@@ -248,6 +248,21 @@ final class AppContainer: ObservableObject {
         return p
     }
 
+    /// Brief #9.26: user tapped a candidate row in the streaming
+    /// engine's progressive-narrowing cloud UX. Forwards the tap to
+    /// the streaming engine's ``forceLockFromCloud``. No-op when
+    /// the streaming engine isn't currently active (buffered mode
+    /// doesn't surface the cloud).
+    func forceLockFromCloud(shabadId: String, matchedLineId: String) {
+        guard let engine = streamingRaagiModeEngine else {
+            NSLog("[DIAG] AppContainer.forceLockFromCloud REFUSED — no streaming engine active (shabadId=\(shabadId))")
+            return
+        }
+        Task { @MainActor [weak engine] in
+            await engine?.forceLockFromCloud(shabadId: shabadId, matchedLineId: matchedLineId)
+        }
+    }
+
     /// Tap-X path from RaagiModeScreen. Stops the engine (which also
     /// clears the ShabadCache), pops .raagiMode off the nav stack.
     /// Returns the user to Home.
