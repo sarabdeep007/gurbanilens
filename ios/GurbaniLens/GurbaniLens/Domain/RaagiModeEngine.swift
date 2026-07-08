@@ -476,8 +476,18 @@ public final class RaagiModeEngine: ObservableObject {
         // Jaikara check — overlay banner only, sticky shabad untouched.
         // Don't advance currentDisplaySeq; a jaikara isn't a shabad
         // update, and future pangti matches with lower seq should
-        // still win against later jaikaras.
-        if let jaikara = jaikaraDetector.detect(transcript: transcript) {
+        // still win against later jaikaras. Brief #9.26 5c: pass the
+        // currently-displayed pangti text so JaikaraDetector's
+        // context guard can suppress false-positives against
+        // Gurbani-context markers like Mool Mantar's "ਅਕਾਲ ਮੂਰਤਿ".
+        let currentPangtiText: String? = {
+            guard let shabad = currentShabad,
+                  let lineId = currentLineId,
+                  let line = shabad.lines.first(where: { $0.id == lineId }) else { return nil }
+            if let uni = line.gurmukhiUnicode, !uni.isEmpty { return uni }
+            return Gurmukhi.fromAnmolLipi(line.gurmukhi)
+        }()
+        if let jaikara = jaikaraDetector.detect(transcript: transcript, currentLineText: currentPangtiText) {
             NSLog("[DIAG] RaagiModeEngine JAIKARA detected utterance #\(seqNum) text=\"\(jaikara)\" — skipping matcher")
             showJaikara(jaikara)
             return
