@@ -312,4 +312,70 @@ final class FirstLetterSignatureTests: XCTestCase {
         )
         XCTAssertNil(hit)
     }
+
+    // MARK: - First-2-word signatures (Brief #9.26 5)
+
+    /// Cache-parity contract: `firstTwoWordSignatures` must return
+    /// a map keyed by `"L1|L2"` for every pangti whose starter
+    /// bigram is unique AMONG STARTERS. Distinct from
+    /// safeUniqueBigramStarters, which also rules out any BODY
+    /// occurrence of the bigram — this one is looser.
+    func testFirstTwoWordSigs_includesUniqueStarters() {
+        // Three pangtis, each with a distinct starter bigram. All
+        // three qualify because no two share a starter pair.
+        // Bodies contain repeats (e.g. ਸ appears in P1 body and
+        // as P2's starter's second letter) but that's fine — first-
+        // 2-word signatures ignore body positions.
+        let corpus: [(lineId: String, fl: [String])] = [
+            ("P1", ["ਤ", "ਵ", "ਨ", "ਲ"]),
+            ("P2", ["ਪ", "ਸ", "ਚ", "ਹ"]),
+            ("P3", ["ਸ", "ਭ", "ਗ", "ਤ"]),
+        ]
+        let sigs = FirstLetterSignature.firstTwoWordSignatures(corpus: corpus)
+        XCTAssertEqual(sigs["ਤ|ਵ"], "P1")
+        XCTAssertEqual(sigs["ਪ|ਸ"], "P2")
+        XCTAssertEqual(sigs["ਸ|ਭ"], "P3")
+    }
+
+    /// When two pangtis SHARE a starter bigram, neither is included
+    /// (the ambiguity floor). Third pangti with a distinct starter
+    /// still qualifies.
+    func testFirstTwoWordSigs_excludesAmbiguousStarters() {
+        let corpus: [(lineId: String, fl: [String])] = [
+            ("P1", ["ਤ", "ਵ", "ਨ", "ਲ"]),
+            ("P2", ["ਤ", "ਵ", "ਪ", "ਸ"]),   // shares "ਤ|ਵ" with P1
+            ("P3", ["ਸ", "ਭ", "ਗ"]),
+        ]
+        let sigs = FirstLetterSignature.firstTwoWordSignatures(corpus: corpus)
+        XCTAssertNil(sigs["ਤ|ਵ"], "Ambiguous starter must NOT map to any single pangti")
+        XCTAssertEqual(sigs["ਸ|ਭ"], "P3", "Unique starter must still map")
+    }
+
+    /// The trailing-window matcher must fire when the ASR partial's
+    /// trailing bigram matches a first-2-word signature.
+    func testFindTrailingFirstTwoWordSig_fires() {
+        // Pangti "ਤ ਵ ਨ ਲ" has starter "ਤ|ਵ". ASR partial ends
+        // with "ਪ ਸ ਤ ਵ" — trailing bigram matches.
+        let query = ["ਪ", "ਸ", "ਤ", "ਵ"]
+        let sigs = ["ਤ|ਵ": "P1"]
+        let hit = FirstLetterSignature.findTrailingFirstTwoWordSig(
+            queryFL: query, firstTwoWordSigs: sigs, trailingWindow: 4
+        )
+        XCTAssertNotNil(hit)
+        XCTAssertEqual(hit?.lineId, "P1")
+        XCTAssertEqual(hit?.bigram.0, "ਤ")
+        XCTAssertEqual(hit?.bigram.1, "ਵ")
+    }
+
+    /// Single-letter partial cannot form a bigram — must return nil
+    /// even when the letter appears in the map's keyspace.
+    func testFindTrailingFirstTwoWordSig_doesNotFireOnPartialWordHit() {
+        // Only one letter in the partial — no bigram possible.
+        let query = ["ਤ"]
+        let sigs = ["ਤ|ਵ": "P1"]
+        let hit = FirstLetterSignature.findTrailingFirstTwoWordSig(
+            queryFL: query, firstTwoWordSigs: sigs, trailingWindow: 3
+        )
+        XCTAssertNil(hit, "Single-letter partial cannot form a bigram — must return nil")
+    }
 }

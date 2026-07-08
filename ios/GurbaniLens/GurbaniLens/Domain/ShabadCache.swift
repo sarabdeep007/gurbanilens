@@ -53,6 +53,14 @@ public actor ShabadCache {
     /// matchLen=2 for pangtis whose starter letter pair is unique
     /// within the shabad's consecutive-bigram universe.
     private var safeBigrams: [String: [String: String]] = [:]
+    /// Brief #9.26: per-shabad first-two-word starter-bigram map
+    /// (bigramKey → lineId), unique AMONG STARTERS only (looser
+    /// than `safeBigrams`, which requires uniqueness across the
+    /// pangti bodies too). Populated on the same MISS path.
+    /// Powers the FL fast-path tier that jumps highlight when the
+    /// ASR partial's trailing window carries a pangti's clean
+    /// opening two-word signature.
+    private var firstTwoWordSigs: [String: [String: String]] = [:]
 
     public init(corpus: Corpus) {
         self.corpus = corpus
@@ -127,7 +135,13 @@ public actor ShabadCache {
         safeBigrams[id] = bigrams
         NSLog("[DIAG] ShabadCache safeUniqueBigramStarters id=\(id) count=\(bigrams.count) keys=\(bigrams.keys.sorted().joined(separator: ","))")
 
-        NSLog("[DIAG] ShabadCache MISS id=\(id) fetchedLines=\(raw.count) keptLines=\(filtered.count) flSigsComputed=\(sigs.count) safeStarters=\(starters.count) safeBigrams=\(bigrams.count) cachedCount=\(shabads.count)")
+        // Brief #9.26 5: precompute first-two-word signatures. Same
+        // MISS-path lifetime as the other three FL maps.
+        let firstTwo = FirstLetterSignature.firstTwoWordSignatures(corpus: corpusForUnique)
+        firstTwoWordSigs[id] = firstTwo
+        NSLog("[DIAG] ShabadCache firstTwoWordSigs id=\(id) count=\(firstTwo.count) keys=\(firstTwo.keys.sorted().joined(separator: ","))")
+
+        NSLog("[DIAG] ShabadCache MISS id=\(id) fetchedLines=\(raw.count) keptLines=\(filtered.count) flSigsComputed=\(sigs.count) safeStarters=\(starters.count) safeBigrams=\(bigrams.count) firstTwoWordSigs=\(firstTwo.count) cachedCount=\(shabads.count)")
         return built
     }
 
@@ -154,6 +168,13 @@ public actor ShabadCache {
         safeBigrams[id]
     }
 
+    /// Brief #9.26 5: lookup of the precomputed first-two-word
+    /// starter-bigram map for a shabad. Returns nil if the shabad
+    /// hasn't been fetched yet.
+    public func firstTwoWordSignatures(forId id: String) -> [String: String]? {
+        firstTwoWordSigs[id]
+    }
+
     /// Brief #9.7-iOS: convenience that returns the FullShabad + its
     /// FL signatures in one actor hop. The streaming engine needs
     /// both on every lock/swap (the shabad for rendering, the
@@ -165,17 +186,24 @@ public actor ShabadCache {
     ///
     /// Brief #9.19-iOS: extended again to include the safely-unique
     /// starter-bigram map for the Tier B fast path.
+    ///
+    /// Brief #9.26 5: extended once more to include the first-two-
+    /// word starter-bigram map for the new FL fast-path tier that
+    /// commits when a pangti's clean opening two-word signature
+    /// appears in the ASR partial's trailing window.
     public func shabadWithFLSignatures(forId id: String) throws -> (
         shabad: FullShabad,
         signatures: [String: [String]],
         safeStarters: [String: String],
-        safeBigrams: [String: String]
+        safeBigrams: [String: String],
+        firstTwoWordSigs: [String: String]
     ) {
         let s = try shabad(forId: id)
         let sigs = flSignatures[id] ?? [:]
         let starters = safeStarters[id] ?? [:]
         let bigrams = safeBigrams[id] ?? [:]
-        return (s, sigs, starters, bigrams)
+        let firstTwo = firstTwoWordSigs[id] ?? [:]
+        return (s, sigs, starters, bigrams, firstTwo)
     }
 
     /// Drop everything. Called when Raagi Mode is exited so the next
@@ -185,11 +213,13 @@ public actor ShabadCache {
         let droppedSigs = flSignatures.count
         let droppedStarters = safeStarters.count
         let droppedBigrams = safeBigrams.count
+        let droppedFirstTwo = firstTwoWordSigs.count
         shabads.removeAll(keepingCapacity: true)
         flSignatures.removeAll(keepingCapacity: true)
         safeStarters.removeAll(keepingCapacity: true)
         safeBigrams.removeAll(keepingCapacity: true)
-        NSLog("[DIAG] ShabadCache cleared (dropped \(dropped) shabads, \(droppedSigs) FL sigs, \(droppedStarters) safe-starter maps, \(droppedBigrams) safe-bigram maps)")
+        firstTwoWordSigs.removeAll(keepingCapacity: true)
+        NSLog("[DIAG] ShabadCache cleared (dropped \(dropped) shabads, \(droppedSigs) FL sigs, \(droppedStarters) safe-starter maps, \(droppedBigrams) safe-bigram maps, \(droppedFirstTwo) first-two-word maps)")
     }
 
     /// Diagnostic: number of cached shabads (used for the bottom-of-

@@ -187,6 +187,10 @@ public final class StreamingRaagiModeEngine: ObservableObject {
     /// currently-locked shabad. Populated at lock time from
     /// ShabadCache. Empty when not locked.
     private var currentShabadSafeBigrams: [String: String] = [:]
+    /// Brief #9.26 5: first-two-word starter-bigram map for the
+    /// currently-locked shabad. Populated at lock time from
+    /// ShabadCache. Empty when not locked.
+    private var currentShabadFirstTwoWordSigs: [String: String] = [:]
     /// True when ``currentLineId`` was last updated by the local FL
     /// match (not a server match). Used to detect server-overrides-FL
     /// reconciliation events for the DIAG trace. Reset to false on
@@ -549,6 +553,7 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         currentShabadFLSigs.removeAll(keepingCapacity: true)
         currentShabadSafeStarters.removeAll(keepingCapacity: true)
         currentShabadSafeBigrams.removeAll(keepingCapacity: true)
+        currentShabadFirstTwoWordSigs.removeAll(keepingCapacity: true)
         currentLineIdSetByFL = false
         lastFLMatchLen = 0
         lastFLMatchAttemptTime = nil
@@ -618,6 +623,7 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         currentShabadFLSigs.removeAll(keepingCapacity: true)
         currentShabadSafeStarters.removeAll(keepingCapacity: true)
         currentShabadSafeBigrams.removeAll(keepingCapacity: true)
+        currentShabadFirstTwoWordSigs.removeAll(keepingCapacity: true)
         currentLineIdSetByFL = false
         lastFLMatchLen = 0
         lastFLMatchAttemptTime = nil
@@ -1403,6 +1409,34 @@ public final class StreamingRaagiModeEngine: ObservableObject {
             }
         }
 
+        // Brief #9.26 5: Tier B2 — first-two-word signature fast path.
+        // Fires when a pangti's clean opening two-word FL signature
+        // appears as a consecutive bigram in the ASR partial's
+        // trailing window AND that starter bigram is unique AMONG
+        // STARTERS. Weaker than Tier B (which requires uniqueness
+        // across every position in every pangti), so acceptable
+        // false-positive rate is slightly higher — but rate is
+        // bounded to WITHIN-SHABAD line jumps, never cross-shabad.
+        if !currentShabadFirstTwoWordSigs.isEmpty {
+            if let hit = FirstLetterSignature.findTrailingFirstTwoWordSig(
+                queryFL: queryFL,
+                firstTwoWordSigs: currentShabadFirstTwoWordSigs,
+                trailingWindow: Self.safeBigramTrailingWindow
+            ) {
+                let oldLine = currentLineId ?? "nil"
+                let isJump = hit.lineId != (currentLineId ?? "")
+                currentLineId = hit.lineId
+                currentLineIdSetByFL = true
+                lastFLMatchLen = 10
+                if isJump {
+                    NSLog("[DIAG] StreamingRaagiModeEngine FL first-2-word match shabadId=\(currentShabad?.id ?? "nil") lineId=\(hit.lineId) bigram=<\(hit.bigram.0),\(hit.bigram.1)> partialFL='\(queryFL.joined(separator: " "))' (jumped from \(oldLine); first-2-word fast path)")
+                } else {
+                    NSLog("[DIAG] StreamingRaagiModeEngine FL first-2-word confirm shabadId=\(currentShabad?.id ?? "nil") lineId=\(hit.lineId) bigram=<\(hit.bigram.0),\(hit.bigram.1)> partialFL='\(queryFL.joined(separator: " "))' (first-2-word fast path, no jump)")
+                }
+                return
+            }
+        }
+
         // Tier C — find longest common substring between partial FL and any pangti
         // in current shabad. See FirstLetterSignature.findBestPangti.
         let corpus: [(lineId: String, fl: [String])] = currentShabadFLSigs.map { ($0.key, $0.value) }
@@ -1586,16 +1620,19 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         // Brief #9.7: fetch shabad + FL sigs in a single actor call.
         // Brief #9.16: same call also returns safely-unique starters.
         // Brief #9.19: same call also returns safely-unique bigrams.
+        // Brief #9.26 5: same call now also returns first-two-word sigs.
         let fetched: FullShabad
         let sigs: [String: [String]]
         let starters: [String: String]
         let bigrams: [String: String]
+        let firstTwo: [String: String]
         do {
             let result = try await cache.shabadWithFLSignatures(forId: shabadId)
             fetched = result.shabad
             sigs = result.signatures
             starters = result.safeStarters
             bigrams = result.safeBigrams
+            firstTwo = result.firstTwoWordSigs
         } catch {
             NSLog("[DIAG] StreamingRaagiModeEngine lock fetch failed shabadId=\(shabadId): \(error.localizedDescription) — staying in DISCOVERING")
             return
@@ -1620,6 +1657,7 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         currentShabadFLSigs = sigs
         currentShabadSafeStarters = starters
         currentShabadSafeBigrams = bigrams
+        currentShabadFirstTwoWordSigs = firstTwo
         currentShabadRecentPeakScore = peakScore
         currentShabadRecentPeakTime = Date()
         currentDisplaySeq = seq
@@ -1665,16 +1703,19 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         // Brief #9.7: fetch shabad + FL sigs together for the new
         // currentShabad. Brief #9.16/#9.19: also picks up the safely-
         // unique starter unigram + bigram maps for the new shabad.
+        // Brief #9.26 5: also fetches first-two-word signatures.
         let fetched: FullShabad
         let sigs: [String: [String]]
         let starters: [String: String]
         let bigrams: [String: String]
+        let firstTwo: [String: String]
         do {
             let result = try await cache.shabadWithFLSignatures(forId: shabadId)
             fetched = result.shabad
             sigs = result.signatures
             starters = result.safeStarters
             bigrams = result.safeBigrams
+            firstTwo = result.firstTwoWordSigs
         } catch {
             NSLog("[DIAG] StreamingRaagiModeEngine swap fetch failed shabadId=\(shabadId): \(error.localizedDescription) — keeping sticky display")
             return
@@ -1696,6 +1737,7 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         currentShabadFLSigs = sigs
         currentShabadSafeStarters = starters
         currentShabadSafeBigrams = bigrams
+        currentShabadFirstTwoWordSigs = firstTwo
         currentShabadRecentPeakScore = score
         currentShabadRecentPeakTime = Date()
         currentDisplaySeq = seq

@@ -276,6 +276,75 @@ public enum FirstLetterSignature {
         return nil
     }
 
+    // MARK: - First-two-word signatures (Brief #9.26 5)
+
+    /// Compute per-shabad first-two-word signatures: pangti-starter
+    /// bigrams that are unique **among starters** (not globally).
+    /// Returns bigramKey `"L1|L2"` → lineId for each starter bigram
+    /// (L1 = fl[0], L2 = fl[1]) that occurs at position 0 in
+    /// exactly one pangti.
+    ///
+    /// Distinct from ``safeUniqueBigramStarters``:
+    ///   - safeUniqueBigramStarters requires the pair to be absent
+    ///     from every OTHER pangti's full FL universe — zero false-
+    ///     positive risk.
+    ///   - firstTwoWordSignatures only requires uniqueness AMONG
+    ///     starter bigrams — looser. Fires more often but carries a
+    ///     small false-positive risk when another pangti's BODY
+    ///     contains the same bigram. Acceptable within-shabad since
+    ///     the outcome is only a line jump inside the current
+    ///     shabad; cross-shabad detection stays server-driven.
+    ///
+    /// Deep's brief rationale: raagis often start a pangti with
+    /// clean opening consonants even during alaap; a two-word
+    /// signature is precise enough to fingerprint most pangtis
+    /// uniquely within a shabad (~5-15 pangtis per shabad).
+    public static func firstTwoWordSignatures(corpus: [(lineId: String, fl: [String])]) -> [String: String] {
+        if corpus.isEmpty { return [:] }
+        var starterCounts: [String: Int] = [:]
+        for (_, fl) in corpus {
+            guard fl.count >= 2 else { continue }
+            let key = "\(fl[0])|\(fl[1])"
+            starterCounts[key, default: 0] += 1
+        }
+        var result: [String: String] = [:]
+        for (lineId, fl) in corpus {
+            guard fl.count >= 2 else { continue }
+            let key = "\(fl[0])|\(fl[1])"
+            if starterCounts[key] == 1 {
+                result[key] = lineId
+            }
+        }
+        return result
+    }
+
+    /// Scan trailing N letters of queryFL for any first-two-word
+    /// signature. Checks each consecutive bigram in the trailing
+    /// slice RIGHT-TO-LEFT (most recent bigram first). Returns the
+    /// matched pangti for the rightmost hit, else nil. Two-letter
+    /// minimum in the query — a single-letter partial cannot form a
+    /// bigram and correctly returns nil. Brief #9.26 5.
+    public static func findTrailingFirstTwoWordSig(
+        queryFL: [String],
+        firstTwoWordSigs: [String: String],
+        trailingWindow: Int
+    ) -> (bigram: (String, String), lineId: String)? {
+        if queryFL.count < 2 || firstTwoWordSigs.isEmpty { return nil }
+        let windowSize = min(trailingWindow, queryFL.count)
+        let startIdx = queryFL.count - windowSize
+        let lastBigramStart = queryFL.count - 2
+        if lastBigramStart < startIdx { return nil }
+        for i in stride(from: lastBigramStart, through: startIdx, by: -1) {
+            let a = queryFL[i]
+            let b = queryFL[i + 1]
+            let key = "\(a)|\(b)"
+            if let lineId = firstTwoWordSigs[key] {
+                return ((a, b), lineId)
+            }
+        }
+        return nil
+    }
+
     // MARK: - Per-word extraction
 
     /// First-letter for a single word. Detects script per-word so
