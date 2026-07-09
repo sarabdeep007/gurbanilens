@@ -415,6 +415,37 @@ public final class StreamingRaagiModeEngine: ObservableObject {
     /// Cloud auto-lock rule B max-score gate.
     private static let cloudRelaxedFastLockMinScore: Double = 85.0
 
+    // MARK: - Server-event history for FL DIAG (Brief #9.28 Commit 2)
+
+    /// Last-known server verdict kind keyed by seq. Populated by the
+    /// event handlers for `.match` / `.noMatch` / `.alaap` /
+    /// `.noConfidentMatch` and consumed at FL walk entry so the
+    /// diagnostic trace can correlate every FL commit with the
+    /// server's own verdict on the same partial.
+    ///
+    /// Distinct from `flLineGate`'s rejection tracker — that one only
+    /// holds `alaap` / `no_confident_match` because those are the
+    /// only kinds the FL suppression gate acts on. This map keeps
+    /// every kind (including `match` / `noMatch`) so the DIAG line
+    /// can distinguish "server matched but FL disagreed" from "server
+    /// rejected and FL still ran". FIFO cap of
+    /// ``lastServerEventMaxTracked`` seqs; longer sessions rotate
+    /// stale entries out.
+    private var lastServerEventBySeq: [Int: String] = [:]
+    private var lastServerEventSeqOrder: [Int] = []
+    private static let lastServerEventMaxTracked: Int = 50
+    /// Brief #9.28 Commit 2: WARN threshold. When this many consecutive
+    /// most-recent server events are `alaap` / `no_confident_match`
+    /// (in any order), emit a single WARN log so Deep can spot
+    /// "server-has-no-confidence in this audio window" from the trace
+    /// alone. 10 covers ~7.5 s of sustained rejection at the ~750 ms
+    /// partial cadence.
+    private static let consecutiveRejectionWarnThreshold: Int = 10
+    /// One-shot latch so the WARN log fires ONCE per rejection-streak
+    /// crossing rather than on every subsequent rejection within the
+    /// streak. Reset the moment any non-rejection kind is recorded.
+    private var consecutiveRejectionWarnEmitted: Bool = false
+
     public init(corpus: Corpus, provider: StreamingProvider) {
         self.corpus = corpus
         self.cache = ShabadCache(corpus: corpus)
@@ -506,6 +537,11 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         serverAlaapCount = 0
         alaapState = false
         flLineGate.reset()
+        // Brief #9.28 Commit 2: drop the FL-attempt DIAG tracker so
+        // stale rejections don't taint the fresh mode's WARN checks.
+        lastServerEventBySeq.removeAll(keepingCapacity: true)
+        lastServerEventSeqOrder.removeAll(keepingCapacity: true)
+        consecutiveRejectionWarnEmitted = false
         // Brief #9.26: any mode-toggle wipes the transient cloud +
         // partial counter — a switch from speech ↔ sung shouldn't
         // leave a stale cloud on screen or a partial count from the
@@ -582,6 +618,11 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         serverAlaapCount = 0
         alaapState = false
         flLineGate.reset()
+        // Brief #9.28 Commit 2: session start clears the FL-attempt
+        // DIAG tracker so the WARN cannot leak across sessions.
+        lastServerEventBySeq.removeAll(keepingCapacity: true)
+        lastServerEventSeqOrder.removeAll(keepingCapacity: true)
+        consecutiveRejectionWarnEmitted = false
         lockState = .discovering
         pendingCandidate = nil
         challengers.removeAll(keepingCapacity: true)
@@ -657,6 +698,11 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         serverAlaapCount = 0
         alaapState = false
         flLineGate.reset()
+        // Brief #9.28 Commit 2: teardown of the FL-attempt DIAG
+        // tracker.
+        lastServerEventBySeq.removeAll(keepingCapacity: true)
+        lastServerEventSeqOrder.removeAll(keepingCapacity: true)
+        consecutiveRejectionWarnEmitted = false
         // Brief #9.26: teardown drops any lingering cloud state so the
         // next session starts from a clean slate.
         discoveryPartialCount = 0
@@ -705,6 +751,8 @@ public final class StreamingRaagiModeEngine: ObservableObject {
             // alaap accumulation. If we were in alaap, drop out of
             // it and revert the sungStore re-lock ratio.
             resetAlaapOnRealMatch(reason: "match")
+            // Brief #9.28 Commit 2: record for FL-attempt DIAG.
+            recordServerEvent(seq: seq, kind: "match")
             await handleMatch(seq: seq, shabadId: shabadId, lineId: lineId, score: score, tier: tier)
 
         case .jaikara(_, let phrase):
@@ -713,6 +761,7 @@ public final class StreamingRaagiModeEngine: ObservableObject {
             showJaikara(phrase)
 
         case .noMatch(let seq, let reason, _):
+            recordServerEvent(seq: seq, kind: "no_match")
             NSLog("[DIAG] StreamingRaagiModeEngine no_match seq=\(seq) reason=\(reason)")
 
         case .alaap(let seq, let reason, let partialLen, _):
@@ -729,6 +778,8 @@ public final class StreamingRaagiModeEngine: ObservableObject {
             if singingModeEnabled, case .locked = lockState {
                 flLineGate.recordServerRejection(seq: seq, reason: .alaap)
             }
+            // Brief #9.28 Commit 2: record for FL-attempt DIAG + WARN check.
+            recordServerEvent(seq: seq, kind: "alaap")
             handleServerAlaap(seq: seq, reason: reason, partialLen: partialLen)
 
         case .noConfidentMatch(let seq, let reason, let top1Score, let top1Tier, _):
@@ -742,12 +793,60 @@ public final class StreamingRaagiModeEngine: ObservableObject {
             if singingModeEnabled, case .locked = lockState {
                 flLineGate.recordServerRejection(seq: seq, reason: .noConfidentMatch)
             }
+            // Brief #9.28 Commit 2: record for FL-attempt DIAG + WARN check.
+            recordServerEvent(seq: seq, kind: "no_confident_match")
             NSLog("[DIAG] StreamingRaagiModeEngine event=no_confident_match seq=\(seq) top1_score=\(String(format: "%.1f", top1Score)) top1_tier=\(top1Tier) reason=\(reason)")
 
         case .disconnected(let reason):
             NSLog("[DIAG] StreamingRaagiModeEngine disconnected reason=\(reason)")
             setAudioState(.error("disconnected — reconnecting…"))
         }
+    }
+
+    // MARK: - Server-event history for FL DIAG (Brief #9.28 Commit 2)
+
+    /// Record the server's verdict kind for `seq` into the tracker and
+    /// evaluate the consecutive-rejection WARN condition. Kinds are the
+    /// short strings the DIAG log surfaces: `"match"`, `"no_match"`,
+    /// `"alaap"`, or `"no_confident_match"`.
+    private func recordServerEvent(seq: Int, kind: String) {
+        if lastServerEventBySeq[seq] == nil {
+            lastServerEventSeqOrder.append(seq)
+        }
+        lastServerEventBySeq[seq] = kind
+        while lastServerEventSeqOrder.count > Self.lastServerEventMaxTracked {
+            let evicted = lastServerEventSeqOrder.removeFirst()
+            lastServerEventBySeq.removeValue(forKey: evicted)
+        }
+
+        // WARN: if the last N verdicts (in seq order) were all
+        // rejections, log once so Deep can distinguish "FL is chasing
+        // real matches on a bad audio window" from a genuine FL bug.
+        let isRejection = (kind == "alaap" || kind == "no_confident_match")
+        if !isRejection {
+            // Any non-rejection resets the latch so the next streak
+            // will trigger the WARN afresh.
+            consecutiveRejectionWarnEmitted = false
+            return
+        }
+        let horizon = Self.consecutiveRejectionWarnThreshold
+        if lastServerEventSeqOrder.count < horizon { return }
+        let tail = lastServerEventSeqOrder.suffix(horizon)
+        let allRejected = tail.allSatisfy { s in
+            let k = lastServerEventBySeq[s] ?? ""
+            return k == "alaap" || k == "no_confident_match"
+        }
+        if allRejected, !consecutiveRejectionWarnEmitted {
+            consecutiveRejectionWarnEmitted = true
+            NSLog("[DIAG] StreamingRaagiModeEngine WARN server rejected last \(horizon) partials seqs=\(tail.first ?? 0)-\(tail.last ?? 0) — FL may be running on garbage")
+        }
+    }
+
+    /// Lookup for the FL-entry diagnostic. Returns `"unknown"` when
+    /// the tracker has no verdict for `seq` (typical, since verdicts
+    /// arrive from the server AFTER the partial for the same seq).
+    private func serverEventKind(for seq: Int) -> String {
+        return lastServerEventBySeq[seq] ?? "unknown"
     }
 
     // MARK: - Server-driven alaap (Brief #9.25)
@@ -1387,6 +1486,17 @@ public final class StreamingRaagiModeEngine: ObservableObject {
 
         var queryFL = FirstLetterSignature.extract(trimmed)
         if queryFL.count < Self.flMinQueryLength { return }
+
+        // Brief #9.28 Commit 2: FL-attempt DIAG. Emitted once per
+        // partial that passes the entry gates (locked + sigs loaded +
+        // cooldown + non-empty query). `lastServerEvent` is usually
+        // `unknown` because verdicts arrive AFTER the partial for the
+        // same seq — the value becomes meaningful when server events
+        // for a seq land BEFORE the client processes that seq's
+        // partial (rare but possible under reconnection replay). No
+        // behavior change; the log correlates FL commits with the
+        // server's own verdict on the same partial.
+        NSLog("[DIAG] StreamingRaagiModeEngine FL attempt seq=\(seq) lastServerEvent=\(serverEventKind(for: seq)) tier=pending lineId=\(currentLineId ?? "nil")")
         if queryFL.count > Self.flMaxQueryLength {
             queryFL = Array(queryFL.prefix(Self.flMaxQueryLength))
         }
