@@ -39,7 +39,7 @@ final class SungModeAccumulatorTests: XCTestCase {
             XCTFail("Expected .noLock at 80 weight"); return
         }
         XCTAssertEqual(slotCount, 1)
-        XCTAssertEqual(store.slots["BSJ"]?.totalWeight, 80.0, accuracy: 0.001)
+        XCTAssertEqual(store.slots["BSJ"]?.totalWeight ?? 0, 80.0, accuracy: 0.001)
         XCTAssertEqual(store.slots["BSJ"]?.hitCount, 1)
         XCTAssertEqual(store.slots["BSJ"]?.maxScoreSeen, 40.0)
     }
