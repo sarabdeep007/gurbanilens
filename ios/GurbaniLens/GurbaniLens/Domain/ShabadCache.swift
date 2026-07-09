@@ -57,10 +57,19 @@ public actor ShabadCache {
     /// (bigramKey → lineId), unique AMONG STARTERS only (looser
     /// than `safeBigrams`, which requires uniqueness across the
     /// pangti bodies too). Populated on the same MISS path.
-    /// Powers the FL fast-path tier that jumps highlight when the
-    /// ASR partial's trailing window carries a pangti's clean
-    /// opening two-word signature.
+    /// Retained for diagnostic parity — Brief #9.28 pointed the FL
+    /// matcher at ``safeFirstTwoWordSigs`` instead, and this field is
+    /// no longer consumed by the fast path.
     private var firstTwoWordSigs: [String: [String: String]] = [:]
+    /// Brief #9.28: per-shabad SAFE-UNIQUE first-two-word starter-
+    /// bigram map. Same shape as ``firstTwoWordSigs`` but the bigram
+    /// must ALSO be absent from every OTHER pangti's FL body —
+    /// zero-false-positive-within-shabad guarantee. Fixes the intra-
+    /// shabad line-jumping observed in Deep's post-#9.27 iPhone log
+    /// where the ASR partial's trailing bigram matched a starter
+    /// that also happened to appear in a neighbor's body.
+    /// Powers the FL fast-path Tier B2 in place of ``firstTwoWordSigs``.
+    private var safeFirstTwoWordSigs: [String: [String: String]] = [:]
 
     public init(corpus: Corpus) {
         self.corpus = corpus
@@ -141,7 +150,22 @@ public actor ShabadCache {
         firstTwoWordSigs[id] = firstTwo
         NSLog("[DIAG] ShabadCache firstTwoWordSigs id=\(id) count=\(firstTwo.count) keys=\(firstTwo.keys.sorted().joined(separator: ","))")
 
-        NSLog("[DIAG] ShabadCache MISS id=\(id) fetchedLines=\(raw.count) keptLines=\(filtered.count) flSigsComputed=\(sigs.count) safeStarters=\(starters.count) safeBigrams=\(bigrams.count) firstTwoWordSigs=\(firstTwo.count) cachedCount=\(shabads.count)")
+        // Brief #9.28: precompute the SAFE-UNIQUE first-two-word map.
+        // Adds the body-absence filter on top of the starter-uniqueness
+        // one — restores the zero-false-positive-within-shabad
+        // guarantee that Brief #9.26 loosened. Log a rejection summary
+        // when the safe-unique set is a strict subset of the raw set so
+        // Deep can see which sigs got dropped for a given shabad.
+        let safeFirstTwo = FirstLetterSignature.safeUniqueFirstTwoWordSigs(corpus: corpusForUnique)
+        safeFirstTwoWordSigs[id] = safeFirstTwo
+        let rejectedFirstTwo = Set(firstTwo.keys).subtracting(Set(safeFirstTwo.keys))
+        if rejectedFirstTwo.isEmpty {
+            NSLog("[DIAG] ShabadCache safeFirstTwoWordSigs id=\(id) accepted=\(safeFirstTwo.count) rejected=0 (no body-collisions)")
+        } else {
+            NSLog("[DIAG] ShabadCache safeFirstTwoWordSigs id=\(id) accepted=\(safeFirstTwo.count) rejected=\(rejectedFirstTwo.count) rejectedKeys=\(rejectedFirstTwo.sorted().joined(separator: ","))")
+        }
+
+        NSLog("[DIAG] ShabadCache MISS id=\(id) fetchedLines=\(raw.count) keptLines=\(filtered.count) flSigsComputed=\(sigs.count) safeStarters=\(starters.count) safeBigrams=\(bigrams.count) firstTwoWordSigs=\(firstTwo.count) safeFirstTwoWordSigs=\(safeFirstTwo.count) cachedCount=\(shabads.count)")
         return built
     }
 
@@ -170,9 +194,19 @@ public actor ShabadCache {
 
     /// Brief #9.26 5: lookup of the precomputed first-two-word
     /// starter-bigram map for a shabad. Returns nil if the shabad
-    /// hasn't been fetched yet.
+    /// hasn't been fetched yet. Retained for diagnostics; the FL
+    /// fast-path uses ``safeUniqueFirstTwoWordSigs`` instead.
     public func firstTwoWordSignatures(forId id: String) -> [String: String]? {
         firstTwoWordSigs[id]
+    }
+
+    /// Brief #9.28: lookup of the precomputed SAFE-UNIQUE first-two-
+    /// word starter-bigram map for a shabad. Returns nil if the
+    /// shabad hasn't been fetched yet. This is the map the FL fast-
+    /// path Tier B2 consumes; the raw ``firstTwoWordSignatures`` map
+    /// is diagnostic-only after #9.28.
+    public func safeUniqueFirstTwoWordSigs(forId id: String) -> [String: String]? {
+        safeFirstTwoWordSigs[id]
     }
 
     /// Brief #9.7-iOS: convenience that returns the FullShabad + its
@@ -191,19 +225,26 @@ public actor ShabadCache {
     /// word starter-bigram map for the new FL fast-path tier that
     /// commits when a pangti's clean opening two-word signature
     /// appears in the ASR partial's trailing window.
+    ///
+    /// Brief #9.28: extended again to include the SAFE-UNIQUE first-
+    /// two-word map. The engine's Tier B2 consumes the safe variant;
+    /// the raw variant is returned in parallel for diagnostic parity
+    /// (unused by the matcher after #9.28).
     public func shabadWithFLSignatures(forId id: String) throws -> (
         shabad: FullShabad,
         signatures: [String: [String]],
         safeStarters: [String: String],
         safeBigrams: [String: String],
-        firstTwoWordSigs: [String: String]
+        firstTwoWordSigs: [String: String],
+        safeFirstTwoWordSigs: [String: String]
     ) {
         let s = try shabad(forId: id)
         let sigs = flSignatures[id] ?? [:]
         let starters = safeStarters[id] ?? [:]
         let bigrams = safeBigrams[id] ?? [:]
         let firstTwo = firstTwoWordSigs[id] ?? [:]
-        return (s, sigs, starters, bigrams, firstTwo)
+        let safeFirstTwo = safeFirstTwoWordSigs[id] ?? [:]
+        return (s, sigs, starters, bigrams, firstTwo, safeFirstTwo)
     }
 
     /// Drop everything. Called when Raagi Mode is exited so the next
@@ -214,12 +255,14 @@ public actor ShabadCache {
         let droppedStarters = safeStarters.count
         let droppedBigrams = safeBigrams.count
         let droppedFirstTwo = firstTwoWordSigs.count
+        let droppedSafeFirstTwo = safeFirstTwoWordSigs.count
         shabads.removeAll(keepingCapacity: true)
         flSignatures.removeAll(keepingCapacity: true)
         safeStarters.removeAll(keepingCapacity: true)
         safeBigrams.removeAll(keepingCapacity: true)
         firstTwoWordSigs.removeAll(keepingCapacity: true)
-        NSLog("[DIAG] ShabadCache cleared (dropped \(dropped) shabads, \(droppedSigs) FL sigs, \(droppedStarters) safe-starter maps, \(droppedBigrams) safe-bigram maps, \(droppedFirstTwo) first-two-word maps)")
+        safeFirstTwoWordSigs.removeAll(keepingCapacity: true)
+        NSLog("[DIAG] ShabadCache cleared (dropped \(dropped) shabads, \(droppedSigs) FL sigs, \(droppedStarters) safe-starter maps, \(droppedBigrams) safe-bigram maps, \(droppedFirstTwo) first-two-word maps, \(droppedSafeFirstTwo) safe-first-two-word maps)")
     }
 
     /// Diagnostic: number of cached shabads (used for the bottom-of-

@@ -378,4 +378,69 @@ final class FirstLetterSignatureTests: XCTestCase {
         )
         XCTAssertNil(hit, "Single-letter partial cannot form a bigram — must return nil")
     }
+
+    // MARK: - safeUniqueFirstTwoWordSigs (Brief #9.28)
+
+    /// Two pangtis share the "ਤ|ਵ" starter bigram → the safe-unique
+    /// map must NOT contain it, mirroring the starter-uniqueness gate
+    /// in the looser ``firstTwoWordSignatures``. Third pangti's unique
+    /// starter still qualifies.
+    func test_safeUniqueFirstTwoWordSigs_excludesDuplicates() {
+        let corpus: [(lineId: String, fl: [String])] = [
+            ("P1", ["ਤ", "ਵ", "ਨ", "ਲ"]),
+            ("P2", ["ਤ", "ਵ", "ਪ", "ਸ"]),   // shares "ਤ|ਵ" with P1
+            ("P3", ["ਹ", "ਮ", "ਸ", "ਗ"]),
+        ]
+        let result = FirstLetterSignature.safeUniqueFirstTwoWordSigs(corpus: corpus)
+        XCTAssertNil(result["ਤ|ਵ"], "Shared starter must NOT map to any single pangti")
+        XCTAssertEqual(result["ਹ|ਮ"], "P3", "Unique starter with no body collisions must qualify")
+    }
+
+    /// A shabad whose starter bigram "ਹ|ਮ" is P1's own (unique among
+    /// starters) AND does not appear in any other pangti's body must
+    /// qualify. Ditto for P2's "ਤ|ਵ" which appears only there.
+    func test_safeUniqueFirstTwoWordSigs_includesUnique() {
+        let corpus: [(lineId: String, fl: [String])] = [
+            ("P1", ["ਹ", "ਮ", "ਸ", "ਲ"]),
+            ("P2", ["ਤ", "ਵ", "ਪ", "ਨ"]),
+        ]
+        let result = FirstLetterSignature.safeUniqueFirstTwoWordSigs(corpus: corpus)
+        XCTAssertEqual(result["ਹ|ਮ"], "P1", "P1's unique starter must qualify")
+        XCTAssertEqual(result["ਤ|ਵ"], "P2", "P2's unique starter must qualify")
+        XCTAssertEqual(result.count, 2)
+    }
+
+    /// The trailing-window matcher fires when the ASR partial's
+    /// trailing bigram matches a signature in the safe-unique map.
+    /// Same underlying ``findTrailingFirstTwoWordSig`` implementation
+    /// as Brief #9.26, now driven by the safe-unique map from #9.28.
+    func test_findTrailingSafeUniqueFirstTwoWord_returnsMatchWhenUnique() {
+        // "ਹ|ਮ" is P1's safe-unique first-two-word signature. Query
+        // ends with "ਹ ਮ" — trailing bigram matches.
+        let query = ["ਪ", "ਸ", "ਹ", "ਮ"]
+        let sigs = ["ਹ|ਮ": "P1"]
+        let hit = FirstLetterSignature.findTrailingFirstTwoWordSig(
+            queryFL: query, firstTwoWordSigs: sigs, trailingWindow: 4
+        )
+        XCTAssertNotNil(hit)
+        XCTAssertEqual(hit?.lineId, "P1")
+        XCTAssertEqual(hit?.bigram.0, "ਹ")
+        XCTAssertEqual(hit?.bigram.1, "ਮ")
+    }
+
+    /// The matcher must NOT fire on a bigram that was rejected by the
+    /// safe-unique filter, even when the map contains other unrelated
+    /// entries. Simulates the case where "ਤ|ਵ" was excluded (duplicate
+    /// starter or body-present in another pangti) — the query's
+    /// trailing "ਤ|ਵ" bigram must return nil.
+    func test_findTrailingSafeUniqueFirstTwoWord_returnsNilWhenAmbiguous() {
+        let query = ["ਪ", "ਸ", "ਤ", "ਵ"]
+        // Map contains other safe-unique sigs but NOT "ਤ|ਵ" — the
+        // ambiguity gate stripped it upstream.
+        let sigs = ["ਹ|ਮ": "P1", "ਖ|ਗ": "P2"]
+        let hit = FirstLetterSignature.findTrailingFirstTwoWordSig(
+            queryFL: query, firstTwoWordSigs: sigs, trailingWindow: 4
+        )
+        XCTAssertNil(hit, "Rejected starter bigram must yield no match")
+    }
 }

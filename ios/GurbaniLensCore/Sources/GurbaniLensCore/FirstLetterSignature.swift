@@ -318,12 +318,84 @@ public enum FirstLetterSignature {
         return result
     }
 
+    // MARK: - Safe-unique first-two-word signatures (Brief #9.28)
+
+    /// Compute the SAFE-UNIQUE first-two-word signature map for a
+    /// shabad — the tightened variant of ``firstTwoWordSignatures``.
+    /// A starter bigram (fl[0], fl[1]) of pangti X qualifies iff:
+    ///   1. No other pangti in the shabad has (fl[0], fl[1]) as its
+    ///      starter (unique among starters), AND
+    ///   2. The consecutive pair (fl[0], fl[1]) does NOT appear at
+    ///      ANY position in any OTHER pangti's FL — including the
+    ///      body. Same-pangti body repetition is fine: the raagi is
+    ///      already on the correct line when the trailing bigram
+    ///      fires.
+    ///
+    /// This restores the zero-false-positive-within-shabad guarantee
+    /// that Brief #9.19's `safeUniqueBigramStarters` had. #9.26's
+    /// `firstTwoWordSignatures` relaxed to "unique-among-starters"
+    /// only, which caused Deep's post-#9.27 iPhone log — the highlight
+    /// walked across 6 different wrong lineIds while he sang D7PD
+    /// because the ASR partial's trailing bigram matched OTHER pangtis'
+    /// starter bigrams that also happened to appear in their neighbors'
+    /// bodies.
+    ///
+    /// Structurally equivalent output to ``safeUniqueBigramStarters``
+    /// under typical corpora; kept as a separate API so the call-site
+    /// intent (fingerprint a pangti's clean opening two-word signature)
+    /// stays explicit and future divergence is possible without
+    /// re-plumbing.
+    ///
+    /// Brief #9.28.
+    public static func safeUniqueFirstTwoWordSigs(corpus: [(lineId: String, fl: [String])]) -> [String: String] {
+        if corpus.isEmpty { return [:] }
+        // Filter 1: starter uniqueness. Same criterion as
+        // ``firstTwoWordSignatures``.
+        var starterCounts: [String: Int] = [:]
+        var starterOwner: [String: String] = [:]
+        for (lineId, fl) in corpus {
+            guard fl.count >= 2 else { continue }
+            let key = "\(fl[0])|\(fl[1])"
+            starterCounts[key, default: 0] += 1
+            starterOwner[key] = lineId
+        }
+        // Filter 2: body-absence in OTHER pangtis. Iterates every
+        // consecutive pair (starter or body) in every non-owning
+        // pangti and excludes bigrams that collide.
+        var result: [String: String] = [:]
+        for (key, ownerId) in starterOwner {
+            guard starterCounts[key] == 1 else { continue }
+            var appearsElsewhere = false
+            for (lid, fl) in corpus {
+                if lid == ownerId { continue }
+                if fl.count < 2 { continue }
+                for i in 0..<(fl.count - 1) {
+                    let otherKey = "\(fl[i])|\(fl[i + 1])"
+                    if otherKey == key {
+                        appearsElsewhere = true
+                        break
+                    }
+                }
+                if appearsElsewhere { break }
+            }
+            if !appearsElsewhere {
+                result[key] = ownerId
+            }
+        }
+        return result
+    }
+
     /// Scan trailing N letters of queryFL for any first-two-word
     /// signature. Checks each consecutive bigram in the trailing
     /// slice RIGHT-TO-LEFT (most recent bigram first). Returns the
     /// matched pangti for the rightmost hit, else nil. Two-letter
     /// minimum in the query — a single-letter partial cannot form a
     /// bigram and correctly returns nil. Brief #9.26 5.
+    ///
+    /// Brief #9.28: callers should feed this the map returned by
+    /// ``safeUniqueFirstTwoWordSigs``, NOT the raw
+    /// ``firstTwoWordSignatures`` output. The signature is unchanged
+    /// because both maps share the `[bigramKey: lineId]` shape.
     public static func findTrailingFirstTwoWordSig(
         queryFL: [String],
         firstTwoWordSigs: [String: String],
