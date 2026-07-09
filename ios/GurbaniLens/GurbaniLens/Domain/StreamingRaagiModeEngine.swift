@@ -206,6 +206,15 @@ public final class StreamingRaagiModeEngine: ObservableObject {
     /// than once per ``flCooldownMs`` (anti-flicker for burst partials).
     private var lastFLMatchAttemptTime: Date? = nil
 
+    /// Brief #9.27: FL fast-path three-gate suppressor. Composes
+    /// server-confidence rejection tracking, an 800 ms debounce with a
+    /// 2-partial pending-line buffer, and a line-level ping-pong guard.
+    /// Only invoked while `singingModeEnabled && lockState == .locked` —
+    /// speech mode and DISCOVERING skip it so pre-#9.27 behavior is
+    /// byte-identical there. Reset on `start`, `stop`, and
+    /// `didToggleSungMode`.
+    private var flLineGate: LineFLGate = LineFLGate()
+
     // MARK: - Tunables (Brief #9.4)
 
     private static let jaikaraBannerSeconds: Double = 3.0
@@ -486,6 +495,7 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         sungStore.reset()
         serverAlaapCount = 0
         alaapState = false
+        flLineGate.reset()
         // Brief #9.26: any mode-toggle wipes the transient cloud +
         // partial counter — a switch from speech ↔ sung shouldn't
         // leave a stale cloud on screen or a partial count from the
@@ -560,6 +570,7 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         sungStore.reset()
         serverAlaapCount = 0
         alaapState = false
+        flLineGate.reset()
         lockState = .discovering
         pendingCandidate = nil
         challengers.removeAll(keepingCapacity: true)
@@ -633,6 +644,7 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         sungStore.reset()
         serverAlaapCount = 0
         alaapState = false
+        flLineGate.reset()
         // Brief #9.26: teardown drops any lingering cloud state so the
         // next session starts from a clean slate.
         discoveryPartialCount = 0
@@ -663,7 +675,7 @@ public final class StreamingRaagiModeEngine: ObservableObject {
                 setAudioState(.listening)
             }
 
-        case .partial(_, let transcript, _):
+        case .partial(let seq, let transcript, _):
             // Brief #9.7-iOS: partials drive the local FL match for
             // fast within-shabad pangti highlight. Match events
             // (server) still drive the lock state machine and any
@@ -671,8 +683,10 @@ public final class StreamingRaagiModeEngine: ObservableObject {
             // client-side empty-partial alaap counter from this path
             // — server-driven `event=alaap` is now the source of
             // truth (server never emitted empty partials during
-            // alaap; the client counter never fired).
-            handlePartialForFLMatch(transcript: transcript)
+            // alaap; the client counter never fired). Brief #9.27:
+            // seq threaded so the FL walk can check the server-
+            // rejection cache before running.
+            handlePartialForFLMatch(transcript: transcript, seq: seq)
 
         case .match(let seq, let shabadId, let lineId, let score, let tier, _, _):
             // Brief #9.25: a real match clears any server-driven
@@ -697,6 +711,12 @@ public final class StreamingRaagiModeEngine: ObservableObject {
             // Increment `serverAlaapCount`; once it crosses the
             // threshold, flip into alaap state so the sung-mode
             // re-lock ratio gate tightens from 1.5× to 2.0×.
+            // Brief #9.27: record the rejection into the FL gate so
+            // any late-arriving partial for the same seq skips its
+            // FL walk entirely.
+            if singingModeEnabled, case .locked = lockState {
+                flLineGate.recordServerRejection(seq: seq, reason: .alaap)
+            }
             handleServerAlaap(seq: seq, reason: reason, partialLen: partialLen)
 
         case .noConfidentMatch(let seq, let reason, let top1Score, let top1Tier, _):
@@ -705,6 +725,11 @@ public final class StreamingRaagiModeEngine: ObservableObject {
             // only — no state mutation. Do NOT reset alaap state
             // (this is not a real match, it's the server telling us
             // it explicitly refused to emit one).
+            // Brief #9.27: record the rejection so the FL walk on
+            // any late-arriving partial for the same seq skips.
+            if singingModeEnabled, case .locked = lockState {
+                flLineGate.recordServerRejection(seq: seq, reason: .noConfidentMatch)
+            }
             NSLog("[DIAG] StreamingRaagiModeEngine event=no_confident_match seq=\(seq) top1_score=\(String(format: "%.1f", top1Score)) top1_tier=\(top1Tier) reason=\(reason)")
 
         case .disconnected(let reason):
@@ -1320,13 +1345,24 @@ public final class StreamingRaagiModeEngine: ObservableObject {
     /// (`currentShabadFLSigs`, `currentLineId`, `lastFLMatchAttemptTime`)
     /// lives on this @MainActor class. The FL match itself is a
     /// linear walk over ~10-50 short string arrays; trivially fast.
-    private func handlePartialForFLMatch(transcript: String) {
+    private func handlePartialForFLMatch(transcript: String, seq: Int) {
         // Gate: LOCKED state only. DISCOVERING uses single-slot
         // pendingCandidate accumulation, not FL — the brief is
         // explicit about FL never affecting discovery.
         guard case .locked = lockState else { return }
         guard !currentShabadFLSigs.isEmpty else { return }
         if case .error = audioState { return }
+
+        // Brief #9.27: server-confidence gate. If the server has
+        // already rejected this partial's seq as `no_confident_match`
+        // or `alaap`, suppress the entire FL walk with a single DIAG
+        // line. Only applies under sung-mode; speech-mode FL is
+        // byte-identical to HEAD `4a1bd00`.
+        if singingModeEnabled, flLineGate.isServerRejected(seq: seq) {
+            let reason = flLineGate.serverRejectionReason(seq: seq)?.rawValue ?? "unknown"
+            NSLog("[DIAG] StreamingRaagiModeEngine FL SUPPRESSED (server-rejected seq=\(seq) reason=\(reason))")
+            return
+        }
 
         // Cooldown — anti-flicker for burst partials.
         if let last = lastFLMatchAttemptTime,
@@ -1370,7 +1406,12 @@ public final class StreamingRaagiModeEngine: ObservableObject {
                 // both cases preserves FL-holds-over-server behavior (#9.12
                 // threshold=4, 10 leaves headroom).
                 let oldLine = currentLineId ?? "nil"
-                let isJump = hit.lineId != (currentLineId ?? "")
+                let currentLineSafe = currentLineId ?? ""
+                let isJump = hit.lineId != currentLineSafe
+                // Brief #9.27: debounce + line ping-pong gate for jumps only.
+                if isJump, !flLineGateAllowsChange(from: currentLineSafe, to: hit.lineId, seq: seq) {
+                    return
+                }
                 currentLineId = hit.lineId
                 currentLineIdSetByFL = true
                 lastFLMatchLen = 10
@@ -1396,7 +1437,11 @@ public final class StreamingRaagiModeEngine: ObservableObject {
                 trailingWindow: Self.safeBigramTrailingWindow
             ) {
                 let oldLine = currentLineId ?? "nil"
-                let isJump = hit.lineId != (currentLineId ?? "")
+                let currentLineSafe = currentLineId ?? ""
+                let isJump = hit.lineId != currentLineSafe
+                if isJump, !flLineGateAllowsChange(from: currentLineSafe, to: hit.lineId, seq: seq) {
+                    return
+                }
                 currentLineId = hit.lineId
                 currentLineIdSetByFL = true
                 lastFLMatchLen = 10
@@ -1424,7 +1469,11 @@ public final class StreamingRaagiModeEngine: ObservableObject {
                 trailingWindow: Self.safeBigramTrailingWindow
             ) {
                 let oldLine = currentLineId ?? "nil"
-                let isJump = hit.lineId != (currentLineId ?? "")
+                let currentLineSafe = currentLineId ?? ""
+                let isJump = hit.lineId != currentLineSafe
+                if isJump, !flLineGateAllowsChange(from: currentLineSafe, to: hit.lineId, seq: seq) {
+                    return
+                }
                 currentLineId = hit.lineId
                 currentLineIdSetByFL = true
                 lastFLMatchLen = 10
@@ -1490,7 +1539,10 @@ public final class StreamingRaagiModeEngine: ObservableObject {
             // Brief #9.13: Only commit and claim FL ownership when match is
             // strong enough to defend against the next server partial.
             // Weak commits cause UI flicker because reconcile reverts them
-            // ~100ms later.
+            // ~100ms later. Brief #9.27: debounce + line ping-pong gate.
+            if !flLineGateAllowsChange(from: currentLineId ?? "", to: match.lineId, seq: seq) {
+                return
+            }
             currentLineId = match.lineId
             currentLineIdSetByFL = true
             lastFLMatchLen = match.matchLength
@@ -1503,6 +1555,38 @@ public final class StreamingRaagiModeEngine: ObservableObject {
             // (low) FL strength.
             lastFLMatchLen = match.matchLength
             NSLog("[DIAG] StreamingRaagiModeEngine FL local match advisory shabadId=\(currentId) lineId=\(match.lineId) matchLen=\(match.matchLength) qStart=\(match.queryStart) tStart=\(match.targetStart) runnerUp=\(runnerStr) partialFL='\(flStr)' (would-jump from \(oldLine); below commit threshold \(Self.flWinsOverServerMatchLen))")
+        }
+    }
+
+    /// Brief #9.27: intercept FL-proposed line CHANGES (not confirms)
+    /// with the ``LineFLGate`` debounce + line ping-pong throttles.
+    /// Returns `true` when the caller should proceed with the assignment,
+    /// `false` when the gate blocked the change (a DIAG line is logged
+    /// inside the blocked branch so callers do not need to duplicate it).
+    ///
+    /// Speech mode (singingModeEnabled = false) and DISCOVERING short-
+    /// circuit to `true` so pre-#9.27 behavior stays byte-identical
+    /// outside the LOCKED sung-mode path.
+    private func flLineGateAllowsChange(from oldLine: String, to newLine: String, seq: Int) -> Bool {
+        guard singingModeEnabled, case .locked = lockState else { return true }
+        let d = flLineGate.decideLineChange(
+            currentLine: oldLine, proposedLine: newLine, seq: seq, now: Date()
+        )
+        switch d {
+        case .allow:
+            return true
+        case .suppressedByServerRejection(let s, let reason):
+            NSLog("[DIAG] StreamingRaagiModeEngine FL SUPPRESSED (server-rejected seq=\(s) reason=\(reason))")
+            return false
+        case .debounced(let ms, let line):
+            NSLog("[DIAG] StreamingRaagiModeEngine FL DEBOUNCED (msSinceLastChange=\(ms) line=\(line))")
+            return false
+        case .pingPongDenied(let a, let b, let count):
+            // Gate emits the one-time "DETECTED" log at threshold-cross;
+            // this engine-side line fires on every blocked attempt so the
+            // trace records which specific proposal got denied.
+            NSLog("[DIAG] StreamingRaagiModeEngine FL DENIED (line ping-pong pair=\(a)↔\(b) swapCount=\(count) currentLine=\(oldLine) proposed=\(newLine))")
+            return false
         }
     }
 
@@ -1662,6 +1746,11 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         currentShabadRecentPeakTime = Date()
         currentDisplaySeq = seq
         pendingCandidate = nil
+        // Brief #9.27: any lock transition clears the FL debounce +
+        // line ping-pong state from the previous shabad. Old lineIds
+        // and lastFLLineChangeAt would otherwise erroneously throttle
+        // the FIRST FL match on the new shabad.
+        flLineGate.reset()
         // Brief #9.6: defensive — challengers should already be
         // empty in DISCOVERING (we don't touch the dict there) but
         // make sure the fresh lock starts with a clean slate.
@@ -1747,6 +1836,10 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         // challenger slots are evidence accrued under the OLD
         // currentShabad context and shouldn't carry over.
         challengers.removeAll(keepingCapacity: true)
+        // Brief #9.27: same reset as `lockTo`. Old-shabad line state
+        // and lastFLLineChangeAt must not throttle the new shabad's
+        // first FL match.
+        flLineGate.reset()
         // lockState stays .locked
         NSLog("[DIAG] StreamingRaagiModeEngine FL snapshot shabadId=\(shabadId) sigsCount=\(sigs.count) (post-swap)")
         // Brief #9.10-iOS: dump every pangti's FL signature for the
