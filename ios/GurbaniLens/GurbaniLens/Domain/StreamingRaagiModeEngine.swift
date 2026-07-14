@@ -1164,13 +1164,33 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         // check fires BEFORE tier-3 filter or accumulator ingest,
         // so a legitimate clean tier-0/1 hit at 90+ can never be
         // masked by later noise.
-        if discoveryPartialCount <= Self.sungFastLockMaxPartials
-            && score >= Self.sungFastLockScoreThreshold
-            && tier <= Self.sungFastLockMaxTier {
+        //
+        // Brief #9.30 Fix 2: ambiguity guard. If the candidate shabad
+        // is in `sungStore.ambiguousSet` (the 1632-shabad set of
+        // common-phrase shabads), DEFER fast-lock in sung mode so the
+        // candidate cloud can arbitrate. Speech mode ignores the flag
+        // per FastLockDecision contract (spoken input rarely surfaces
+        // the ambiguous phrase in isolation and Deep values speed).
+        let isAmbiguous = sungStore.ambiguousSet?.contains(shabadId) ?? false
+        let shouldFastLock = FastLockDecision.shouldFastLock(
+            score: score, tier: tier, partialIndex: discoveryPartialCount,
+            isAmbiguous: isAmbiguous, mode: .sung
+        )
+        if shouldFastLock {
             NSLog("[DIAG] StreamingRaagiModeEngine sungMode FAST-LOCK shabadId=\(shabadId) partial=\(discoveryPartialCount) score=\(String(format: "%.1f", score)) tier=\(tier) via=sungFast")
             await lockTo(shabadId: shabadId, lineId: lineId, peakScore: score, via: "sungFast", seq: seq, tier: tier)
             sungStore.capWeight(shabadId: shabadId)
             return
+        }
+        // Brief #9.30 Fix 2: distinct DIAG when the gates would have
+        // fired but ambiguity blocked the fast-lock. Only useful when
+        // score/tier/partials all cleared; other rejections are silent
+        // (pre-#9.30 behavior).
+        let wouldFastLockOnGates = discoveryPartialCount <= Self.sungFastLockMaxPartials
+            && score >= Self.sungFastLockScoreThreshold
+            && tier <= Self.sungFastLockMaxTier
+        if wouldFastLockOnGates && isAmbiguous {
+            NSLog("[DIAG] StreamingRaagiModeEngine fast-lock DEFERRED (ambiguous shabadId=\(shabadId) score=\(String(format: "%.1f", score))) — routing to accumulator/cloud")
         }
 
         // Brief #9.22 Fix 3: skip tier-3 hits in sung-mode DISCOVERY.
