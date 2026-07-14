@@ -115,12 +115,20 @@ public struct LineTracker: Equatable {
     /// The tracker's answer to a single ingest. `newLineIndex == nil`
     /// means the engine should not touch the display; `reason` is a
     /// short human-readable string suitable for DIAG logs.
+    ///
+    /// Brief #9.30 Fix 1: `diagnostics` carries zero or more auxiliary
+    /// trace lines (e.g. departed-line suppression events) produced
+    /// while processing this ingest. The tracker stays pure — the
+    /// engine loops over these strings and NSLogs them prefixed with
+    /// `[DIAG] LineTracker `.
     public struct Decision: Equatable {
         public let newLineIndex: Int?
         public let reason: String
-        public init(newLineIndex: Int?, reason: String) {
+        public let diagnostics: [String]
+        public init(newLineIndex: Int?, reason: String, diagnostics: [String] = []) {
             self.newLineIndex = newLineIndex
             self.reason = reason
+            self.diagnostics = diagnostics
         }
     }
 
@@ -176,6 +184,28 @@ public struct LineTracker: Equatable {
     /// stay-confirm on the new line doesn't upstage the initial hook.
     public static let hookPromotionMargin: Int = 2
 
+    // MARK: - Departed-line suppression (Brief #9.30 Fix 1)
+
+    /// Seconds of stale-audio suppression after a commit A→B: subsequent
+    /// evidence for line A is discounted for this many seconds because
+    /// the server's rolling audio window still contains A's audio for
+    /// several seconds after the raagi has moved to B. Roughly matches
+    /// the server's sung-mode window length (5.5s upper bound, 4s
+    /// covers the paath case).
+    public static let departedSuppressionSec: TimeInterval = 4.0
+    /// Strength multiplier applied to evidence for a departed line
+    /// within `departedSuppressionSec`. 0.2 keeps stale server audio
+    /// from re-firing a backward commit while letting sustained real
+    /// evidence eventually break through.
+    public static let departedDiscount: Double = 0.2
+    /// Kirtan-mode exception when the departed line IS the current
+    /// hook: raagis genuinely return to the hook within seconds in
+    /// fast kirtan, so a lighter discount preserves that path.
+    public static let departedDiscountHookKirtan: Double = 0.6
+    /// Maximum number of departed lines tracked simultaneously. Two
+    /// covers the typical A→B→C cadence; older entries drop out.
+    public static let departedRecentMaxEntries: Int = 2
+
     // MARK: - Instance state
 
     public let mode: Mode
@@ -194,6 +224,19 @@ public struct LineTracker: Equatable {
         var updatedAt: TimeInterval
     }
     private var lineEvidence: [Int: LineEvidence] = [:]
+
+    /// Brief #9.30 Fix 1: recently-departed lines with the wall-clock
+    /// time they were left. Evidence for a line in this list within
+    /// `departedSuppressionSec` is multiplied by `departedDiscount`
+    /// (or `departedDiscountHookKirtan` when kirtan mode + hook line)
+    /// before entering the accumulator. Capped at
+    /// `departedRecentMaxEntries`; entries are effectively expired by
+    /// the age check on lookup so no eager pruning is needed.
+    private struct DepartedLine: Equatable {
+        var lineIndex: Int
+        var departedAt: TimeInterval
+    }
+    private var recentlyDeparted: [DepartedLine] = []
 
     // MARK: - Init
 
@@ -220,25 +263,28 @@ public struct LineTracker: Equatable {
     public mutating func ingest(_ evidence: Evidence, at time: TimeInterval) -> Decision {
         decayEvidence(to: time)
 
+        var diagnostics: [String] = []
+
         switch evidence {
         case .serverMatch(let idx, let score):
             let clamped = max(0.0, min(100.0, score))
-            addEvidence(lineIndex: idx, strength: clamped / 100.0, at: time)
+            addEvidence(lineIndex: idx, strength: clamped / 100.0, at: time, diagnostics: &diagnostics)
 
         case .flSafeUnique(let idx):
-            addEvidence(lineIndex: idx, strength: Self.flSafeUniqueStrength, at: time)
+            addEvidence(lineIndex: idx, strength: Self.flSafeUniqueStrength, at: time, diagnostics: &diagnostics)
 
         case .flAmbiguous(let candidates):
             let favored = candidates.filter { inRange($0) && isPriorFavored(lineIndex: $0) }
             if favored.isEmpty {
                 return Decision(
                     newLineIndex: nil,
-                    reason: "flAmbiguous-noFavoredCandidates(candidates=\(candidates))"
+                    reason: "flAmbiguous-noFavoredCandidates(candidates=\(candidates))",
+                    diagnostics: diagnostics
                 )
             }
             let per = Self.flAmbiguousStrength / Double(favored.count)
             for idx in favored {
-                addEvidence(lineIndex: idx, strength: per, at: time)
+                addEvidence(lineIndex: idx, strength: per, at: time, diagnostics: &diagnostics)
             }
         }
 
@@ -256,7 +302,8 @@ public struct LineTracker: Equatable {
         guard let winner = bestIdx, bestScore >= Self.changeThreshold else {
             return Decision(
                 newLineIndex: nil,
-                reason: "belowThreshold(bestScore=\(fmt(bestScore)))"
+                reason: "belowThreshold(bestScore=\(fmt(bestScore)))",
+                diagnostics: diagnostics
             )
         }
 
@@ -265,7 +312,8 @@ public struct LineTracker: Equatable {
             maybePromoteHook()
             return Decision(
                 newLineIndex: nil,
-                reason: "stay-confirmed(line=\(winner) strength=\(fmt(bestScore)))"
+                reason: "stay-confirmed(line=\(winner) strength=\(fmt(bestScore)))",
+                diagnostics: diagnostics
             )
         }
 
@@ -273,7 +321,8 @@ public struct LineTracker: Equatable {
             let msSince = Int((time - last) * 1000)
             return Decision(
                 newLineIndex: nil,
-                reason: "debounced(msSinceLastChange=\(msSince) proposed=\(winner))"
+                reason: "debounced(msSinceLastChange=\(msSince) proposed=\(winner))",
+                diagnostics: diagnostics
             )
         }
 
@@ -284,10 +333,15 @@ public struct LineTracker: Equatable {
         // The winning accumulator has fired — drop it so residual weight
         // doesn't immediately re-fire on the next ingest.
         lineEvidence[winner] = nil
+        // Brief #9.30 Fix 1: mark the line we just left as recently
+        // departed so any stale-audio evidence for it over the next
+        // few seconds gets discounted before it can bounce us back.
+        recordDeparture(previous: previous, at: time)
         maybePromoteHook()
         return Decision(
             newLineIndex: winner,
-            reason: "commit(from=\(previous) to=\(winner) strength=\(fmt(bestScore)))"
+            reason: "commit(from=\(previous) to=\(winner) strength=\(fmt(bestScore)))",
+            diagnostics: diagnostics
         )
     }
 
@@ -306,14 +360,54 @@ public struct LineTracker: Equatable {
         idx >= 0 && idx < lineCount
     }
 
-    private mutating func addEvidence(lineIndex: Int, strength: Double, at time: TimeInterval) {
+    private mutating func addEvidence(
+        lineIndex: Int,
+        strength: Double,
+        at time: TimeInterval,
+        diagnostics: inout [String]
+    ) {
         guard inRange(lineIndex), strength > 0 else { return }
+        // Brief #9.30 Fix 1: apply departed-line suppression BEFORE the
+        // accumulator addition so a stream of stale server matches for
+        // the just-left line can never accrete past the change threshold.
+        var effectiveStrength = strength
+        if let dep = recentlyDeparted.last(where: { $0.lineIndex == lineIndex }) {
+            let age = time - dep.departedAt
+            if age >= 0, age < Self.departedSuppressionSec {
+                let discount: Double
+                if mode == .kirtan && lineIndex == hookLineIndex {
+                    discount = Self.departedDiscountHookKirtan
+                } else {
+                    discount = Self.departedDiscount
+                }
+                effectiveStrength *= discount
+                diagnostics.append(
+                    "departed-suppression line=\(lineIndex) ageSec=\(fmt(age)) discount=\(fmt(discount))"
+                )
+            }
+        }
         if var existing = lineEvidence[lineIndex] {
-            existing.weight += strength
+            existing.weight += effectiveStrength
             existing.updatedAt = time
             lineEvidence[lineIndex] = existing
         } else {
-            lineEvidence[lineIndex] = LineEvidence(weight: strength, updatedAt: time)
+            lineEvidence[lineIndex] = LineEvidence(weight: effectiveStrength, updatedAt: time)
+        }
+    }
+
+    /// Brief #9.30 Fix 1: record the previously-current line as
+    /// recently departed. If the line is already in the list its
+    /// timestamp is refreshed (kirtan A→B→A→B keeps the freshest
+    /// departure); otherwise it's appended, evicting the oldest entry
+    /// when the list is at capacity.
+    private mutating func recordDeparture(previous: Int, at time: TimeInterval) {
+        if let existingIdx = recentlyDeparted.firstIndex(where: { $0.lineIndex == previous }) {
+            recentlyDeparted[existingIdx].departedAt = time
+            return
+        }
+        recentlyDeparted.append(DepartedLine(lineIndex: previous, departedAt: time))
+        if recentlyDeparted.count > Self.departedRecentMaxEntries {
+            recentlyDeparted.removeFirst(recentlyDeparted.count - Self.departedRecentMaxEntries)
         }
     }
 

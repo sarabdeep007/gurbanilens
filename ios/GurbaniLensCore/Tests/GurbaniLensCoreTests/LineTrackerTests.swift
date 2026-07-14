@@ -289,6 +289,121 @@ final class LineTrackerTests: XCTestCase {
 
     // MARK: - Anand Sahib dense scenario
 
+    // MARK: - Departed-line suppression (Brief #9.30 Fix 1)
+
+    /// Deep's paath-mode iPhone log #9.29 showed a 1→2 commit followed
+    /// ~1s later by a stale 2→1 backward commit sourced from the
+    /// server's rolling audio window still holding line-1 audio.
+    /// #9.30 introduces recently-departed suppression: within
+    /// `departedSuppressionSec` (4s) of leaving line A, subsequent
+    /// evidence for A is multiplied by `departedDiscount` (0.2 in
+    /// paath) before entering the accumulator. Two moderate server
+    /// matches for the just-left line must NO LONGER cross threshold.
+    func test_departedLineSuppressed_noBackwardBounce() {
+        var tracker = LineTracker(
+            mode: .paath, lineCount: 10, initialLineIndex: 1, now: 0
+        )
+        // Commit 1 → 2 with a strong next-line match. Next prior=1.0,
+        // 0.88 × 1.0 = 0.88 ≥ 0.55 → fires immediately.
+        let forward = tracker.ingest(
+            .serverMatch(lineIndex: 2, score: 88), at: 1.0
+        )
+        XCTAssertEqual(forward.newLineIndex, 2, "Forward 1→2 must fire on the strong next-line match")
+        XCTAssertEqual(tracker.currentLineIndex, 2)
+
+        // Two rapid server matches for the just-departed line 1 at
+        // score 85 within the suppression window. Without suppression:
+        // 0.85 × 0.5 (prev) fires on hit 2 (weight accretes to ~1.6,
+        // × 0.5 = ~0.8, above threshold). WITH suppression: strength
+        // is discounted by 0.2 to ~0.17 per hit; accumulator stays far
+        // below threshold and NO backward commit fires.
+        _ = tracker.ingest(.serverMatch(lineIndex: 1, score: 85), at: 1.5)
+        let second = tracker.ingest(.serverMatch(lineIndex: 1, score: 85), at: 2.0)
+        XCTAssertNil(
+            second.newLineIndex,
+            "Second stale line-1 match within suppression window must not backward-commit; reason=\(second.reason)"
+        )
+        XCTAssertEqual(
+            tracker.currentLineIndex, 2,
+            "Highlight must stay on line 2 through the stale audio bounce"
+        )
+        XCTAssertTrue(
+            second.diagnostics.contains(where: { $0.contains("departed-suppression line=1") }),
+            "Departed-suppression diagnostic must fire on stale line-1 evidence; got: \(second.diagnostics)"
+        )
+    }
+
+    /// After 4s the departed line entry is treated as expired and the
+    /// discount no longer applies. A genuine return to line 1 (raagi
+    /// really did go back after a pause) can then fire normally.
+    func test_departedLineExpiresAfter4s() {
+        var tracker = LineTracker(
+            mode: .paath, lineCount: 10, initialLineIndex: 1, now: 0
+        )
+        _ = tracker.ingest(.serverMatch(lineIndex: 2, score: 88), at: 1.0)
+        XCTAssertEqual(tracker.currentLineIndex, 2)
+
+        // First line-1 hit at t=5.5 → age 4.5s > 4.0s so suppression
+        // has already expired. Prior=0.5 (prev). 0.90 × 0.5 = 0.45 —
+        // one hit falls just short. A second hit 100ms later clears
+        // threshold and the backward commit fires (raagi genuinely
+        // returned after a pause).
+        let first = tracker.ingest(.serverMatch(lineIndex: 1, score: 90), at: 5.5)
+        XCTAssertNil(
+            first.newLineIndex,
+            "One line-1 hit at score 90 gives 0.45 (below threshold) even without suppression"
+        )
+        XCTAssertFalse(
+            first.diagnostics.contains(where: { $0.contains("departed-suppression") }),
+            "After 4s the suppression must NOT fire; got: \(first.diagnostics)"
+        )
+        let second = tracker.ingest(.serverMatch(lineIndex: 1, score: 90), at: 5.6)
+        XCTAssertEqual(
+            second.newLineIndex, 1,
+            "Two rapid line-1 hits AFTER suppression expiry must fire the backward commit"
+        )
+        XCTAssertEqual(tracker.currentLineIndex, 1)
+    }
+
+    /// Kirtan-mode exception: when the departed line IS the hook, the
+    /// suppression is lighter (0.6 vs 0.2) so real hook returns within
+    /// the window can still fire on 3+ moderate hits.
+    func test_hookReturnWithin4s_lighterDiscount_kirtanMode() {
+        var tracker = LineTracker(
+            mode: .kirtan, lineCount: 10, initialLineIndex: 4, now: 0
+        )
+        XCTAssertEqual(tracker.hookLineIndex, 4)
+        // Commit 4 → 5 (next-line, prior 1.0, 0.88 fires immediately).
+        _ = tracker.ingest(.serverMatch(lineIndex: 5, score: 88), at: 1.0)
+        XCTAssertEqual(tracker.currentLineIndex, 5)
+        XCTAssertEqual(tracker.hookLineIndex, 4, "Hook stays at line 4 after routine 4→5 advance")
+
+        // Feed 3 moderate hook-line hits within the suppression window
+        // (0.9s, 1.0s, 1.1s past the commit). Line 4 is prev-of-5 AND
+        // hook; kirtan max prior = 1.0. Per-hit raw = 0.45 → after the
+        // kirtan-hook exception discount (0.6) each hit contributes
+        // 0.27, and the accumulator crosses 0.55 on the third hit.
+        // Under the paath-style 0.2 discount the same 3 hits would
+        // accrete only ~0.26 — far below threshold — so the exception
+        // is what enables the return here.
+        let first = tracker.ingest(.serverMatch(lineIndex: 4, score: 45), at: 1.9)
+        XCTAssertNil(first.newLineIndex, "One discounted hit alone must stay under threshold")
+        let second = tracker.ingest(.serverMatch(lineIndex: 4, score: 45), at: 2.0)
+        XCTAssertNil(second.newLineIndex, "Two discounted hits still below 0.55")
+        let third = tracker.ingest(.serverMatch(lineIndex: 4, score: 45), at: 2.1)
+        XCTAssertEqual(
+            third.newLineIndex, 4,
+            "Three rapid moderate hook hits within 4s of departure must commit under the kirtan-hook exception (0.6); reason=\(third.reason)"
+        )
+        XCTAssertEqual(tracker.currentLineIndex, 4)
+        XCTAssertTrue(
+            third.diagnostics.contains(where: { $0.contains("departed-suppression line=4") && $0.contains("discount=0.600") }),
+            "Diagnostic must record the lighter 0.6 discount on the hook line; got: \(third.diagnostics)"
+        )
+    }
+
+    // MARK: - Anand Sahib dense scenario
+
     func test_anandSahibDenseScenario() {
         // Paath mode, 10-line shabad. Lines 2, 5, 8 share dense first
         // letters. Server correctly advances 0→1→2→3 while FL keeps

@@ -602,10 +602,23 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         seq: Int
     ) {
         guard var tracker = lineTracker else { return }
+        let hookBefore = tracker.hookLineIndex
         let now = Date().timeIntervalSince1970
         let decision = tracker.ingest(evidence, at: now)
         lineTracker = tracker
+        // Brief #9.30 Fix 1: surface any tracker-side diagnostics
+        // (currently only departed-line suppression events) before the
+        // ingest summary so trace ordering reads top-to-bottom.
+        for diag in decision.diagnostics {
+            NSLog("[DIAG] LineTracker \(diag)")
+        }
         NSLog("[DIAG] StreamingRaagiModeEngine LineTracker ingest source=\(source) seq=\(seq) mode=\(tracker.mode.rawValue) currentIdx=\(tracker.currentLineIndex) hookIdx=\(tracker.hookLineIndex) decision=\(decision.reason)")
+        // Brief #9.30 Fix 3: hook promotion DIAG. Pre-#9.30 the shift
+        // was only visible by diffing hookIdx across two successive
+        // ingest lines; this surfaces the transition explicitly.
+        if tracker.hookLineIndex != hookBefore {
+            NSLog("[DIAG] LineTracker hook UPDATED from=\(hookBefore) to=\(tracker.hookLineIndex) at seq=\(seq)")
+        }
         guard let newIdx = decision.newLineIndex else { return }
         guard let shabad = currentShabad,
               newIdx >= 0, newIdx < shabad.lines.count else {
