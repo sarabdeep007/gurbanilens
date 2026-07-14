@@ -223,7 +223,28 @@ public final class StreamingRaagiModeEngine: ObservableObject {
     /// speech mode and DISCOVERING skip it so pre-#9.27 behavior is
     /// byte-identical there. Reset on `start`, `stop`, and
     /// `didToggleSungMode`.
+    ///
+    /// Brief #9.29: as of the LineTracker rewiring, only the
+    /// server-confidence gate at the top of `handlePartialForFLMatch`
+    /// is actively consulted. The debounce + line ping-pong path is
+    /// left dormant — ``LineTracker`` owns the arbitration for FL
+    /// and server evidence with its own 800 ms debounce and
+    /// prior-driven ping-pong suppression. The class is retained per
+    /// brief's belt-and-braces guidance.
     private var flLineGate: LineFLGate = LineFLGate()
+
+    // MARK: - Line tracker (Brief #9.29)
+
+    /// Brief #9.29: structure-prior pangti tracker. Owns the display's
+    /// `currentLineId` while `lockState == .locked`. Reinstantiated on
+    /// every lock/swap/toggle so mode + initial-line + hook restart
+    /// clean. Nil in DISCOVERING and after stop().
+    private var lineTracker: LineTracker?
+    /// Snapshot of the currently-locked shabad's `[lineId → lineIndex]`
+    /// map. Rebuilt on every lock/swap; empty in DISCOVERING and after
+    /// stop(). Used to translate the server's / FL matcher's lineId
+    /// strings into the integer indices the tracker consumes.
+    private var lineIndexByLineId: [String: Int] = [:]
 
     // MARK: - Tunables (Brief #9.4)
 
@@ -542,12 +563,102 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         lastServerEventBySeq.removeAll(keepingCapacity: true)
         lastServerEventSeqOrder.removeAll(keepingCapacity: true)
         consecutiveRejectionWarnEmitted = false
+        // Brief #9.29: LineTracker mode is set at construction and
+        // immutable for the tracker's lifetime. On toggle, rebuild
+        // with the new mode + current display line as the initial
+        // anchor. DISCOVERING has no tracker to rebuild.
+        if case .locked = lockState,
+           let shabad = currentShabad,
+           let anchor = currentLineId {
+            lineTracker = makeLineTracker(shabad: shabad, initialLineId: anchor)
+        } else {
+            lineTracker = nil
+        }
         // Brief #9.26: any mode-toggle wipes the transient cloud +
         // partial counter — a switch from speech ↔ sung shouldn't
         // leave a stale cloud on screen or a partial count from the
         // previous mode.
         discoveryPartialCount = 0
         dismissCandidateCloud(reason: "sungModeToggle")
+    }
+
+    // MARK: - Line tracker plumbing (Brief #9.29)
+
+    /// Feed a single evidence event into the LineTracker and apply
+    /// its decision to the display. On a `commit` decision the
+    /// tracker's chosen line becomes `currentLineId` and
+    /// `currentDisplaySeq` advances to `seq`. On `stay` / debounce /
+    /// below-threshold, only the DIAG line is emitted; the caller
+    /// remains responsible for advancing `currentDisplaySeq` when
+    /// the ingest is server-driven (server events acknowledge seq
+    /// regardless of whether a highlight change fired).
+    ///
+    /// A missing tracker (DISCOVERING, stop() called) short-circuits
+    /// silently — the FL fast-path invokes this on every partial and
+    /// the check must be cheap.
+    private func feedLineTracker(
+        _ evidence: LineTracker.Evidence,
+        source: String,
+        seq: Int
+    ) {
+        guard var tracker = lineTracker else { return }
+        let now = Date().timeIntervalSince1970
+        let decision = tracker.ingest(evidence, at: now)
+        lineTracker = tracker
+        NSLog("[DIAG] StreamingRaagiModeEngine LineTracker ingest source=\(source) seq=\(seq) mode=\(tracker.mode.rawValue) currentIdx=\(tracker.currentLineIndex) hookIdx=\(tracker.hookLineIndex) decision=\(decision.reason)")
+        guard let newIdx = decision.newLineIndex else { return }
+        guard let shabad = currentShabad,
+              newIdx >= 0, newIdx < shabad.lines.count else {
+            NSLog("[DIAG] StreamingRaagiModeEngine LineTracker commit newIdx=\(newIdx) out of range — skipping display update")
+            return
+        }
+        let newLineId = shabad.lines[newIdx].id
+        let oldLine = currentLineId ?? "nil"
+        currentLineId = newLineId
+        currentDisplaySeq = seq
+        NSLog("[DIAG] StreamingRaagiModeEngine display update: LineTracker source=\(source) from=\(oldLine) to=\(newLineId) seq=\(seq)")
+        NSLog("[DIAG] StreamingRaagiModeEngine.currentShabad sticky shabadId=\(shabad.id) lineId=\(newLineId) currentDisplaySeq=\(seq)")
+    }
+
+    /// Lookup helper: convert a server / FL lineId string to the
+    /// integer index the tracker consumes. Nil when the lineId isn't
+    /// in the currently-locked shabad's display body.
+    private func lineIndex(forId id: String) -> Int? {
+        lineIndexByLineId[id]
+    }
+
+    /// Build the `[lineId → index]` map for `shabad.lines`. Called on
+    /// every lock/swap so the tracker's Int-domain state maps cleanly
+    /// back to the engine's String-domain currentLineId.
+    private static func buildLineIndex(shabad: FullShabad) -> [String: Int] {
+        var out: [String: Int] = [:]
+        out.reserveCapacity(shabad.lines.count)
+        for (idx, line) in shabad.lines.enumerated() {
+            out[line.id] = idx
+        }
+        return out
+    }
+
+    /// Instantiate a fresh LineTracker for the given locked shabad.
+    /// Called from `lockTo` and `performSwap` after the shabad + its
+    /// FL sig maps have been snapshotted. Mode reads FRESH from
+    /// UserDefaults so a mid-DISCOVERY toggle takes effect on the
+    /// first lock. Initial line index derives from the effective
+    /// (post Manglacharan-fallback) lineId picked by the caller.
+    private func makeLineTracker(shabad: FullShabad, initialLineId: String) -> LineTracker? {
+        guard let idx = lineIndexByLineId[initialLineId] else {
+            NSLog("[DIAG] StreamingRaagiModeEngine LineTracker init failed shabadId=\(shabad.id) initialLineId=\(initialLineId) — id not in shabad body")
+            return nil
+        }
+        let mode: LineTracker.Mode = singingModeEnabled ? .kirtan : .paath
+        let tracker = LineTracker(
+            mode: mode,
+            lineCount: shabad.lines.count,
+            initialLineIndex: idx,
+            now: Date().timeIntervalSince1970
+        )
+        NSLog("[DIAG] StreamingRaagiModeEngine LineTracker INIT shabadId=\(shabad.id) mode=\(mode.rawValue) lineCount=\(shabad.lines.count) initialIdx=\(idx) initialLineId=\(initialLineId)")
+        return tracker
     }
 
     // MARK: - Effective-lineId resolver (Brief #9.24 Part 7)
@@ -626,6 +737,11 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         lockState = .discovering
         pendingCandidate = nil
         challengers.removeAll(keepingCapacity: true)
+        // Brief #9.29: clear any stale tracker + index map from a
+        // prior session so DISCOVERING starts with no ghost line
+        // tracker in memory. The next lock builds a fresh one.
+        lineTracker = nil
+        lineIndexByLineId.removeAll(keepingCapacity: true)
         // Brief #9.26: reset cloud state + partial counter each session.
         discoveryPartialCount = 0
         candidateCloud = nil
@@ -694,6 +810,10 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         lockState = .discovering
         pendingCandidate = nil
         challengers.removeAll(keepingCapacity: true)
+        // Brief #9.29: teardown drops the LineTracker so a subsequent
+        // start() session begins clean.
+        lineTracker = nil
+        lineIndexByLineId.removeAll(keepingCapacity: true)
         sungStore.reset()
         serverAlaapCount = 0
         alaapState = false
@@ -1291,34 +1411,30 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         let oldLine = currentLineId ?? "nil"
         let currentId = currentShabad?.id ?? "nil"
 
-        // Brief #9.12: Within-shabad, when FL has a strong recent local
-        // match (matchLen >= threshold) and server disagrees on lineId,
-        // FL wins. Server's per-partial lineId is laggy because it
-        // matches against cumulative ASR text; FL detects line jumps
-        // faster from its local cache of the locked shabad's FL sigs.
-        if currentLineIdSetByFL
-           && oldLine != lineId
-           && lastFLMatchLen >= Self.flWinsOverServerMatchLen {
-            NSLog("[DIAG] StreamingRaagiModeEngine FL holds over server flLineId=\(oldLine) matchLen=\(lastFLMatchLen) serverLineId=\(lineId) (FL wins, threshold=\(Self.flWinsOverServerMatchLen))")
-            // Keep currentLineId = oldLine. Keep currentLineIdSetByFL = true.
-            // Still update display seq so we don't go backwards.
-            currentDisplaySeq = seq
-            NSLog("[DIAG] StreamingRaagiModeEngine display update: FL-held same-shabad lineId=\(oldLine) seq=\(seq) tier=\(tier) score=\(String(format: "%.1f", score))")
-            NSLog("[DIAG] StreamingRaagiModeEngine.currentShabad sticky shabadId=\(currentId) lineId=\(oldLine) currentDisplaySeq=\(seq)")
-            return
-        }
-
-        // Brief #9.7 / #9.12: below-threshold or no-FL case — server
-        // wins, log the reconcile event when FL had set the line.
-        if currentLineIdSetByFL && oldLine != lineId {
-            NSLog("[DIAG] StreamingRaagiModeEngine FL reconcile shabadId=\(currentId) flLineId=\(oldLine) serverLineId=\(lineId) matchLen=\(lastFLMatchLen) (server wins, below threshold \(Self.flWinsOverServerMatchLen))")
-        }
-        currentLineId = lineId
-        currentLineIdSetByFL = false  // server-driven now
+        // Brief #9.29: the pre-#9.29 FL-holds-over-server and reconcile
+        // branches (Briefs #9.12/#9.13) are retired here — LineTracker
+        // now arbitrates between FL and server evidence with a single
+        // scoring model. Server matches route through the tracker as
+        // `.serverMatch(lineIndex:, score:)` and only the tracker's
+        // decision touches `currentLineId`. `currentDisplaySeq`
+        // continues to advance per server-event acknowledgement,
+        // whether or not the tracker fires a change.
+        currentLineIdSetByFL = false
         lastFLMatchLen = 0
         currentDisplaySeq = seq
-        NSLog("[DIAG] StreamingRaagiModeEngine display update: same-shabad highlight from=\(oldLine) to=\(lineId) seq=\(seq) tier=\(tier) score=\(String(format: "%.1f", score))")
-        NSLog("[DIAG] StreamingRaagiModeEngine.currentShabad sticky shabadId=\(currentId) lineId=\(lineId) currentDisplaySeq=\(seq)")
+        if let idx = lineIndex(forId: lineId) {
+            feedLineTracker(
+                .serverMatch(lineIndex: idx, score: score),
+                source: "server-same-shabad-tier\(tier)",
+                seq: seq
+            )
+        } else {
+            NSLog("[DIAG] StreamingRaagiModeEngine same-shabad server lineId=\(lineId) not found in lineIndexByLineId — falling back to direct display update")
+            currentLineId = lineId
+        }
+        let displayedLine = currentLineId ?? "nil"
+        NSLog("[DIAG] StreamingRaagiModeEngine display update: same-shabad server-event from=\(oldLine) displayed=\(displayedLine) serverLineId=\(lineId) seq=\(seq) tier=\(tier) score=\(String(format: "%.1f", score))")
+        NSLog("[DIAG] StreamingRaagiModeEngine.currentShabad sticky shabadId=\(currentId) lineId=\(displayedLine) currentDisplaySeq=\(seq)")
     }
 
     // ── LOCKED + different shabad ─────────────────────────────────
@@ -1517,30 +1633,26 @@ public final class StreamingRaagiModeEngine: ObservableObject {
                 safeStarters: currentShabadSafeStarters,
                 trailingWindow: Self.safeStarterTrailingWindow
             ) {
-                // Brief #9.18 fix: safe-unique is authoritative by construction
-                // (the letter cannot appear in any other pangti's FL universe).
-                // Always RETURN whether it's a jump to a new line or a confirm
-                // of the current line — do NOT fall through to the substring
-                // matcher. Falling through allowed substring to commit a wrong
-                // JUMP to a different pangti while safe-unique said we're still
-                // on the current line (Deep saw XLVS → 90CQ → XLVS flip-flop
-                // in tati wao shabad, seq=51-53). Setting lastFLMatchLen=10 in
-                // both cases preserves FL-holds-over-server behavior (#9.12
-                // threshold=4, 10 leaves headroom).
+                // Brief #9.29: safe-unique starter is fed into LineTracker
+                // as `.flSafeUnique(...)` — the tracker's prior model
+                // decides whether to move (stay/next/hook prior wins fast
+                // at 0.6 × 1.0 = 0.6; random-line prior falls to 0.09 and
+                // never fires alone). No direct `currentLineId` assignment
+                // here; the tracker is the single choke point.
                 let oldLine = currentLineId ?? "nil"
                 let currentLineSafe = currentLineId ?? ""
                 let isJump = hit.lineId != currentLineSafe
-                // Brief #9.27: debounce + line ping-pong gate for jumps only.
-                if isJump, !flLineGateAllowsChange(from: currentLineSafe, to: hit.lineId, seq: seq) {
-                    return
-                }
-                currentLineId = hit.lineId
-                currentLineIdSetByFL = true
-                lastFLMatchLen = 10
                 if isJump {
-                    NSLog("[DIAG] StreamingRaagiModeEngine FL unique-starter match shabadId=\(currentShabad?.id ?? "nil") lineId=\(hit.lineId) letter=\(hit.letter) partialFL='\(queryFL.joined(separator: " "))' (jumped from \(oldLine); safe-unique fast path)")
+                    NSLog("[DIAG] StreamingRaagiModeEngine FL unique-starter hit shabadId=\(currentShabad?.id ?? "nil") lineId=\(hit.lineId) letter=\(hit.letter) partialFL='\(queryFL.joined(separator: " "))' (would-jump from \(oldLine); safe-unique fast path)")
                 } else {
                     NSLog("[DIAG] StreamingRaagiModeEngine FL unique-starter confirm shabadId=\(currentShabad?.id ?? "nil") lineId=\(hit.lineId) letter=\(hit.letter) partialFL='\(queryFL.joined(separator: " "))' (safe-unique fast path, no jump)")
+                }
+                if let idx = lineIndex(forId: hit.lineId) {
+                    feedLineTracker(
+                        .flSafeUnique(lineIndex: idx),
+                        source: "FL-safe-starter",
+                        seq: seq
+                    )
                 }
                 return
             }
@@ -1558,19 +1670,22 @@ public final class StreamingRaagiModeEngine: ObservableObject {
                 safeBigrams: currentShabadSafeBigrams,
                 trailingWindow: Self.safeBigramTrailingWindow
             ) {
+                // Brief #9.29: safe-unique bigram → LineTracker as
+                // `.flSafeUnique`. Same rationale as Tier A above.
                 let oldLine = currentLineId ?? "nil"
                 let currentLineSafe = currentLineId ?? ""
                 let isJump = hit.lineId != currentLineSafe
-                if isJump, !flLineGateAllowsChange(from: currentLineSafe, to: hit.lineId, seq: seq) {
-                    return
-                }
-                currentLineId = hit.lineId
-                currentLineIdSetByFL = true
-                lastFLMatchLen = 10
                 if isJump {
-                    NSLog("[DIAG] StreamingRaagiModeEngine FL unique-bigram match shabadId=\(currentShabad?.id ?? "nil") lineId=\(hit.lineId) bigram=<\(hit.bigram.0),\(hit.bigram.1)> partialFL='\(queryFL.joined(separator: " "))' (jumped from \(oldLine); safe-unique-bigram fast path)")
+                    NSLog("[DIAG] StreamingRaagiModeEngine FL unique-bigram hit shabadId=\(currentShabad?.id ?? "nil") lineId=\(hit.lineId) bigram=<\(hit.bigram.0),\(hit.bigram.1)> partialFL='\(queryFL.joined(separator: " "))' (would-jump from \(oldLine); safe-unique-bigram fast path)")
                 } else {
                     NSLog("[DIAG] StreamingRaagiModeEngine FL unique-bigram confirm shabadId=\(currentShabad?.id ?? "nil") lineId=\(hit.lineId) bigram=<\(hit.bigram.0),\(hit.bigram.1)> partialFL='\(queryFL.joined(separator: " "))' (safe-unique-bigram fast path, no jump)")
+                }
+                if let idx = lineIndex(forId: hit.lineId) {
+                    feedLineTracker(
+                        .flSafeUnique(lineIndex: idx),
+                        source: "FL-safe-bigram",
+                        seq: seq
+                    )
                 }
                 return
             }
@@ -1592,19 +1707,22 @@ public final class StreamingRaagiModeEngine: ObservableObject {
                 firstTwoWordSigs: currentShabadSafeFirstTwoWordSigs,
                 trailingWindow: Self.safeBigramTrailingWindow
             ) {
+                // Brief #9.29: first-2-word safe-unique → LineTracker as
+                // `.flSafeUnique`.
                 let oldLine = currentLineId ?? "nil"
                 let currentLineSafe = currentLineId ?? ""
                 let isJump = hit.lineId != currentLineSafe
-                if isJump, !flLineGateAllowsChange(from: currentLineSafe, to: hit.lineId, seq: seq) {
-                    return
-                }
-                currentLineId = hit.lineId
-                currentLineIdSetByFL = true
-                lastFLMatchLen = 10
                 if isJump {
-                    NSLog("[DIAG] StreamingRaagiModeEngine FL first-2-word match shabadId=\(currentShabad?.id ?? "nil") lineId=\(hit.lineId) bigram=<\(hit.bigram.0),\(hit.bigram.1)> partialFL='\(queryFL.joined(separator: " "))' (jumped from \(oldLine); first-2-word fast path)")
+                    NSLog("[DIAG] StreamingRaagiModeEngine FL first-2-word hit shabadId=\(currentShabad?.id ?? "nil") lineId=\(hit.lineId) bigram=<\(hit.bigram.0),\(hit.bigram.1)> partialFL='\(queryFL.joined(separator: " "))' (would-jump from \(oldLine); first-2-word fast path)")
                 } else {
                     NSLog("[DIAG] StreamingRaagiModeEngine FL first-2-word confirm shabadId=\(currentShabad?.id ?? "nil") lineId=\(hit.lineId) bigram=<\(hit.bigram.0),\(hit.bigram.1)> partialFL='\(queryFL.joined(separator: " "))' (first-2-word fast path, no jump)")
+                }
+                if let idx = lineIndex(forId: hit.lineId) {
+                    feedLineTracker(
+                        .flSafeUnique(lineIndex: idx),
+                        source: "FL-first-2-word",
+                        seq: seq
+                    )
                 }
                 return
             }
@@ -1642,44 +1760,42 @@ public final class StreamingRaagiModeEngine: ObservableObject {
 
         let oldLine = currentLineId ?? "nil"
         let runnerStr = runnerUp.map { "\($0.lineId):\($0.matchLength)" } ?? "none"
+
+        // Brief #9.29: Tier C is the non-guaranteed FL path — LCS may
+        // pick a line whose match happens to score well without being
+        // structurally supported by the raagi's movement. All Tier C
+        // outcomes feed LineTracker as `.flAmbiguous(candidates:)`
+        // with the best and (if present) runner-up line indices.
+        // `.flAmbiguous` distributes its 0.25 strength only across
+        // candidates that are prior-favored (stay/next/hook); non-
+        // favored candidates receive zero. Same-line confirms skip
+        // the tracker feed entirely — they'd just re-strengthen the
+        // stay accumulator, which has no arbitration value.
         if match.lineId == oldLine {
-            // FL-confirmed quiescent — keep latest match strength so
-            // the FL-wins gate (Brief #9.12) reflects current confidence
-            // rather than the first jump's strength.
             lastFLMatchLen = match.matchLength
-            if match.matchLength >= Self.flWinsOverServerMatchLen {
-                // Brief #9.13: When FL strongly confirms the current line,
-                // claim FL ownership so the next server disagreement on
-                // same shabad triggers the FL-holds defense in
-                // handleSameShabadMatchInLock. Without this, FL ownership
-                // is only set via the "jumped" path and is reset by every
-                // server confirm — leaving FL strength purely informational.
-                currentLineIdSetByFL = true
-            }
-            NSLog("[DIAG] StreamingRaagiModeEngine FL confirm lineId=\(match.lineId) matchLen=\(match.matchLength) qStart=\(match.queryStart) tStart=\(match.targetStart) runnerUp=\(runnerStr) partialFL='\(flStr)' ownership=\(currentLineIdSetByFL ? "FL" : "server")")
+            NSLog("[DIAG] StreamingRaagiModeEngine FL confirm lineId=\(match.lineId) matchLen=\(match.matchLength) qStart=\(match.queryStart) tStart=\(match.targetStart) runnerUp=\(runnerStr) partialFL='\(flStr)' (LineTracker not fed — same-line confirm)")
             return
         }
-        if match.matchLength >= Self.flWinsOverServerMatchLen {
-            // Brief #9.13: Only commit and claim FL ownership when match is
-            // strong enough to defend against the next server partial.
-            // Weak commits cause UI flicker because reconcile reverts them
-            // ~100ms later. Brief #9.27: debounce + line ping-pong gate.
-            if !flLineGateAllowsChange(from: currentLineId ?? "", to: match.lineId, seq: seq) {
-                return
-            }
-            currentLineId = match.lineId
-            currentLineIdSetByFL = true
-            lastFLMatchLen = match.matchLength
-            NSLog("[DIAG] StreamingRaagiModeEngine FL local match committed shabadId=\(currentId) lineId=\(match.lineId) matchLen=\(match.matchLength) qStart=\(match.queryStart) tStart=\(match.targetStart) runnerUp=\(runnerStr) partialFL='\(flStr)' (jumped from \(oldLine))")
-        } else {
-            // Brief #9.13: Weak FL jump; advisory only. Don't change
-            // currentLineId/currentLineIdSetByFL — leaves UI on whatever
-            // line server most recently confirmed. Still update
-            // lastFLMatchLen so a strong server hold gate sees the new
-            // (low) FL strength.
-            lastFLMatchLen = match.matchLength
-            NSLog("[DIAG] StreamingRaagiModeEngine FL local match advisory shabadId=\(currentId) lineId=\(match.lineId) matchLen=\(match.matchLength) qStart=\(match.queryStart) tStart=\(match.targetStart) runnerUp=\(runnerStr) partialFL='\(flStr)' (would-jump from \(oldLine); below commit threshold \(Self.flWinsOverServerMatchLen))")
+
+        var candidateIdxs: [Int] = []
+        if let idx = lineIndex(forId: match.lineId) {
+            candidateIdxs.append(idx)
         }
+        if let ru = runnerUp, let ruIdx = lineIndex(forId: ru.lineId) {
+            candidateIdxs.append(ruIdx)
+        }
+        let severityTag = match.matchLength >= Self.flWinsOverServerMatchLen ? "strong" : "advisory"
+        if candidateIdxs.isEmpty {
+            NSLog("[DIAG] StreamingRaagiModeEngine FL local match \(severityTag) shabadId=\(currentId) lineId=\(match.lineId) matchLen=\(match.matchLength) runnerUp=\(runnerStr) partialFL='\(flStr)' (would-jump from \(oldLine); LineTracker not fed — no indexable candidates)")
+        } else {
+            NSLog("[DIAG] StreamingRaagiModeEngine FL local match \(severityTag) shabadId=\(currentId) lineId=\(match.lineId) matchLen=\(match.matchLength) qStart=\(match.queryStart) tStart=\(match.targetStart) runnerUp=\(runnerStr) partialFL='\(flStr)' (would-jump from \(oldLine); routing to LineTracker as .flAmbiguous)")
+            feedLineTracker(
+                .flAmbiguous(candidates: candidateIdxs),
+                source: "FL-lcs-\(severityTag)",
+                seq: seq
+            )
+        }
+        lastFLMatchLen = match.matchLength
     }
 
     /// Brief #9.27: intercept FL-proposed line CHANGES (not confirms)
@@ -1884,6 +2000,13 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         // empty in DISCOVERING (we don't touch the dict there) but
         // make sure the fresh lock starts with a clean slate.
         challengers.removeAll(keepingCapacity: true)
+        // Brief #9.29: build the lineId→index map for the new shabad
+        // and instantiate a fresh LineTracker anchored to the
+        // effective triggering line. Both must happen after
+        // `currentShabad` is set so `makeLineTracker` sees a
+        // consistent snapshot.
+        lineIndexByLineId = Self.buildLineIndex(shabad: fetched)
+        lineTracker = makeLineTracker(shabad: fetched, initialLineId: effectiveLineId)
         lockState = .locked
         // Brief #9.26: dismiss the cloud on ANY lock transition —
         // covers fast-lock, accumulator lock, cloud auto-lock, and
@@ -1974,6 +2097,12 @@ public final class StreamingRaagiModeEngine: ObservableObject {
         // and lastFLLineChangeAt must not throttle the new shabad's
         // first FL match.
         flLineGate.reset()
+        // Brief #9.29: rebuild the lineId→index map and the
+        // LineTracker for the new locked shabad. The old tracker was
+        // pinned to the OLD shabad's line indices and cannot survive
+        // a cross-shabad swap.
+        lineIndexByLineId = Self.buildLineIndex(shabad: fetched)
+        lineTracker = makeLineTracker(shabad: fetched, initialLineId: effectiveLineId)
         // lockState stays .locked
         NSLog("[DIAG] StreamingRaagiModeEngine FL snapshot shabadId=\(shabadId) sigsCount=\(sigs.count) (post-swap)")
         // Brief #9.10-iOS: dump every pangti's FL signature for the
