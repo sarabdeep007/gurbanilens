@@ -1,0 +1,26 @@
+{
+  "hypothesis": "H0",
+  "url": "wss://api.sarvam.ai/speech-to-text/ws?model=saaras:v3&language-code=pa-IN&mode=transcribe&sample_rate=16000&input_audio_codec=pcm_s16le&high_vad_sensitivity=true",
+  "headers": {
+    "api-subscription-key": "<KEY>"
+  },
+  "prelude_count": 0,
+  "audio_strategy": "skip",
+  "events": [
+    {
+      "t": "1782128398.894",
+      "kind": "OPEN",
+      "payload": ""
+    },
+    {
+      "t": "1782128398.894",
+      "kind": "AUDIO_SKIPPED",
+      "payload": ""
+    },
+    {
+      "t": "1782128410.193",
+      "kind": "HARD_TIMEOUT",
+      "payload": "12s"
+    }
+  ]
+}

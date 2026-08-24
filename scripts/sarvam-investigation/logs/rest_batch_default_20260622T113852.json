@@ -1,0 +1,27 @@
+{
+  "variation": "default",
+  "url": "https://api.sarvam.ai/speech-to-text",
+  "status": 200,
+  "response_headers": {
+    "Date": "Mon, 22 Jun 2026 11:38:52 GMT",
+    "Content-Type": "application/json",
+    "Content-Length": "220",
+    "Connection": "keep-alive",
+    "server": "uvicorn",
+    "x-request-id": "20260622_889a38a6-d0f3-404a-be57-177d9caf2f3e",
+    "Access-Control-Allow-Origin": "*",
+    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+    "X-Frame-Options": "DENY",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "Permissions-Policy": "geolocation=(), camera=(), microphone=(), payment=()",
+    "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
+    "Cache-Control": "no-store, no-cache, must-revalidate",
+    "Pragma": "no-cache",
+    "Expires": "0",
+    "X-XSS-Protection": "0"
+  },
+  "response_body": "{\"request_id\":\"20260622_889a38a6-d0f3-404a-be57-177d9caf2f3e\",\"transcript\":\"ਇੱਕ ਓਅੰਕਾਰ ਸਤਿ ਨਾਮੋ ਕਰਤਾ ਪੁਰਖੋ ਨਿਰਭਉ ਨਿਰਵੈਰ।\",\"language_code\":\"pa-IN\"}",
+  "wav_size_bytes": 141390,
+  "ts": "20260622T113852"
+}

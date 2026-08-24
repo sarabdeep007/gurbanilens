@@ -69,6 +69,8 @@ docs/aeneas_spike_alignment.json
 .env
 .env.local
 *.log
+# Investigation helper — loads keys from other .env files; author docstring says "NOT committed"
+scripts/sarvam-investigation/_keys.py
 
 # Brief #9.8-iOS: Swift-codegen output of scripts/inject_env_to_swift.sh.
 # Contains real .env values baked into Swift constants; never commit.

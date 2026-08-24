@@ -1,0 +1,71 @@
+{
+  "hypothesis": "H1",
+  "url": "wss://api.sarvam.ai/speech-to-text/ws?model=saaras:v3&language-code=pa-IN&mode=transcribe&sample_rate=16000&input_audio_codec=pcm_s16le&high_vad_sensitivity=true",
+  "headers": {
+    "api-subscription-key": "<KEY>"
+  },
+  "prelude_count": 0,
+  "audio_strategy": "json_b64",
+  "events": [
+    {
+      "t": "1782128418.438",
+      "kind": "OPEN",
+      "payload": ""
+    },
+    {
+      "t": "1782128418.440",
+      "kind": "SEND_AUDIO_1",
+      "payload": "<3200 bytes>"
+    },
+    {
+      "t": "1782128418.494",
+      "kind": "SEND_AUDIO_2",
+      "payload": "<3200 bytes>"
+    },
+    {
+      "t": "1782128418.902",
+      "kind": "SEND_AUDIO_10",
+      "payload": "<3200 bytes>"
+    },
+    {
+      "t": "1782128419.421",
+      "kind": "SEND_AUDIO_20",
+      "payload": "<3200 bytes>"
+    },
+    {
+      "t": "1782128419.933",
+      "kind": "SEND_AUDIO_30",
+      "payload": "<3200 bytes>"
+    },
+    {
+      "t": "1782128419.995",
+      "kind": "RECV_TEXT",
+      "payload": "{\"type\":\"data\",\"data\":{\"request_id\":\"20260622_f6bb45a5-b434-4711-be07-eec785c2a3fa\",\"transcript\":\"ਇੱਕ ਓਅੰਕਾਰ ਸਤਿ ਨਾਮੋ ਕਰਤਾ\",\"timestamps\":null,\"diarized_transcript\":null,\"language_code\":\"pa-IN\",\"language_probability\":null,\"metrics\":{\"audio_duration\":2.336,\"processing_latency\":0.12333488464355469}}}"
+    },
+    {
+      "t": "1782128420.439",
+      "kind": "SEND_AUDIO_40",
+      "payload": "<3200 bytes>"
+    },
+    {
+      "t": "1782128420.743",
+      "kind": "AUDIO_DONE",
+      "payload": "sent 45 chunks"
+    },
+    {
+      "t": "1782128420.850",
+      "kind": "RECV_TEXT",
+      "payload": "{\"type\":\"data\",\"data\":{\"request_id\":\"20260622_f6bb45a5-b434-4711-be07-eec785c2a3fa\",\"transcript\":\"ਤਾਂ ਪੁਰਖ ਨਿਰਭਾਉ ਨਿਰਵੈਰ।\",\"timestamps\":null,\"diarized_transcript\":null,\"language_code\":\"pa-IN\",\"language_probability\":null,\"metrics\":{\"audio_duration\":1.952,\"processing_latency\":0.13547372817993164}}}"
+    },
+    {
+      "t": "1782128422.244",
+      "kind": "CLIENT_CLOSE",
+      "payload": "graceful"
+    },
+    {
+      "t": "1782128429.822",
+      "kind": "HARD_TIMEOUT",
+      "payload": "12s"
+    }
+  ]
+}

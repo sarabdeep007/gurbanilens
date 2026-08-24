@@ -1,6 +1,16 @@
 # GurbaniLens — STATUS
 
-_Last updated: 2026-06-22 by Claude (overnight Sarvam/Gemini protocol investigation) — **Root causes identified for both cloud providers and fixed with cited evidence.** Sarvam: was sending audio as raw binary WS frames; Sarvam expects JSON-wrapped base64 text frames per AVR production reference + Pipecat + official docs (commit `de786bf`, full investigation at [`docs/SARVAM_PROTOCOL_INVESTIGATION.md`](./docs/SARVAM_PROTOCOL_INVESTIGATION.md)). Gemini: was sending `inline_data` / `mime_type` snake_case; Google's REST gateway silently drops these per `ai.google.dev/gemini-api/docs/audio` + LangChain4j #3559, so the model was being called with text-only input (commit `6afe5f6`, full investigation at [`docs/GEMINI_PROTOCOL_INVESTIGATION.md`](./docs/GEMINI_PROTOCOL_INVESTIGATION.md)). Both fixes use evidence-cited reference implementations, not speculative guesses. **Confidence Sarvam works in morning rebuild: medium-high (3 independent sources agree on wire format). Confidence Gemini works: medium (fix is well-cited but no working iOS-Gemini-Punjabi-audio reference to compare against).** Deep's morning recipe at the bottom of this file under "Resume 2026-06-22"._
+_Last updated: 2026-07-02 by Claude (chat-continuity handoff after prior chat context froze at Brief #9.22 completion) — **Sung-mode stability sweep landed clean: Briefs #9.20 → #9.22 all shipped and verified.** Sung Kirtan Mode (Beta) toggle at `settings.singingModeEnabled` (default OFF) is now the umbrella for continuous-listen raagi companion behavior; toggle OFF preserves byte-identical speech-optimized behavior. #9.20 introduced the multi-slot decaying accumulator (tier-weighted score × tier multiplier, 6s half-life, lock at weight≥100 + ratio≥1.5× + hits≥3); #9.21 added the cross-shabad **re-lock** path from LOCKED (accumulator persists across lock boundaries, `performSungModeReLock` reuses `lockTo(via:"sungReLock")`, currentWeight capped at 100 on lock); #9.22 (**Deep's iPhone regression fix**) closed 5 false re-lock swaps by (a) protecting `currentShabadId` slot from stale-window eviction so `currentWeight` stays a meaningful ratio denominator, (b) raising re-lock bar to FIVE gates (weight≥100, ratio≥1.5× current, hits≥4 up from 3, lastSeenAt within 3s, ≥1 tier-0/1 hit in lastTiers), (c) skipping tier-3 hits in sungMode DISCOVERY (targets ~15-25s lock latency down from Deep's observed 55s BSJ session). Commits `2301744` (toggle) → `bbf0502` (accumulator engine) → `678c7f3` (unit tests) → `eee9025` (re-lock core + 8 XCTests) → `1e15869` (re-lock engine wiring) → `7fdbdbf` (STATUS #9.21) → `498c5e1` (#9.22 core) → `4223d1a` (#9.22 engine tier-3 filter) → `8233627` (STATUS #9.22). Deep is testing on iPhone now; next likely dispatch is **#9.23 alaap handling** (Planned, see below) to address the "raagi sustains vowels / melismas produce empty partials → correct pangti gets bypassed because common phrases like ਗੋਪਾਲ ਗੋਬਿੰਦੇ match dozens of shabads across SGGS" pattern._
+
+_Prior: 2026-06-28 — Raagi Mode reached spoken-cadence usability via the **bigram safely-unique first-letter fast path** (Brief #9.19). Extended #9.16's per-shabad safe-unique unigram cache (letter is unique across all pangtis' full FL sigs → zero false-positive guarantee) to bigrams, giving instant highlight on ~500ms cadence for ALL pangtis in a locked shabad, not just the ones with letter-unique starters. Deep tagged commit `e948d79` as **`v0.9-fl-fast-path`** — the "chaogird humare" instant-highlight moment. Explicit rollback point if regressions. Three commits: `d321391` (helpers + tests), `a475aeb` (ShabadCache bigram-starter map), `e948d79` (Tier B engine wiring, matchLen=2, ~500ms flip). Earlier same day #9.18 fixed the flicker in #9.16's safe-unique block ("safe-unique always returns, blocks substring matcher from wrong-jumping when a unique letter is present"), commit `d49b517`._
+
+_Prior: 2026-06-27 — Full week of Raagi-mode iteration. Brief #8 shipped the initial engine (RaagiModeEngine + ShabadCache + JaikaraDetector with 8-seed set + RaagiView + SangatView 48pt + RaagiModeScreen + Settings wiring, flexible session cache with no eviction, 7 commits). #8.1 sticky-shabad display (separate `audioState` from `currentShabad`). #8.2 continuous mic + async dispatch + VAD tuning (1500→500ms silence, 15000→7000ms max recording). #8.2.1 `_continuousModeStream` retention fix (AsyncStream was auto-terminating on discard). #8.3 hierarchical scoped search (Tier 1 currentShabad ~20 lines → Tier 2 cached shabads → Tier 3 full SGGS). #8.4 Tier 1 scoring alignment + cancel stale Tier 3 tasks + jaikara prefix matching. #8.5 lower thresholds 70→60 + confidence acceptance (top ≥ 1.8× runner-up) + stage1Candidates 1500→600. #8.6 reverted stage1Candidates 600→1500 (accuracy over speed), tier 3 threshold 45, jaikara min 3-char length. Then **Brief #9** parallel dispatch: server-side `/stream` WebSocket endpoint on taaj-prod:9001 (files `stream.py`, `matcher.py`, `corpus.py`, `gtext.py`, `jaikara.py`, plus SGGS-only 56152-line matcher parity with iOS) + iOS `StreamingProvider` / `StreamingMicCapture` / `StreamingRaagiModeEngine` (Starscream WebSocket). Init→first-match=1618ms. 24/24 unit tests. #9-Server-Tune corrected server matcher to port-parity with iOS scoring (SGGS-only vs BaniDB-all, jaikara 8-seed + 3-char min, thresholds tier 1/2=60 tier 3=45). Test results: "ek oankaar" → 97.6, sung shabads worked 7/7._
+
+_Prior: 2026-06-27 (continued) — Post-streaming stability arc: #9.2 sticky hysteresis on shabad swaps (`currentShabadRecentPeakScore` / `currentShabadRecentPeakTime`, refresh time on same-shabad match). #9.3 always refresh peak TIME on same-shabad match (high-water-mark semantics for score, not time). #9.4 explicit DISCOVERING / LOCKED state machine + evidence accumulation (single-match swap only ≥95, 2×80+ same shabad OR 95+ single to lock, brief excursion challenger cleared on return). #9.5 AVAudioSession format-fresh at installTap (fixed 24kHz/48kHz sample-rate mismatch crash) + `engine.start()` error context + `engine.reset()` on stop + route-change observer. #9.6 multi-slot challenger (3 slots keyed by shabadId) + tier-3 filter + wider evidence window 5→8s + thresholds tuned. #9.7 first-letter local match (per-shabad FL cache + ~50ms sub-server matching for same-shabad pangti jumps). #9.9 sliding-window longest-common-substring FL match. #9.10 TRUE longest-common-substring (any position in both arrays, matchLen 3→2). #9.11 AnmolLipi→Unicode via existing `Gurmukhi.fromAnmolLipi` anvaad port (root cause: Latin `q v n l p s` vs Unicode ASR mismatch). #9.12 FL wins over server lineId when matchLen≥4 within locked shabad. #9.13 full anvaad converter for FL extraction + weak-FL commit gating (matchLen≥4 to eliminate UI flicker) + FL ownership on confirm + drop on no_match. Server-side: #9.14 PARTIAL_INTERVAL_S 0.75→0.35 (2× cadence); #9.15 WINDOW_S 3.0→1.5 (too aggressive, no lock); #9.17 revert WINDOW_S 3.0 + PARTIAL_INTERVAL_S 0.35 (known-working). #9.16 safe-unique first-letter STARTERS cache per shabad (unigram, letter must be unique across ALL pangtis' full FL sigs → zero false-positive guarantee), commits `d10287b` (string literal fix) + `903d38f` (SWIFT_STRICT_CONCURRENCY minimal to unblock NSLock async errors, defer proper refactor)._
+
+_Prior: 2026-06-24 — Env token codegen fought and lost. After multiple sandboxing failures with `inject_env_to_plist.sh` on the streaming path, fell back to hardcoded literal token in `ios/GurbaniLens/GurbaniLens/ASR/StreamingProvider.swift` line 89 (perl in-place edit). Ugly but shipping; proper env plumbing is deferred backlog._
+
+_Prior: 2026-06-22 by Claude (overnight Sarvam/Gemini protocol investigation) — **Root causes identified for both cloud providers and fixed with cited evidence.** Sarvam: was sending audio as raw binary WS frames; Sarvam expects JSON-wrapped base64 text frames per AVR production reference + Pipecat + official docs (commit `de786bf`, full investigation at [`docs/SARVAM_PROTOCOL_INVESTIGATION.md`](./docs/SARVAM_PROTOCOL_INVESTIGATION.md)). Gemini: was sending `inline_data` / `mime_type` snake_case; Google's REST gateway silently drops these per `ai.google.dev/gemini-api/docs/audio` + LangChain4j #3559, so the model was being called with text-only input (commit `6afe5f6`, full investigation at [`docs/GEMINI_PROTOCOL_INVESTIGATION.md`](./docs/GEMINI_PROTOCOL_INVESTIGATION.md)). Both fixes use evidence-cited reference implementations, not speculative guesses. **Confidence Sarvam works in morning rebuild: medium-high (3 independent sources agree on wire format). Confidence Gemini works: medium (fix is well-cited but no working iOS-Gemini-Punjabi-audio reference to compare against).** Deep's morning recipe at the bottom of this file under "Resume 2026-06-22"._
 
 _Prior: 2026-06-21 by Claude (iOS A.4b agent) — Phase A.4b: **two cloud ASR providers wired + debug Compare mode shipped.** `SarvamProvider` (Saaras-v3 WebSocket streaming, REST batch one-shot for Compare) and `GeminiProvider` (2.5 Flash chunked REST, ~2 sec/chunk) conform to A.4a's `ASRProvider` protocol; both slotted into `StreamingASR`'s @AppStorage switch. New shared `CloudMicCapture` actor-y class emits 16 kHz mono s16le PCM chunks via AsyncStream (sibling to MicSource's Float32 bulk path). Settings → Voice recognition gains a Cloud sub-section (toggle + Sarvam/Gemini picker + 50/month free-trial counter with monthly auto-reset). 5 rapid taps on the Settings → Version footer unlock a `CompareScreen` debug modal in LiveResultsScreen toolbar that fan-outs one recording to all three providers in parallel and side-by-sides the transcripts; Save writes JSON to Documents/ for Deep to pull. `scripts/inject_env_to_plist.sh` postBuildScript pulls SARVAM_API_KEY + GEMINI_API_KEY from repo-root .env into the built Info.plist without committing keys. 23 new `CloudParsing` unit tests in GurbaniLensCore (extractSarvamTranscript / extractGeminiText / detectScript / sanitize / joinAccumulator)._
 
@@ -91,22 +101,17 @@ Pivoted from "continuous-listen Paath companion" on **2026-06-17**. Original Pha
 - ✅ **Whisper model bundled** — multilingual `ggml-base.bin` (~148 MB) downloaded from HuggingFace into `app/src/main/assets/`. (The previous `ggml-tiny.en.bin` was English-only and couldn't transcribe Punjabi; multilingual base is the smallest model that handles `pa`.)
 - ✅ **`scripts/fetch_android_deps.sh`** — re-runnable bootstrap that populates the gitignored Android binary deps: prebuilt `libwhisper*.so` files, `ggml-base.bin`, and `sggs.sqlite` (copied from `data/sggs/database.sqlite`). `app/src/main/jniLibs/` and `app/src/main/assets/ggml-*.bin` are now explicit in `.gitignore`.
 - ✅ **End-to-end voice-search unit test** — synthetic PCM → MockAsr → Matcher → SearchResult; verified strong-confidence match on exact transcript, low-confidence reject on unrelated query, empty matches on empty transcript.
+- ✅ **Phase 2A v2 Phase B — Raagi Mode (Brief #8 series, Jun 27)** — RaagiModeEngine + ShabadCache + JaikaraDetector (8-seed set: ਵਾਹਿਗੁਰੂ / ਵਾਹਿਗੁਰੂ ਵਾਹਿਗੁਰੂ / ਸਤਿ ਨਾਮੁ ਵਾਹਿਗੁਰੂ / ਬੋਲੇ ਸੋ ਨਿਹਾਲ ਸਤਿ ਸ੍ਰੀ ਅਕਾਲ / ਧੰਨ ਗੁਰੂ ਨਾਨਕ ਦੇਵ ਜੀ / ਧੰਨ ਗੁਰੂ ਗ੍ਰੰਥ ਸਾਹਿਬ ਜੀ / ਅਕਾਲ / ਓਅੰਕਾਰ) + RaagiView (full shabad scrolled, current pangti highlighted, smooth auto-scroll) + SangatView (single pangti 48pt for projector) + RaagiModeScreen + Settings wiring. Flexible session cache with no eviction (~50 KB per shabad, trivial memory). Follow-ups shipped through #8.6: sticky-shabad (#8.1), continuous mic + async dispatch + VAD tuning 500ms silence / 7000ms max (#8.2), `_continuousModeStream` retention fix (#8.2.1), hierarchical scoped search Tier 1 currentShabad → Tier 2 cached → Tier 3 full SGGS (#8.3), Tier 1 scoring alignment + cancel stale Tier 3 tasks + jaikara prefix matching (#8.4), lower thresholds 70→60 + confidence acceptance top ≥ 1.8× runner-up (#8.5), reverted stage1Candidates to 1500 for accuracy-over-speed + tier 3 threshold 45 + jaikara min 3-char (#8.6).
+- ✅ **Phase 2A v2 Phase B — streaming endpoint (Brief #9, Jun 27)** — Server-side `/stream` WebSocket on taaj-prod:9001 (`stream.py`, `matcher.py`, `corpus.py`, `gtext.py`, `jaikara.py`, `test_stream.py`, `fixture_corpus.json`, `make_fixture.py`, `deploy/asr.gurbanilens.com.NEW`, `docs/STREAMING.md`, `docs/TESTING.md`). iOS-side `StreamingProvider` / `StreamingMicCapture` / `StreamingRaagiModeEngine` via Starscream WebSocket. Init→first-match=1618ms. 24/24 unit tests. #9-Server-Tune achieved port-parity with iOS matcher (SGGS-only 56152 lines, port-parity scoring, jaikara 8-seed + 3-char min, thresholds tier 1/2=60 tier 3=45). Test: "ek oankaar" → 97.6, sung shabads 7/7.
+- ✅ **Phase 2A v2 Phase B — Raagi-mode stability arc (Briefs #9.2 → #9.13, Jun 27)** — Sticky hysteresis with `currentShabadRecentPeakScore/Time` (#9.2), always refresh peak TIME on same-shabad match — high-water-mark for score not time (#9.3), explicit DISCOVERING/LOCKED state machine with evidence accumulation — single-match swap only ≥95, 2×80+ same shabad OR 95+ single to lock, brief excursion challenger cleared on return (#9.4), AVAudioSession format-fresh at installTap fixing 24kHz/48kHz sample-rate mismatch crash + `engine.start()` error context + `engine.reset()` on stop + route-change observer (#9.5), multi-slot challenger 3 slots keyed by shabadId + tier-3 filter + wider evidence window 5→8s + tuned thresholds (#9.6), first-letter local match with per-shabad FL cache + ~50ms sub-server matching for same-shabad pangti jumps (#9.7), sliding-window longest-common-substring FL match (#9.9), TRUE longest-common-substring any position in both arrays with matchLen 3→2 (#9.10), AnmolLipi→Unicode via existing `Gurmukhi.fromAnmolLipi` anvaad port — root cause of Latin `q v n l p s` vs Unicode ASR mismatch (#9.11), FL wins over server lineId when matchLen≥4 within locked shabad (#9.12), full anvaad converter for FL extraction + weak-FL commit gating matchLen≥4 to eliminate UI flicker + FL ownership on confirm + drop on no_match (#9.13). Server-side stream WINDOW_S / PARTIAL_INTERVAL_S tuning: #9.14 PARTIAL_INTERVAL_S 0.75→0.35 (2× cadence), #9.15 WINDOW_S 3.0→1.5 (too aggressive, no lock), #9.17 revert WINDOW_S 3.0 + PARTIAL_INTERVAL_S 0.35 (known-working).
+- ✅ **Phase 2A v2 Phase B — safe-unique first-letter cache (Briefs #9.16 → #9.19, Jun 27–28)** — Per-shabad safe-unique STARTERS cache. Letter (unigram) OR letter-pair (bigram) is guaranteed unique across all pangtis' full FL signatures within a shabad → zero false-positive guarantee for the fast-path. **#9.16 unigram**: commits `d10287b` (string literal escaping fix) + `903d38f` (SWIFT_STRICT_CONCURRENCY minimal to unblock NSLock async errors, defer proper refactor). **#9.18 flicker fix**: safe-unique block ALWAYS returns — same-line confirms bail early, blocks substring matcher from wrong-jumping when a unique letter is present (commit `d49b517`). **#9.19 bigram — THE BREAKTHROUGH**: extended fast-path from only letter-unique starters (which gave e.g. "ਚ" instant chaogird humare highlight) to ALL pangtis via bigram uniqueness. Three commits: `d321391` (`FirstLetterSignature.safeUniqueBigramStarters` + `findTrailingSafeUniqueBigram` helpers + tests), `a475aeb` (ShabadCache bigram-starter map), `e948d79` (StreamingRaagiModeEngine Tier B fast path, matchLen=2, ~500ms flip). Deep tagged commit `e948d79` as **`v0.9-fl-fast-path`** — the "spoken-cadence Gurbani" milestone, "chaogird humare" instant-highlight moment. Explicit rollback point if regressions.
+- ✅ **Sung Kirtan Mode (Beta) — Briefs #9.20 + #9.21 + #9.22 (Jun 28 → Jul 1)** — New Settings toggle `settings.singingModeEnabled` (default OFF) gates a decaying multi-slot accumulator for DISCOVERING (#9.20), a cross-shabad **re-lock** path from LOCKED (#9.21), and three surgical stability fixes (#9.22 addressing Deep's iPhone regression of 5 false re-lock swaps). Existing speech-optimized behavior is byte-identical when toggle is OFF. Accumulator: `score × tierMultiplier` with `t0=2×`, `t1=1.5×`, `t2=1×`, `t3=0.5×`; 6s half-life; lock at `weight≥100` + `ratio≥1.5×` + `hits≥3`. #9.21 re-lock reuses `lockTo(via:"sungReLock")`, currentWeight capped at 100 on lock. #9.22 fixes: (1) currentShabadId slot exempt from stale-window eviction so `currentWeight` stays meaningful (kills currentWeight=0.0 → ratio=100000+ bug), (2) re-lock now requires FIVE gates (weight≥100, ratio≥1.5×, hits≥4 up from 3, lastSeenAt within 3s, ≥1 tier-0/1 in lastTiers), (3) sungMode DISCOVERY skips tier-3 hits (~15-25s lock latency vs Deep's observed 55s). Commits `2301744` (toggle) → `bbf0502` (accumulator engine) → `678c7f3` (24 XCTest unit tests including real-world Aukhi Gharri replay + 30s-pause-then-new-shabad no-false-swap replay) → `eee9025` (re-lock core + 8 XCTests) → `1e15869` (re-lock engine wiring) → `7fdbdbf` (STATUS #9.21) → `498c5e1` (#9.22 core) → `4223d1a` (#9.22 engine tier-3 filter) → `8233627` (STATUS #9.22).
 
 ---
 
 ## What's In Flight
 
-- 🟢 **Sung Kirtan Mode (Beta) — Briefs #9.20 + #9.21 + #9.22.** New Settings toggle `settings.singingModeEnabled` (default OFF) gates a decaying multi-slot accumulator for DISCOVERING (#9.20), a cross-shabad **re-lock** path from LOCKED (#9.21), and three surgical stability fixes (#9.22). Existing speech-optimized behavior is byte-identical when toggle is OFF. Brief #9.22 fixes Deep's iPhone regression where 5 rapid re-locks fired with `currentWeight=0.0` (ratios in the 100000+ range) because the locked shabad's slot was ageing out during natural pauses:
-  1. **Fix 1** — currentShabadId slot is now exempt from stale-window eviction in `processMatchInLocked`. Weight still decays; only the slot itself is protected so `currentWeight` stays a meaningful ratio denominator.
-  2. **Fix 2** — re-lock now requires FIVE gates: weight ≥ 100, ratio ≥ 1.5 × current, hits ≥ 4 (up from 3, distinct from initial-discovery `minHits`), lastSeenAt within 3 s, and at least one tier-0/1 hit in `lastTiers`.
-  3. **Fix 3** — sung-mode DISCOVERY skips tier-3 hits (full-SGGS regex noise). Deep's session had first-shabad lock take 55 s (seq=126) due to tier-3 scatter; skipping them targets ~15-25 s lock latency. Post-lock still consumes tier-3 for current-shabad refresh.
-  Test recipe on iPhone with toggle ON:
-  1. Sing shabad A (e.g. Tati Wao) → expect `sungMode LOCK shabadId=… weight=… hits=… peakScore=…` DIAG within ~15-25 s (down from 55 s pre-#9.22). Screen switches to shabad A view. Console shows `sungMode discovery tier-3 skip …` for filtered noise.
-  2. Continue same shabad — expect `sungMode locked-acc … same-shabad` per partial; **no** re-lock. FL fast paths (#9.16/#9.19) drive pangti transitions.
-  3. Pause 30 s between shabads (natural kirtan cadence) — pre-#9.22 this ejected the current shabad's slot; now BSJ (or whichever) stays with decayed-but-nonzero weight.
-  4. Switch to shabad B (e.g. Aukhi Gharri) → expect challenger to build across ~4+ recent tier-0/1 hits, then `sungMode RE-LOCK from=A to=B currentWeight=… challengerWeight=… ratio=… hits=…` fires + screen swaps. FL fast paths for B take over pangti tracking. Pre-#9.22 this would swap on any 3-hit challenger meeting weight; now the extra gates block false swaps.
-  5. **Regression check** — same test flow with toggle OFF should be unchanged from prior release (single-slot pendingCandidate discovery + speech-mode challenger for cross-shabad).
-  Reference logs: `swift test` in `ios/GurbaniLensCore/` covers the pure accumulator (24 XCTest cases including a real-world Aukhi Gharri replay AND a #9.22 30 s-pause-then-new-shabad no-false-swap replay). Deep validates on Mac then iPhone.
+- 🟢 **Deep — Sung Kirtan Mode iPhone verification.** #9.22 landed cleanly on origin/main (commits `498c5e1`, `4223d1a`, `8233627`). Deep to `git pull && xcodegen generate && Cmd+R`, sing 5+ pangtis with `settings.singingModeEnabled` ON, watch for `sungMode LOCK` DIAG within ~15-25s and no false swaps during 30s+ pauses. Test recipe: (1) Sing shabad A (e.g. Tati Wao) → expect `sungMode LOCK shabadId=… weight=… hits=… peakScore=…` DIAG within ~15-25s (down from 55s pre-#9.22). Screen switches to shabad A view. Console shows `sungMode discovery tier-3 skip …` for filtered noise. (2) Continue same shabad — expect `sungMode locked-acc … same-shabad` per partial; **no** re-lock. FL fast paths (#9.16/#9.19) drive pangti transitions. (3) Pause 30s between shabads (natural kirtan cadence) — pre-#9.22 this ejected the current shabad's slot; now BSJ (or whichever) stays with decayed-but-nonzero weight. (4) Switch to shabad B (e.g. Aukhi Gharri) → expect challenger to build across ~4+ recent tier-0/1 hits, then `sungMode RE-LOCK from=A to=B currentWeight=… challengerWeight=… ratio=… hits=…` fires + screen swaps. FL fast paths for B take over pangti tracking. Pre-#9.22 this would swap on any 3-hit challenger meeting weight; now the extra gates block false swaps. (5) **Regression check** — same test flow with toggle OFF should be unchanged from prior release (single-slot pendingCandidate discovery + speech-mode challenger for cross-shabad).
 
 - 🟢 **Deep — iOS v1 voice-search on device.** Xcode install + `bash scripts/fetch_ios_deps.sh` + `xcodegen generate` + run on iPhone with free Apple ID. See [docs/PHASE_2A_IOS_SETUP.md](./docs/PHASE_2A_IOS_SETUP.md). Independent of Android track.
 - 🟢 **Phase 2B Kirtan dataset gathering** (separate agent track) — continues feeding v2.
@@ -130,6 +135,18 @@ Pivoted from "continuous-listen Paath companion" on **2026-06-17**. Original Pha
 
 ---
 
+## What's Planned (not committed as intent yet)
+
+- 🟠 **Brief #9.23 — Alaap handling for Sung Kirtan Mode.** Address the pattern Deep identified: when raagi sustains vowels / does melismas ("kirpaaa aa a aaaa gopal gobindeeee ee eeee apnaa naam japaavo japaaavo"), ASR produces empty/garbage partials during the sustain → no phoneme progression → UI feels frozen. Then when a real word arrives ("gopal gobinde"), matcher picks the wrong shabad because that phrase appears in DOZENS of shabads across SGGS (common Waheguru name). Repetition of the sung phrase reinforces wrong match; meanwhile YOUR correct shabad's unique preceding/following lines were sung during alaap when ASR produced nothing. **Four coordinated fixes in ONE bundled dispatch (iOS + server together):**
+  1. **Repeat detection (iOS)** — same lineId (or same shabadId) hitting N times in a row = raagi holding on that tuk. Boost current-shabad accumulator weight massively; downweight cross-shabad "coincidental common-phrase" hits during this state. New `SungModeAccumulator.RepeatState` tracking `(lineId, count, lastSeenAt)`.
+  2. **Server-side sung profile (taaj-prod `stream.py`)** — bump `GURBANI_STREAM_WINDOW_S` from 3.0 to 5.0–6.0 for sungMode sessions. Longer window = more phoneme context = better disambiguation of common phrases. Signal from iOS via WebSocket handshake param `?mode=sung`.
+  3. **Empty-partial anchor hold (iOS)** — N consecutive empty/whitespace partials = ALAAP state, harden lock (challenger needs 2× weight to break instead of 1.5×). Auto-releases when non-empty partials resume.
+  4. **Ambiguous-shabad detection (iOS build-time)** — if partial text is a "common phrase" that matches many shabads, treat as low-info. Precompute at build time a list of shabadIds sharing high-frequency n-grams. Load as `Set<ShabadId>` in ShabadCache; when accumulator receives a hit for a member of this set, apply 0.5× tier multiplier before scoring.
+
+  **Estimated risk**: medium. Fix #4 requires build-time precompute (new script + JSON asset). Fix #2 requires server restart + agent-observer scan. Fixes #1 and #3 are pure iOS logic in SungModeAccumulator with unit-test coverage. **Dispatch will HOLD before each commit** so we can bail if any single fix regresses the sung-mode test suite. **Not started** — Deep decides whether to dispatch after verifying #9.22 on iPhone.
+
+---
+
 ## What's Deferred
 
 | Item | Why deferred | Gating |
@@ -141,60 +158,7 @@ Pivoted from "continuous-listen Paath companion" on **2026-06-17**. Original Pha
 | Hyyro / n-gram prefilter for Swift+Kotlin partial_ratio | v1 single-shot query is latency-tolerant; brute-force port is fine | v2 (full-corpus continuous search needs it) |
 | `language="pa"` + fixed Whisper seed | Prebuilt .so JNI hardcodes `language="en"` + no seed knob | Replace prebuilt with NDK-compiled-from-source (next chunk) |
 | Real-device validation of `WhisperAsr` | Headless taaj-portal can't run an APK against the mic | Deep runs `./gradlew :app:installDebug` on a connected device |
-
----
-
-## Resume 2026-06-22 — cloud-provider morning recipe (Deep)
-
-After overnight investigation, the cloud providers should now work. **Pull, regen, rebuild, retry:**
-
-```bash
-cd ~/claude-workspace/projects/gurbanilens
-git pull origin main
-cd ios/GurbaniLens
-rm -rf GurbaniLens.xcodeproj && xcodegen generate
-xcodebuild -project GurbaniLens.xcodeproj -scheme GurbaniLens \
-  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' build 2>&1 | tail -50
-```
-
-Expect BUILD SUCCEEDED. Then Cmd-R on device.
-
-**Sarvam test (most likely to work — confidence MEDIUM-HIGH):**
-1. Settings → Voice recognition → Cloud → toggle ON → pick Sarvam.
-2. Return Home, tap mic, recite **"ek oankaar sat naam"** for ~5 sec.
-3. Expected Xcode console log:
-   ```
-   [DIAG] SarvamProvider WS connecting to wss://api.sarvam.ai/speech-to-text/ws?model=saaras:v3&language-code=pa-IN&mode=transcribe&sample_rate=16000&input_audio_codec=pcm_s16le&high_vad_sensitivity=true
-   [DIAG] SarvamProvider.start streaming begun
-   [DIAG] SarvamProvider partial transcript.len=<N> script=gurmukhi latin.head60="..." gurmukhi.head60="ਏਕ ਓਅੰਕਾਰ ..."
-   ```
-4. If you see partials → working. Tap Stop, expect Results screen.
-5. If `readLoop terminated: Socket is not connected` reappears → paste the full xcodebuild + run log; the fallback is `mode` or `input_audio_codec` mismatch documented in [`docs/SARVAM_PROTOCOL_INVESTIGATION.md`](./docs/SARVAM_PROTOCOL_INVESTIGATION.md#confidence-the-morning-rebuild-will-work).
-
-**Gemini test (probably works — confidence MEDIUM):**
-1. Settings → Cloud → pick Gemini → Home → mic → recite same line.
-2. Wait ~2-4 sec per chunk. Expected:
-   ```
-   [DIAG] GeminiProvider.start streaming begun (chunkBytes=64000)
-   [DIAG] GeminiProvider chunk.sec=2.00 elapsedMs=<N> response.len=<N> response.head80="ਏਕ ..."
-   ```
-3. If you see HTTP 400 → paste the body (probably another field name issue).
-4. If you see HTTP 200 but response.len=0 → Gemini doesn't want to transcribe; tighten the prompt or try Gemini 2.5 Pro (see [`docs/GEMINI_PROTOCOL_INVESTIGATION.md`](./docs/GEMINI_PROTOCOL_INVESTIGATION.md)).
-
-**Then Compare mode** (the deciding A/B test):
-1. Settings → tap Version line 5x rapidly → "Compare mode unlocked" alert.
-2. Home → mic → tap the rectangle.split icon top-right → CompareScreen sheet.
-3. Tap Record → recite "ek oankaar sat naam" → tap Stop.
-4. Three rows fill in side-by-side. Save Comparison → pull JSON via Xcode → Devices → Download Container.
-5. Decision: pick whichever Gurmukhi transcript is closest to ground truth + has acceptable latency. Free-trial counter (46/50 after last night's burn) gets decremented one more credit per cloud row per Compare run.
-
-**If both providers still fail** after pulling `6afe5f6`:
-- Sarvam: paste the full xcodebuild stderr/run log including the URL line and the first `readLoop terminated` error. The investigation doc has 3 fallback hypotheses prioritised.
-- Gemini: paste the full HTTP response body when status != 200. The fix is field-name-level and well-cited, so a failure means there's an account / quota / safety-policy issue rather than a wire-format issue.
-
-**Trial counter:** Started June 2026 at 50, was at 46 after last night. Sarvam burns 1 per commit; Gemini same; CompareScreen NOT yet wired to consume (it directly calls the static `transcribeOneShot` helpers, bypassing `CloudTrialPolicy.tryConsume`). If you want Compare runs to count, that's a 5-line follow-up — say the word.
-
-**WhisperKit large-v3** is unaffected by all of this; it's the local default + the always-available fallback if either cloud provider fails. Toggle Cloud OFF in Settings to use it.
+| Proper env-token plumbing (StreamingProvider) | Multiple `inject_env_to_plist.sh` sandboxing failures on the streaming path; fell back to hardcoded literal token in `StreamingProvider.swift` line 89 via perl in-place edit (2026-06-24). Ugly but shipping | Backlog — proper build-time inject for streaming path |
 
 ---
 
@@ -297,3 +261,59 @@ Read in this order:
 5. The relevant code surface (`core/gurbanilens/matcher.py` if matcher-related, `ios/GurbaniLensCore/` for Swift, `android/` for Kotlin).
 
 When in doubt: **v1 is voice-search, foreground, tap-to-record.** v2 is the continuous-listen vision. v3 is the projector. If a request sounds like continuous listening or background audio, it's v2 — confirm whether the dispatcher means v1 or v2 before coding.
+
+---
+
+## Resume 2026-06-22 — cloud-provider morning recipe (Deep)
+
+After overnight investigation, the cloud providers should now work. **Pull, regen, rebuild, retry:**
+
+```bash
+cd ~/claude-workspace/projects/gurbanilens
+git pull origin main
+cd ios/GurbaniLens
+rm -rf GurbaniLens.xcodeproj && xcodegen generate
+xcodebuild -project GurbaniLens.xcodeproj -scheme GurbaniLens \
+  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' build 2>&1 | tail -50
+```
+
+Expect BUILD SUCCEEDED. Then Cmd-R on device.
+
+**Sarvam test (most likely to work — confidence MEDIUM-HIGH):**
+1. Settings → Voice recognition → Cloud → toggle ON → pick Sarvam.
+2. Return Home, tap mic, recite **"ek oankaar sat naam"** for ~5 sec.
+3. Expected Xcode console log:
+   ```
+   [DIAG] SarvamProvider WS connecting to wss://api.sarvam.ai/speech-to-text/ws?model=saaras:v3&language-code=pa-IN&mode=transcribe&sample_rate=16000&input_audio_codec=pcm_s16le&high_vad_sensitivity=true
+   [DIAG] SarvamProvider.start streaming begun
+   [DIAG] SarvamProvider partial transcript.len=<N> script=gurmukhi latin.head60="..." gurmukhi.head60="ਏਕ ਓਅੰਕਾਰ ..."
+   ```
+4. If you see partials → working. Tap Stop, expect Results screen.
+5. If `readLoop terminated: Socket is not connected` reappears → paste the full xcodebuild + run log; the fallback is `mode` or `input_audio_codec` mismatch documented in [`docs/SARVAM_PROTOCOL_INVESTIGATION.md`](./docs/SARVAM_PROTOCOL_INVESTIGATION.md#confidence-the-morning-rebuild-will-work).
+
+**Gemini test (probably works — confidence MEDIUM):**
+1. Settings → Cloud → pick Gemini → Home → mic → recite same line.
+2. Wait ~2-4 sec per chunk. Expected:
+   ```
+   [DIAG] GeminiProvider.start streaming begun (chunkBytes=64000)
+   [DIAG] GeminiProvider chunk.sec=2.00 elapsedMs=<N> response.len=<N> response.head80="ਏਕ ..."
+   ```
+3. If you see HTTP 400 → paste the body (probably another field name issue).
+4. If you see HTTP 200 but response.len=0 → Gemini doesn't want to transcribe; tighten the prompt or try Gemini 2.5 Pro (see [`docs/GEMINI_PROTOCOL_INVESTIGATION.md`](./docs/GEMINI_PROTOCOL_INVESTIGATION.md)).
+
+**Then Compare mode** (the deciding A/B test):
+1. Settings → tap Version line 5x rapidly → "Compare mode unlocked" alert.
+2. Home → mic → tap the rectangle.split icon top-right → CompareScreen sheet.
+3. Tap Record → recite "ek oankaar sat naam" → tap Stop.
+4. Three rows fill in side-by-side. Save Comparison → pull JSON via Xcode → Devices → Download Container.
+5. Decision: pick whichever Gurmukhi transcript is closest to ground truth + has acceptable latency. Free-trial counter (46/50 after last night's burn) gets decremented one more credit per cloud row per Compare run.
+
+**If both providers still fail** after pulling `6afe5f6`:
+- Sarvam: paste the full xcodebuild stderr/run log including the URL line and the first `readLoop terminated` error. The investigation doc has 3 fallback hypotheses prioritised.
+- Gemini: paste the full HTTP response body when status != 200. The fix is field-name-level and well-cited, so a failure means there's an account / quota / safety-policy issue rather than a wire-format issue.
+
+**Trial counter:** Started June 2026 at 50, was at 46 after last night. Sarvam burns 1 per commit; Gemini same; CompareScreen NOT yet wired to consume (it directly calls the static `transcribeOneShot` helpers, bypassing `CloudTrialPolicy.tryConsume`). If you want Compare runs to count, that's a 5-line follow-up — say the word.
+
+**WhisperKit large-v3** is unaffected by all of this; it's the local default + the always-available fallback if either cloud provider fails. Toggle Cloud OFF in Settings to use it.
+
+---
